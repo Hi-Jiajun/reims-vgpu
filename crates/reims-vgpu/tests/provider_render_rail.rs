@@ -4314,6 +4314,119 @@ fn a_guest_backed_chain_middle_leaves_for_the_provider_and_its_tail_does_not() {
         "the sentence names the half the rail lacks: {refusal}"
     );
 
+    // 1b. B3's probe: the window door's own state, one route per state, and the
+    //     three of them partition the bucket. The gate's judgement, slug and
+    //     sentence are untouched — this is the reading that says *why* a record
+    //     could not be carried, which the census could not tell apart: whether
+    //     no door stated a window at all, whether a door applied and named the
+    //     fact that stopped it, or whether a window was stated and the class
+    //     still refused it (a wiring gap, and a number of its own).
+    let labels_before: u64 = provider_render::GUEST_BACKING_WINDOW_LABELS
+        .iter()
+        .map(|label| route_count(label))
+        .sum();
+    let probe_bucket_before = route_count("render_provider_out_of_class_guest_backing");
+
+    // (a) No door stated a window: the state census v31/v32's 690 records are in
+    //     until the probe says otherwise.
+    let none_before = route_count(provider_render::GUEST_BACKING_WINDOW_NONE);
+    let no_window = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &tail(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => reason,
+        other => panic!("a guest-backed tail with no window is still refused: {other:?}"),
+    };
+    assert_eq!(
+        no_window.slug(),
+        "render_provider_out_of_class_guest_backing",
+        "the probe moves no admit/refuse edge: {no_window}"
+    );
+    assert_eq!(
+        route_count(provider_render::GUEST_BACKING_WINDOW_NONE) - none_before,
+        1,
+        "a record no door stated a window for is the `_none` state"
+    );
+
+    // (b) A door applied and could not cut the window: the refusal keeps its own
+    //     bucket and the probe charges the door's own fact.
+    let refused_label =
+        provider_render::guest_backing_window_refused_label(ResidentSourceRoute::WindowPaddedRows);
+    let refused_before = route_count(refused_label);
+    let refused_window = match provider_render::submit_render(
+        &inputs_held_with_window_refusal(
+            &stages,
+            RenderChainRole::SoleOrTail,
+            ResidentSourceRoute::WindowPaddedRows,
+        ),
+        &tail(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => reason,
+        other => panic!("a refused window is not an admission: {other:?}"),
+    };
+    assert_eq!(
+        refused_window.slug(),
+        "render_provider_out_of_class_guest_backing",
+        "a refused window leaves the bucket where it was: {refused_window}"
+    );
+    assert_eq!(
+        route_count(refused_label) - refused_before,
+        1,
+        "the door's own fact is the state, one label per fact: {refused_label}"
+    );
+
+    // (c) The canary: the seam stated the window and the record stated a load
+    //     source of its own, so the class must **not** convert it — two
+    //     declarations for one attachment's contents is the disagreement the
+    //     `load_from_target` arm refuses by name, and silently preferring the
+    //     window is how a wrong frame becomes unobservable. The refusal stays,
+    //     and the probe reads the state it is in rather than folding it into
+    //     `_none`.
+    let mut seeded_tail = tail();
+    seeded_tail.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
+    let window_extent = u64::from(width) * u64::from(height) * 4;
+    let window = [StageBufferWindow {
+        import: 0x9e3b,
+        host_va: 0x1000,
+        length: window_extent,
+        head: 0,
+        bytes_len: window_extent,
+    }];
+    let handed_seed = seed.clone();
+    let runs_before = route_count(provider_render::GUEST_BACKING_WINDOW_RUNS);
+    let runs_refusal = match provider_render::submit_render(
+        &RenderRailInputs {
+            load_seed_source_bytes: Some(&handed_seed),
+            ..inputs_held_with_attachment_window(&stages, RenderChainRole::SoleOrTail, &window)
+        },
+        &seeded_tail,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => reason,
+        other => panic!("a window the record's own bytes disagree with is not adopted: {other:?}"),
+    };
+    assert_eq!(
+        runs_refusal.slug(),
+        "render_provider_out_of_class_guest_backing",
+        "the record keeps the census's own bucket: {runs_refusal}"
+    );
+    assert_eq!(
+        route_count(provider_render::GUEST_BACKING_WINDOW_RUNS) - runs_before,
+        1,
+        "a stated window the class did not use is the canary state"
+    );
+
+    // The probe's whole contract: the three families partition the bucket, so
+    // the next census can subtract them and read the population by name.
+    let labels_after: u64 = provider_render::GUEST_BACKING_WINDOW_LABELS
+        .iter()
+        .map(|label| route_count(label))
+        .sum();
+    assert_eq!(
+        labels_after - labels_before,
+        route_count("render_provider_out_of_class_guest_backing") - probe_bucket_before,
+        "the three window states sum to the bucket they partition"
+    );
+
     // 2. The middle (`wb=0`, census group A) with the walk's frame handed over:
     //    in class, answered by the provider, and published — the walk consumes
     //    that frame as the next record's seed, and the packet's last record is
@@ -4350,6 +4463,207 @@ fn a_guest_backed_chain_middle_leaves_for_the_provider_and_its_tail_does_not() {
         route_count("render_provider_out_of_class_guest_backing") - bucket_before,
         0,
         "the admitted middle charges no refusal: the bucket moved with the class"
+    );
+}
+
+/// The B3 probe's label list and its classifier cannot drift apart.
+///
+/// The three families partition the `guest_backing` bucket only if the list a
+/// reader sums is *exactly* the set the classifier returns: a label returned
+/// but not listed makes the sum read short — an unaccounted population hiding
+/// behind a bucket that looks fully decomposed — and a label listed but never
+/// returned reads as a state nothing was ever in. The list is public API for a
+/// reason (the census reader sums it), so the drift it can suffer is the one a
+/// test has to catch.
+#[test]
+fn the_guest_backing_window_labels_are_exactly_the_states_the_probe_charges() {
+    use provider_render::{
+        guest_backing_window_refused_label, guest_backing_window_route_label,
+        AttachmentGuestWindow, GUEST_BACKING_WINDOW_LABELS,
+    };
+
+    let runs: [StageBufferWindow; 0] = [];
+    let mut produced = vec![
+        guest_backing_window_route_label(None),
+        guest_backing_window_route_label(Some(&AttachmentGuestWindow::Runs(&runs))),
+    ];
+    // Every route the enum has, not only the nine a window door can state: the
+    // defensive arm is part of the contract too, and a route that started
+    // reaching it without a label of its own would be a second producer the
+    // census could not see.
+    for route in [
+        ResidentSourceRoute::ChainOrderMismatch,
+        ResidentSourceRoute::ChainGeometryMismatch,
+        ResidentSourceRoute::ChainReadUnavailable,
+        ResidentSourceRoute::ChainTexelUnavailable,
+        ResidentSourceRoute::GvaElision,
+        ResidentSourceRoute::MapperRefNoLanding,
+        ResidentSourceRoute::MapperRefIdentityMismatch,
+        ResidentSourceRoute::MapperRefFrameUnavailable,
+        ResidentSourceRoute::Undeclared,
+        ResidentSourceRoute::WindowUnregistered,
+        ResidentSourceRoute::WindowUnwindowed,
+        ResidentSourceRoute::WindowPaddedRows,
+        ResidentSourceRoute::WindowExtent,
+        ResidentSourceRoute::WindowRegistrations,
+        ResidentSourceRoute::WindowGeometry,
+        ResidentSourceRoute::WindowIdentityMoved,
+        ResidentSourceRoute::WindowLandingRefused,
+        ResidentSourceRoute::WindowSpanUnmapped,
+    ] {
+        produced.push(guest_backing_window_route_label(Some(
+            &AttachmentGuestWindow::Refused(route),
+        )));
+        produced.push(guest_backing_window_refused_label(route));
+    }
+    produced.sort_unstable();
+    produced.dedup();
+    let mut listed = GUEST_BACKING_WINDOW_LABELS.to_vec();
+    listed.sort_unstable();
+    assert_eq!(
+        produced, listed,
+        "the labels the probe charges and the list the census sums are the same set"
+    );
+}
+
+/// B3: a guest-backed tail whose seam states the record's **own** window is
+/// carried by the provider, and the frame lands back in the window it began
+/// from.
+///
+/// The class's `guest_backing` refusal names one shape — a record whose frame
+/// the guest's pages are owed, with no declaration that can state the landing —
+/// and B1-B3 answered it for the two doors that *have* a window to state (the
+/// LOAD elision and the seed door). This is the third caller of the same
+/// mechanism: a record whose whole statement of previous contents is the window
+/// itself (no `target_guest_seed`, no `target_rgba8`, a declared action that
+/// preserves prior contents) is admitted as the contract's ordered run list and
+/// its frame is landed by E-TX8's `StoreOp::Borrowed` — no readback of its own,
+/// no copy of its own, and one authority for the pixels.
+///
+/// The test drives the released arm against a **real** registered host region
+/// (the owner rail's own import, the primitive the R9d/R11/R28/B1/R38 window
+/// tests use) and asserts the three things the release is worth:
+///
+/// * `INV-LAND`/`INV-BORROW`: the undrawn half of the completed frame is the
+///   window's memory, texel for texel — a rail that began from zeros, from a
+///   copy of anything, or from a stale image lands a different picture there;
+/// * `INV-RETURN`: the window holds the frame the pass produced, byte for byte
+///   (the same bytes the completion published — one frame, two destinations);
+/// * the record left the engine: the `guest_backing` bucket does not move while
+///   the submission count does, and the window's own byte names are the ones
+///   that price it.
+#[test]
+fn a_guest_backed_tail_whose_own_window_is_stated_lands_the_frame_it_began_from() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    // Per-texel bytes rather than one colour: which bytes the pass began from is
+    // read texel by texel, in the half this pass does not draw.
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+
+    let import = 0x9e3d_u64;
+    let gpa_base = 0x55_b000_u64;
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &pattern(0), 4 * u64::from(width));
+    let identity = surface_identity(0x7c_38_04);
+    let memory = std::sync::Arc::new(memory);
+    // The record's own shape: the attachment the mapper-ref-texture surface's
+    // guest allocation backs, a load that preserves what is already there, **no
+    // seed bytes of its own**, the withheld readback the census's shapes show,
+    // and the partial scissor that leaves the window's bytes readable.
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&pattern(0));
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let before = owner.as_mut_slice()[..frame_len as usize].to_vec();
+
+    let single = [window];
+    let deliveries = provider_render::provider_submissions();
+    let landing_before = route_count("render_provider_borrowed_landing_bytes");
+    let window_bytes_before = route_count("render_provider_attachment_guest_window_bytes");
+    let bucket_before = route_count("render_provider_out_of_class_guest_backing");
+    let frame = {
+        let inputs =
+            inputs_held_with_attachment_window(&stages, RenderChainRole::SoleOrTail, &single);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => {
+                panic!("a guest-backed tail whose own window is stated is in class: {other:?}")
+            }
+        }
+    };
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the released shape reaches the canonical provider instead of the engine"
+    );
+    assert_eq!(
+        frame.len(),
+        frame_len as usize,
+        "the whole attachment comes back"
+    );
+    for y in 0..height {
+        for x in half..width {
+            let expected = before[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&frame, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) is the window's own byte: a rail that read anything else — \
+                 zeros, a copy, or an image of its own — lands a different picture here"
+            );
+        }
+    }
+    assert_eq!(
+        owner.as_mut_slice()[..frame_len as usize].to_vec(),
+        frame,
+        "INV-RETURN: the owner's window holds the frame the pass produced, byte for byte"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landing_before,
+        frame_len,
+        "the landing is priced at exactly the attachment the election covers (elections × extent)"
+    );
+    assert_eq!(
+        route_count("render_provider_attachment_guest_window_bytes") - window_bytes_before,
+        frame_len,
+        "the declaration is the elision door's own window name: one window population, one price"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_guest_backing") - bucket_before,
+        0,
+        "the record left the engine: the refusal it used to meet does not move"
     );
 }
 
