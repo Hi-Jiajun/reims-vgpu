@@ -1984,10 +1984,12 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
         other => panic!("a continued record is out of class: {other:?}"),
     }
 
-    // A non-indexed draw.
-    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
-    req.indexed = None;
-    class(&req);
+    // A non-indexed draw used to be the boundary this list held; R39 moved both
+    // arms of the contract's one draw into the class, and
+    // `a_non_indexed_draw_lands_the_same_bytes_as_the_indexed_one` is where the
+    // arm's parity is driven. What stays out of class is the span this rail
+    // cannot pay for, driven by name in
+    // `a_non_indexed_draw_the_provider_would_refuse_stays_on_the_engine_by_name`.
 
     // A second stream the vertex stage does not read, whose own bytes also stop
     // short of the vertices the index stream names. Two rules answer this
@@ -2700,6 +2702,239 @@ fn a_two_stream_shape_draws_the_same_bytes_on_both_rails() {
         shifted, engine_shifted,
         "the same two streams, drawn by the canonical provider and by the self-contained engine, \
          have to land the same bytes"
+    );
+}
+
+/// The contract's other draw arm, end to end (R39): a draw with no index buffer
+/// names its vertices directly, and until this increment the class admitted only
+/// the indexed one.
+///
+/// The falsifiable half is not "the shape was accepted". The same three
+/// vertices, reached through `[0, 1, 2]` and through the request's own `0..3`,
+/// have to land the same frame on the canonical rail *and* against the
+/// self-contained engine; and the frame has to follow the vertex stream's own
+/// bytes, so a rail that drew nothing, or that kept reading the indexed arm's
+/// bytes, fails one of those two.
+#[test]
+fn a_non_indexed_draw_lands_the_same_bytes_as_the_indexed_one() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+
+    let indexed_req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    let indexed = provider_pixels("indexed", &stages, &indexed_req);
+    assert_solid("indexed (provider)", &indexed);
+
+    // The same request with the index buffer dropped: `vertices = 3` over the
+    // same stream reads the same three vertices in the same order.
+    let mut direct_req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    direct_req.indexed = None;
+    let direct = provider_pixels("no index buffer", &stages, &direct_req);
+    assert_eq!(
+        direct, indexed,
+        "`[0, 1, 2]` and `0..3` are the same three vertices: the two arms of the contract's one \
+         draw have to land the same frame on the canonical rail"
+    );
+    let Some(engine_direct) = engine_pixels("no index buffer", &stages, direct_req) else {
+        return;
+    };
+    assert_eq!(
+        direct, engine_direct,
+        "the non-indexed arm has to land the engine's own frame byte for byte"
+    );
+
+    // The stream decides this arm's frame too. The same three vertices with the
+    // third one moved from `x = 3` to `x = 1` cover half the attachment, so the
+    // texels past the new edge keep the clear — and the frame is not the clear.
+    let mut half_req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    half_req.indexed = None;
+    half_req.vertex_attributes = streams(&[stream(0, &[(-1.0, -3.0), (-1.0, 1.0), (1.0, 1.0)])]);
+    let half = provider_pixels("no index buffer, half-width triangle", &stages, &half_req);
+    assert_texel_count("no index buffer, half-width triangle (provider)", &half);
+    assert_ne!(
+        half, direct,
+        "the vertex stream's own bytes have to reach the vertex stage on this arm: moving the \
+         third vertex halves the covered area, which a rail that ignored its stream would not see"
+    );
+    assert_texel_near(
+        "half-width triangle: texel (width / 4, 0)",
+        texel_at(&half, width / 4, 0),
+        FRAGMENT_TEXEL,
+    );
+    assert_clear_texel(
+        "half-width triangle: the corner the shortened edge no longer reaches",
+        texel_at(&half, width - 1, height - 1),
+    );
+    let Some(engine_half) =
+        engine_pixels("no index buffer, half-width triangle", &stages, half_req)
+    else {
+        return;
+    };
+    assert_eq!(
+        half, engine_half,
+        "the same stream, drawn by the canonical provider and by the self-contained engine, has \
+         to land the same bytes"
+    );
+    eprintln!(
+        "R39 non-indexed draw: attachment {width}x{height}; the indexed arm's frame and the \
+         `0..3` arm's frame are byte-identical ({bytes} bytes), and the engine's frame is the \
+         same; moving the third vertex to x = 1 halves the covered area — texel (width / 4, 0) \
+         = {:?}, texel (width - 1, height - 1) = {:?}",
+        texel_at(&half, width / 4, 0),
+        texel_at(&half, width - 1, height - 1),
+        bytes = direct.len(),
+    );
+}
+
+/// The non-indexed arm beside a *sampled* texture (R39): the index view's number
+/// is claimed and left undeclared, so the views stated after it — a texture view
+/// here — have to be declared and resolvable in the trace's own namespace. A
+/// rail that skipped the number, or that declared the slot it does not state,
+/// would be refused at admission rather than landing the frame.
+#[test]
+fn a_non_indexed_draw_carrying_a_sampled_texture_lands_the_same_frame() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    let wanted = {
+        let texel = &texels[read_y * width as usize + read_x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+
+    let mut request = sampled_request(&stages, texels, (width, height));
+    request.indexed = None;
+    let provider = provider_pixels("no index buffer, sampled texture", &stages, &request);
+    assert_uniform_frame(
+        "no index buffer, sampled texture (provider)",
+        &provider,
+        width,
+        height,
+        wanted,
+    );
+    let Some(engine) = engine_pixels("no index buffer, sampled texture", &stages, request) else {
+        return;
+    };
+    assert_uniform_frame(
+        "no index buffer, sampled texture (engine)",
+        &engine,
+        width,
+        height,
+        wanted,
+    );
+    assert_frames_equal("no index buffer, sampled texture", &provider, &engine);
+    eprintln!(
+        "R39 non-indexed draw beside a sampled texture: {width}x{height} attachment, the \
+         texture's read texel {wanted:?} fills every texel on both rails, provider and engine \
+         byte-equal ({bytes} bytes)",
+        bytes = provider.len(),
+    );
+}
+
+/// Fail-closed, for the arm R39 opened: every shape whose span this rail cannot
+/// pay for stays on the engine **by name**, because an in-class refusal is a
+/// typed decline and never a fallback.
+///
+/// The contrast is the test. The *same* short stream is a typed decline on the
+/// indexed arm — the provider proves coverage of the vertices its indices name,
+/// at submission — while on the non-indexed arm the provider's own proof is
+/// `vertices * stride` over *every* per-vertex stream, which is strictly more
+/// than the indexed arm owes. A gate that let the second shape through would
+/// turn "this draw stays on the engine" into a hard failure, which is why the
+/// door is spelled before the provider is asked rather than read off the
+/// provider's answer.
+#[test]
+fn a_non_indexed_draw_the_provider_would_refuse_stays_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let delivered = provider_render::provider_submissions();
+    let refused = |req: &DrawRequest, slug: &str| match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        req,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                slug,
+                "the refusal names the condition: {reason}"
+            );
+            assert!(
+                !reason.detail().is_empty(),
+                "an out-of-class answer still carries its sentence"
+            );
+            eprintln!("door ({slug}): {}", reason.detail());
+        }
+        other => panic!("expected {slug} for this shape, got {other:?}"),
+    };
+
+    // Two vertices' worth of bytes (16) for a draw that names three: the
+    // provider's footprint proof would refuse it, and the contract's count rule
+    // below refuses the two counts that are not a triangle at all.
+    let mut short = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[stream(0, &[(-1.0, -3.0), (3.0, 1.0)])],
+    );
+    short.indexed = None;
+    refused(&short, "render_provider_out_of_class_vertex_span");
+
+    let mut empty = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    empty.indexed = None;
+    empty.vertex_count = 0;
+    refused(&empty, "render_provider_out_of_class_vertex_span");
+
+    let mut two = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    two.indexed = None;
+    two.vertex_count = 2;
+    refused(&two, "render_provider_out_of_class_vertex_span");
+
+    // `firstVertex` is the boundary it was before this increment: the contract
+    // has no spelling for a non-indexed draw that starts anywhere but zero, and
+    // the door that says so still answers first.
+    let mut offset = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    offset.indexed = None;
+    offset.first_vertex = 1;
+    refused(&offset, "render_provider_out_of_class_first_vertex");
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "every shape above stays on the engine without the provider seeing it"
+    );
+
+    // The contrast, same stream and same allocation: on the indexed arm this is
+    // in class and the *provider* proves the coverage — the refusal that would
+    // have been a hard failure here.
+    let short_indexed = request_with_streams(
+        MTL_FORMAT_RGBA8_UNORM,
+        &[stream(0, &[(-1.0, -3.0), (3.0, 1.0)])],
+    );
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &short_indexed,
+    ) {
+        RenderRailOutcome::ProviderDeclined(decline) => {
+            assert_eq!(
+                decline.slug(),
+                "provider_capability",
+                "an in-class refusal answers under this rail's provider name: {decline}"
+            );
+            let fields = decline.fields();
+            assert!(
+                fields.iter().any(|(key, value)| *key == "detail"
+                    && value.contains("render_vertex_buffer_footprint_unsupported")),
+                "the provider's own slug rides along: {fields:?}"
+            );
+            eprintln!("indexed arm, same stream: {fields:?}");
+        }
+        other => panic!(
+            "the indexed arm admits this stream and the provider proves its coverage: {other:?}"
+        ),
+    }
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the indexed arm's shape reached the provider, which is the whole contrast: the same \
+         stream on the arm this increment opened must not"
     );
 }
 
