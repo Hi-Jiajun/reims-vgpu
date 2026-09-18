@@ -4069,6 +4069,99 @@ fn guest_target_memory() -> reims_vgpu::backend::vulkan::engine::GuestTargetMemo
     }
 }
 
+/// One seed-backing fixture: a host window holding `pattern`, and the **same**
+/// allocation stated as the engine's own guest target backing.
+///
+/// Both rails have to read one set of bytes or a byte-for-byte comparison
+/// between them means nothing, and for a guest-backed attachment that set is the
+/// guest's own pages: the engine imports them as the target image's backing
+/// (`registry_ensure`'s binding equation), the provider gathers them through the
+/// owner's window ([`StageBufferWindow`], registered by
+/// [`register_seed_backing`]). The owner travels back because the registration
+/// names its pointer and the memory has to outlive every submission.
+fn seed_backing_fixture(
+    gpa_base: u64,
+    pattern: &[u8],
+    row_pitch: u64,
+) -> (
+    AlignedHost,
+    reims_vgpu::backend::vulkan::engine::GuestTargetMemory,
+) {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the window arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    assert!(
+        pattern.len() <= page,
+        "the fixture's window fits one provider page"
+    );
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..pattern.len()].copy_from_slice(pattern);
+    let memory = reims_vgpu::backend::vulkan::engine::GuestTargetMemory {
+        backing: reims_vgpu::backend::vulkan::engine::GuestTargetBacking {
+            allocation_host_ptr: owner.pointer as usize,
+            allocation_len: 2 * page as u64,
+            plane_offset: 0,
+            row_pitch,
+        },
+        import: std::sync::Arc::new(
+            reims_vgpu::runtime::guest_ram::GuestRamImport::new_host_allocation(
+                owner.pointer as usize,
+                2 * page as u64,
+                alignment,
+            )
+            .expect("the fixture's host allocation is a valid import"),
+        ),
+        footprint: reims_vgpu::runtime::guest_ram::GuestPageFootprint::new(
+            std::sync::Arc::from([gpa_base, gpa_base + 0x1000]),
+            0x1000,
+        )
+        .expect("two pages"),
+    };
+    (owner, memory)
+}
+
+/// Register a seed-backing fixture's own allocation with the provider's owner
+/// rail, and return the window the door would cut from it.
+///
+/// A separate step from [`seed_backing_fixture`] because of *when* it may run:
+/// the engine arm imports the same allocation through the guest-RAM map, and
+/// that map's advance resets this rail's registrations
+/// (`runtime::guest_ram_map` → `provider_owner::reset`). So the engine runs
+/// first — it needs no registration — and the provider's own registration is
+/// made after it, immediately before the submission that names it.
+fn register_seed_backing(
+    owner: &AlignedHost,
+    import: u64,
+    gpa_base: u64,
+    bytes_len: u64,
+) -> StageBufferWindow {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    provider_owner::register(Region {
+        import,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(gpa_base),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    StageBufferWindow {
+        import,
+        host_va: owner.pointer as u64,
+        length: page as u64,
+        head: 0,
+        bytes_len,
+    }
+}
+
 #[test]
 fn the_chain_value_the_walk_carries_reaches_the_provider() {
     let _guard = engine_test_session();
@@ -4947,75 +5040,396 @@ fn a_window_the_door_could_not_cut_keeps_the_record_on_the_engine_by_name() {
     );
 }
 
-/// R38 (RAIL-M): the seed door's own window is **named before it is admitted**.
+/// R38 (RAIL-P): the seed door's own window carries the pass, and the frame
+/// lands back in the window it began from.
 ///
-/// The measurement round the release is sized on. Census v27b put 919 records —
-/// one door, not a residue — on `render_provider_out_of_class_load_seed`, and
-/// the one question a release cannot answer about its own population is *which*
-/// of those records have a window the contract can state at all: the mapper-ref
-/// surface's own pages, cut into the ordered run list `BufferSource::GuestRuns`
-/// names. So this round asks the door, names every answer, and admits nothing.
+/// `render_provider_out_of_class_load_seed` is one door — census v27b's 919 rows
+/// are the mapper-ref-texture surface's own guest backing, key for key with
+/// `mapper_ref_texture_seed_provided` — and the class's sentence for it named a
+/// *write* half B1-B3 had already landed (E-TX8's `StoreOp::Borrowed`) while the
+/// read half stayed unwired, because `carried_attachment_guest_window` is only
+/// ever set inside the `load_from_target` branch.
 ///
-/// Four readings, and each is falsifiable on its own:
+/// This test drives the released arm against a **real** registered host region
+/// (the owner rail's own import, the primitive the R9d/R11/R28/B1 window tests
+/// use) and asserts the four things the release is worth:
 ///
-/// * a window that **cuts** is counted under `…_load_seed_backing_window` — the
-///   declarable population, and an upper bound, because a measurement round pays
-///   no debt and so cannot yet separate a window the landing would have held
-///   from one it would not — and the record still keeps the engine under the
-///   door's own bucket. The bucket is the v27b number, deliberately untouched:
-///   a round in which the bucket itself moved could not be told apart from a
-///   release;
-/// * a window that does **not** cut is counted under the name R32's own run-list
-///   arm already gives that fact (`…_load_seed_rows` here), so the two doors'
-///   residuals stay one vocabulary rather than two;
-/// * a fact the door answers *before* it reaches the list — the mapping's
-///   geometry, an unpaid landing, a moved identity, the host's alias — keeps its
-///   B1 window route (`resident_source_window_*`), charged beside the same
-///   bucket;
-/// * a record the seam states **no** window for is refused exactly as it was
-///   before this increment: the door is the one producer of this input, so an
-///   absent answer is a wiring bug and never a fallback.
+/// * the pass begins from the window's own bytes — the undrawn half of the frame
+///   is the registered memory, texel for texel, and a rewrite of that memory
+///   moves the frame with it (`INV-BORROW`: the provider gathers the guest's
+///   live pages rather than a copy of anything);
+/// * the record left the engine: `render_provider_out_of_class_load_seed` does
+///   not move while the submission count does;
+/// * the door's own population is a number of its own
+///   (`render_provider_seed_attachment_guest_window_bytes`) beside the merged
+///   window name, so a census can say *which* door grew;
+/// * `INV-RETURN`: the frame the provider published is what the registered
+///   window holds afterwards — the half a rail that only loaded the window
+///   could not produce, and the half the guest's own pages are owed.
 #[test]
-fn the_seed_backings_own_window_is_named_before_it_is_admitted() {
-    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
-
+fn the_seed_backings_own_window_carries_the_pass_and_receives_its_frame() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
     let (width, height) = (8u32, 4u32);
+    let half = width / 2;
     let frame_len = u64::from(width) * u64::from(height) * 4;
-    let alignment = host_import_alignment().expect("the owner rail's provider answers");
-    assert!(
-        alignment > 0,
-        "this device must advertise VK_EXT_external_memory_host for the window arm"
-    );
-    let page = usize::try_from(alignment).expect("the alignment fits usize");
-    assert!(
-        frame_len <= page as u64,
-        "the fixture's window fits one provider page"
-    );
-    let mut owner = AlignedHost::new(2 * page, page);
-    owner.as_mut_slice()[..frame_len as usize].fill(0x3c);
-    let import = 0x9e3a_u64;
-    provider_owner::register(Region {
-        import,
-        epoch: device_epoch().expect("the rail's provider epoch"),
-        host_pointer: owner.pointer as usize,
-        length: 2 * page as u64,
-        page_size: alignment,
-        gpa_base: Some(0x55_0000),
-    })
-    .expect("a page-aligned registration is a legal provider region");
-    let window = StageBufferWindow {
-        import,
-        host_va: owner.pointer as u64,
-        length: page as u64,
-        head: 0,
-        bytes_len: frame_len,
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
     };
+    // Per-texel bytes rather than one colour: which bytes the pass began from is
+    // read texel by texel, in the half this pass does not draw.
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+
+    let import = 0x9e3b_u64;
+    let gpa_base = 0x55_1000_u64;
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &pattern(0), 4 * u64::from(width));
+
+    // The door's own request shape: the attachment the mapper-ref-texture
+    // surface's guest allocation backs, a load that preserves what is already
+    // there, no seed bytes of the caller's own, the withheld readback the
+    // census's shapes show, and the partial scissor that leaves the window's
+    // bytes readable in the frame.
+    let identity = surface_identity(0x7c_38_02);
+    let memory = std::sync::Arc::new(memory);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = true;
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+    // The engine's own answer for the same **contents**, first: these pages are
+    // what the record begins from, and the two rails have to land one frame.
+    //
+    // The comparison goes through the engine's byte arm (`target_rgba8`, the
+    // load R32's own test already pins against the engine) rather than through
+    // its guest-backed one, because the latter is the engine's *device* path:
+    // it imports the allocation through the guest-RAM map, which an off-VM rail
+    // test cannot mint — and minting it here would reset the provider's own
+    // registrations, as the map's advance does for a live device. What the
+    // assertion therefore pins is the half a rail can get wrong on its own: the
+    // bytes the pass begins from and the frame it lands, byte for byte.
+    let engine_request = {
+        let mut req = request();
+        req.target_rgba8 = Some(std::sync::Arc::new(pattern(0)));
+        req.guest_target_memory = None;
+        req.load_guest_target_backing = false;
+        req.skip_readback = false;
+        req.readback_skip_reason = ReadbackSkipReason::None;
+        req
+    };
+    let Some(engine) = engine_pixels("R38 seed backing window", &stages, engine_request) else {
+        return;
+    };
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&pattern(0));
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let deliveries = provider_render::provider_submissions();
+    let bucket_before = route_count("render_provider_out_of_class_load_seed");
+    let seed_window_before = route_count("render_provider_seed_attachment_guest_window_bytes");
+    let window_bytes_before = route_count("render_provider_attachment_guest_window_bytes");
+    let seeded_runs_before = route_count("render_provider_load_seed_runs");
+    let landing_before = route_count("render_provider_borrowed_landing_bytes");
+    let frame = {
+        let single = [window];
+        let inputs = inputs_with_seed_window(&stages, RenderChainRole::SoleOrTail, &single);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => {
+                panic!("the seed door's own window is in class once the seam states it: {other:?}")
+            }
+        }
+    };
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the released shape reaches the canonical provider instead of the engine"
+    );
+    assert_eq!(
+        frame.len(),
+        frame_len as usize,
+        "the whole attachment comes back"
+    );
+    assert_frames_equal("R38 seed backing window, both rails", &frame, &engine);
+    for x in 0..half {
+        assert_texel_near(
+            &format!("seed backing window: drawn texel ({x}, 0)"),
+            texel(&frame, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            let expected = pattern(0)[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&frame, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) is the window's own byte: a rail that read anything else — the \
+                 engine's readback, the pooled image, or bytes of its own making — lands a \
+                 different picture here"
+            );
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_seed_attachment_guest_window_bytes") - seed_window_before,
+        frame_len,
+        "the door's own population is priced at the attachment's extent"
+    );
+    assert_eq!(
+        route_count("render_provider_attachment_guest_window_bytes") - window_bytes_before,
+        frame_len,
+        "the merged window name moves with it: the declaration is the same one"
+    );
+    assert_eq!(
+        route_count("render_provider_load_seed_runs") - seeded_runs_before,
+        0,
+        "R32's run-list arm is the other seed door: the same shape, two callers, two numbers"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landing_before,
+        frame_len,
+        "the record whose frame the guest's pages are owed landed it in the window it began \
+         from (E-TX8)"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed") - bucket_before,
+        0,
+        "an answered seed backing is no longer an out-of-class shape"
+    );
+
+    // `INV-RETURN`, the falsifiable half: the provider's own store wrote the
+    // frame into the *registered* window, so the memory the test owns now holds
+    // the frame — including the half this pass never drew.
+    let landed = owner.as_mut_slice()[..frame_len as usize].to_vec();
+    assert_eq!(
+        landed, frame,
+        "the window holds the frame the provider published: a rail that only loaded it would \
+         leave the pre-pass pattern in every undrawn texel"
+    );
+
+    // `INV-BORROW`, the other falsifiable half: rewrite the window's own bytes
+    // and the frame follows them — the provider reads the guest's live pages and
+    // not a snapshot this rail took when the window was cut.
+    let other = pattern(0x5a);
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&other);
+    let moved = {
+        let single = [window];
+        let inputs = inputs_with_seed_window(&stages, RenderChainRole::SoleOrTail, &single);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!("the same window with other bytes: {other:?}"),
+        }
+    };
+    assert_frames_differ("the window's own bytes reach the frame", &frame, &moved);
+    for y in 0..height {
+        for x in half..width {
+            assert_eq!(
+                texel(&moved, x, y).to_vec(),
+                other[((y * width + x) * 4) as usize..][..4].to_vec(),
+                "texel ({x}, {y}) follows the bytes the window holds"
+            );
+        }
+    }
+    eprintln!(
+        "R38 seed backing window: {width}x{height} attachment, {frame_len} byte window in \
+         registration {import:#x}; the undrawn half is the window's own bytes and follows a \
+         rewrite of them; counters \
+         render_provider_seed_attachment_guest_window_bytes +{frame_len}, \
+         render_provider_attachment_guest_window_bytes +{frame_len}, \
+         render_provider_borrowed_landing_bytes +{frame_len}, render_provider_load_seed_runs \
+         +0, render_provider_out_of_class_load_seed +0; the registered memory holds the \
+         published frame byte for byte"
+    );
+}
+
+/// R38 (RAIL-C): the other half of the census's split — the record whose frame
+/// goes back to the caller.
+///
+/// v27b's latched shapes split the door's population by where the frame goes:
+/// the `wb=1` tails, whose frame the guest's pages are owed, and the `wb=0`
+/// records, whose frame the exec walk consumes as the next record's chain value.
+/// Only the first may land; a `Borrowed` store elected for the second would
+/// write a frame into pages no reader asked that record to write, which is why
+/// B3's election is gated on `SoleOrTail` rather than on the window alone.
+///
+/// The release adds no condition to that election, so this test pins what "no
+/// condition" means: the window is still declared (the pass has to begin from
+/// those pages either way), the store is the pooled publish, and the memory the
+/// window names is left exactly as it was — the drawn half included.
+#[test]
+fn the_seed_backings_window_loads_where_the_frame_goes_to_the_caller() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+
+    let import = 0x9e3c_u64;
+    let gpa_base = 0x55_3000_u64;
+    let source = pattern(0);
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &source, 4 * u64::from(width));
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+    let identity = surface_identity(0x7c_38_03);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some(memory.clone());
+        req.load_guest_target_backing = true;
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+
+    let deliveries = provider_render::provider_submissions();
+    let window_before = route_count("render_provider_seed_attachment_guest_window_bytes");
+    let landing_before = route_count("render_provider_borrowed_landing_bytes");
+    let bucket_before = route_count("render_provider_out_of_class_load_seed");
+    let frame = {
+        let single = [window];
+        let inputs = inputs_with_seed_window(&stages, RenderChainRole::Head, &single);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => {
+                panic!("a record whose frame goes to the caller is in class: {other:?}")
+            }
+        }
+    };
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the record still leaves for the provider: its load is the window, whatever its store is"
+    );
+    for x in 0..half {
+        assert_texel_near(
+            &format!("seed backing window, caller store: drawn texel ({x}, 0)"),
+            texel(&frame, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            assert_eq!(
+                texel(&frame, x, y).to_vec(),
+                source[((y * width + x) * 4) as usize..][..4].to_vec(),
+                "texel ({x}, {y}) keeps the window's own byte: the load is the window even where                  the frame is the caller's"
+            );
+        }
+    }
+    assert_eq!(
+        route_count("render_provider_seed_attachment_guest_window_bytes") - window_before,
+        frame_len,
+        "the door's own population moves for this position too: the window is the load"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landing_before,
+        0,
+        "no frame lands in the guest's pages for a record that does not owe them one: B3's \
+         election keeps its `SoleOrTail` gate"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed") - bucket_before,
+        0,
+        "and the record is answered rather than refused"
+    );
+    // `INV-RETURN`'s negative half: nothing wrote the window. The drawn half of
+    // the registered memory is still the pre-pass pattern, while the frame the
+    // caller received carries the fragment's texel there.
+    for x in 0..half {
+        assert_eq!(
+            texel(owner.as_mut_slice(), x, height / 2).to_vec(),
+            source[(((height / 2) * width + x) * 4) as usize..][..4].to_vec(),
+            "texel ({x}, {}) in the registered memory is untouched: a `Borrowed` store elected \
+             here would have landed the frame in it",
+            height / 2
+        );
+    }
+    eprintln!(
+        "R38 seed backing window, caller store: {width}x{height} attachment, {frame_len} byte \
+         window in registration {import:#x}; the load is the window (+{frame_len}) while \
+         render_provider_borrowed_landing_bytes stays +0 and the registered memory keeps its \
+         pre-pass bytes"
+    );
+}
+
+/// R38 (RAIL-N): a window the seed door could not cut keeps the record on the
+/// engine **by name**, and no arm of it reaches the provider.
+///
+/// Every shape here is one the door answers *with its own vocabulary*, so each
+/// has to be the number the census reads for it:
+///
+/// * the run-list facts answer under the four names R32's own list arm already
+///   gives them — one family for the two doors that ask one question of one
+///   list, so the residuals of both are readable in one vocabulary;
+/// * the facts the door answers *before* it reaches the list (the mapping's
+///   geometry, an unpaid landing, a moved identity) keep the door's own bucket
+///   and are charged under the B1 window's route names, which is also the name
+///   `INV-LAND` answers under: a landing that could not be paid is the one
+///   condition that would otherwise hand the provider stale bytes with no
+///   counter moving;
+/// * a record the seam states **no** window for keeps the door's refusal exactly
+///   as it was: the door is the one producer of this input, so an absent answer
+///   is a wiring bug and never a fallback.
+#[test]
+fn the_seed_backings_window_refusals_keep_the_record_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
 
     // The door's own request shape: the attachment the mapper-ref-texture
     // surface's guest allocation backs, a load that preserves what is already
     // there, no seed bytes, and the withheld readback the census's shapes show.
+    // Every case below is a *refusal*, so no window has to be registered: the
+    // class answers before the provider is ever reached, which is exactly what
+    // the submission count at the end asserts.
     let identity = surface_identity(0x7c_38_01);
     let request = || {
         let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
@@ -5034,106 +5448,151 @@ fn the_seed_backings_own_window_is_named_before_it_is_admitted() {
         });
         req
     };
-    let refused = |label: &str, inputs: &RenderRailInputs<'_>| match provider_render::submit_render(
-        inputs,
-        &request(),
-    ) {
-        RenderRailOutcome::NotInNarrowClass(reason) => {
-            assert_eq!(
-                reason.slug(),
-                "render_provider_out_of_class_load_seed",
-                "{label}: the round names the window beside the door's own bucket, and the \
-                     bucket is the v27b reading: {reason}"
-            );
-            eprintln!("R38 measurement {label}: {}", reason.detail());
-        }
-        other => panic!("{label}: the measurement round admits nothing, got {other:?}"),
-    };
-
+    // One case per fact, each stated the way the seam would state it, each
+    // expected to answer under its own name.
+    let listed: [(&str, ResidentSourceRoute, &str); 5] = [
+        (
+            "padded rows",
+            ResidentSourceRoute::WindowPaddedRows,
+            "render_provider_out_of_class_load_seed_rows",
+        ),
+        (
+            "a span that is not the attachment's extent",
+            ResidentSourceRoute::WindowExtent,
+            "render_provider_out_of_class_load_seed_extent",
+        ),
+        (
+            "runs in two registrations",
+            ResidentSourceRoute::WindowRegistrations,
+            "render_provider_out_of_class_load_seed_registrations",
+        ),
+        (
+            "no registered import",
+            ResidentSourceRoute::WindowUnregistered,
+            "render_provider_out_of_class_load_seed_runs",
+        ),
+        (
+            "a stretch with no registered window",
+            ResidentSourceRoute::WindowUnwindowed,
+            "render_provider_out_of_class_load_seed_runs",
+        ),
+    ];
+    // The facts the door answers before it reaches the list: the door's own
+    // bucket, charged under the window's route name.
+    let doors: [(&str, ResidentSourceRoute, &str); 3] = [
+        (
+            "a mapping whose geometry is not the attachment's",
+            ResidentSourceRoute::WindowGeometry,
+            "resident_source_window_geometry",
+        ),
+        (
+            "a landing that could not be paid",
+            ResidentSourceRoute::WindowLandingRefused,
+            "resident_source_window_landing_refused",
+        ),
+        (
+            "an identity that moved",
+            ResidentSourceRoute::WindowIdentityMoved,
+            "resident_source_window_identity_moved",
+        ),
+    ];
     let deliveries = provider_render::provider_submissions();
     let bucket_before = route_count("render_provider_out_of_class_load_seed");
-    let declarable_before = route_count("render_provider_out_of_class_load_seed_backing_window");
-    let rows_before = route_count("render_provider_out_of_class_load_seed_rows");
-    let runs_before = route_count("render_provider_out_of_class_load_seed_runs");
-    let geometry_before = route_count("resident_source_window_geometry");
     let seeded_runs_before = route_count("render_provider_load_seed_runs");
-
-    // 1. The window cuts: named as the declarable population, still kept.
-    let single = [window];
-    refused(
-        "a window that cuts",
-        &inputs_with_seed_window(&stages, RenderChainRole::SoleOrTail, &single),
-    );
-    assert_eq!(
-        route_count("render_provider_out_of_class_load_seed_backing_window") - declarable_before,
-        1,
-        "the declarable population is the number the release is sized on"
-    );
-
-    // 2. The window does not cut, and the fact has a name in R32's own family.
-    refused(
-        "padded rows",
-        &inputs_with_seed_window_refusal(
-            &stages,
-            RenderChainRole::SoleOrTail,
-            ResidentSourceRoute::WindowPaddedRows,
-        ),
-    );
-    assert_eq!(
-        route_count("render_provider_out_of_class_load_seed_rows") - rows_before,
-        1,
-        "a run list cannot state a padded row, and the name is the one R32's arm already uses"
-    );
-    refused(
-        "no registered window",
-        &inputs_with_seed_window_refusal(
-            &stages,
-            RenderChainRole::SoleOrTail,
-            ResidentSourceRoute::WindowUnwindowed,
-        ),
-    );
-    assert_eq!(
-        route_count("render_provider_out_of_class_load_seed_runs") - runs_before,
-        1,
-        "the bytes are not nameable as an owner window, which is R32's `_runs` fact"
-    );
-
-    // 3. A fact the door answers before it cuts keeps the B1 window's route.
-    refused(
-        "a mapping whose geometry is not the attachment's",
-        &inputs_with_seed_window_refusal(
-            &stages,
-            RenderChainRole::SoleOrTail,
-            ResidentSourceRoute::WindowGeometry,
-        ),
-    );
-    assert_eq!(
-        route_count("resident_source_window_geometry") - geometry_before,
-        1,
-        "one name per fact, and this fact's name is the window's own"
-    );
-
-    // 4. No seam answer: the door refuses exactly as it did before this round,
-    //    which is what makes an absent answer a wiring bug rather than a shape.
-    refused(
-        "no window stated",
-        &inputs_held(&stages, RenderChainRole::SoleOrTail),
-    );
-
+    for (label, route, bucket) in listed {
+        let before = route_count(bucket);
+        let inputs = inputs_with_seed_window_refusal(&stages, RenderChainRole::SoleOrTail, route);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    bucket,
+                    "{label}: the fact is named in R32's own run-list family: {reason}"
+                );
+                eprintln!("R38 seed backing refusal {label}: {}", reason.detail());
+            }
+            other => {
+                panic!("{label}: a window the door could not cut stays on the engine: {other:?}")
+            }
+        }
+        assert_eq!(
+            route_count(bucket) - before,
+            1,
+            "{label}: {bucket} is the number the census reads for its own fact"
+        );
+    }
+    // The facts outside that family keep the door's own bucket and are charged
+    // under the window's own route name: the by-name discipline the census reads
+    // is the route, and the bucket stays the population the door answered for.
+    for (label, route, name) in doors {
+        let before = route_count(name);
+        let inputs = inputs_with_seed_window_refusal(&stages, RenderChainRole::SoleOrTail, route);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_load_seed",
+                    "{label}: a fact outside the run-list family keeps the door's bucket: {reason}"
+                );
+                eprintln!("R38 seed backing refusal {label}: {}", reason.detail());
+            }
+            other => {
+                panic!("{label}: a window the door could not cut stays on the engine: {other:?}")
+            }
+        }
+        assert_eq!(
+            route_count(name) - before,
+            1,
+            "{label}: the route {name} is the number the census reads for its own fact"
+        );
+    }
     assert_eq!(
         route_count("render_provider_out_of_class_load_seed") - bucket_before,
-        5,
-        "all five readings are the door's own bucket: the round moves no edge"
+        3,
+        "only the three door facts keep the door's own bucket — the run-list facts answer in \
+         R32's family — and the wiring case below is the fourth answer"
     );
     assert_eq!(
         route_count("render_provider_load_seed_runs") - seeded_runs_before,
         0,
         "R32's own run-list arm is a different door and does not move here"
     );
+
+    // No seam answer at all: the door refuses exactly as it did before this
+    // increment, which is what makes an absent answer a wiring bug rather than a
+    // shape this class quietly runs.
+    let deliveries_before_missing = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &request(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(reason.slug(), "render_provider_out_of_class_load_seed");
+            assert!(
+                reason.detail().contains("states no window"),
+                "the sentence names the wiring bug: {reason}"
+            );
+            eprintln!(
+                "R38 seed backing refusal no seam answer: {}",
+                reason.detail()
+            );
+        }
+        other => panic!("a seed backing with no window stated keeps the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_seed") - bucket_before,
+        4,
+        "the missing-answer case is the fourth charge to the door's own bucket"
+    );
     assert_eq!(
         provider_render::provider_submissions(),
         deliveries,
-        "a measurement round never reaches the provider: it names, and it keeps"
+        "a seed the class cannot state never reaches the provider"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries_before_missing,
+        "and the wiring case does not reach it either"
     );
 }
 

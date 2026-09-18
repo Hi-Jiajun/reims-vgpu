@@ -2799,93 +2799,6 @@ fn mapper_ref_attachment_window<M: HostMemory + HostOps>(
         .map_err(AttachmentWindowMiss::Runs)
 }
 
-/// The **seed door's** own window, cut without paying the debt (R38, the
-/// measurement round).
-///
-/// This is [`mapper_ref_attachment_window`] minus its payment: the same geometry
-/// and texel-format checks against the mapping's own declaration, the same
-/// host-alias question, the same [`mapping_window_guest_runs`] walk, and the
-/// same [`crate::backend::provider_render::load_seed_run_windows`] cut. It
-/// exists for exactly one round — the one that *names* the seed door's window
-/// population without admitting a record — because `INV-LAND` is the release's
-/// rule: a measurement round that paid a debt it never reads would change the
-/// run it is measuring, and the debt a still-refused record's own engine pass
-/// pays for itself has to stay where that pass puts it.
-///
-/// The release calls [`mapper_ref_attachment_window`] instead, whose
-/// `landed_or_current()` gate is what turns "these pages are the surface's" into
-/// "these pages hold what the door read".
-#[cfg(feature = "provider-render")]
-fn mapper_ref_seed_window_measure<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    w: u32,
-    h: u32,
-    target_format: ash::vk::Format,
-    extent: u64,
-) -> Result<Vec<crate::backend::provider_render::StageBufferWindow>, AttachmentWindowMiss> {
-    use crate::backend::vulkan::engine::GuestRunSource;
-    use crate::runtime::mapping_write::mapper_ref_texture_sample_window;
-
-    if w == 0 || h == 0 || !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
-        return Err(AttachmentWindowMiss::Geometry);
-    }
-    let (base_off, bpr, layout) = {
-        let Some(mapping) = state.mappings.get(&mapping_id) else {
-            return Err(AttachmentWindowMiss::Geometry);
-        };
-        if !mapping.mapped
-            || mapping.page_entries.is_empty()
-            || !mapping.has_geom
-            || mapping.width != w
-            || mapping.height != h
-        {
-            return Err(AttachmentWindowMiss::Geometry);
-        }
-        let format = if mapping.format == 0 {
-            pixel_format::MTL_FORMAT_BGRA8_UNORM
-        } else {
-            mapping.format
-        };
-        let Some(layout) = pixel_format::store_texel_order(format) else {
-            return Err(AttachmentWindowMiss::Geometry);
-        };
-        let Some((base_off, bpr, _)) = mapper_ref_texture_sample_window(mapping, w, h, format)
-        else {
-            return Err(AttachmentWindowMiss::Geometry);
-        };
-        (base_off, u64::from(bpr), layout)
-    };
-    let source_format = translate::pixel::vk_texel_layout(layout);
-    if source_format != target_format {
-        return Err(AttachmentWindowMiss::Geometry);
-    }
-    let Some((span, row_length_texels)) =
-        strided_window_extent(w, h, u64::from(layout.bytes_per_texel()), bpr)
-    else {
-        return Err(AttachmentWindowMiss::Geometry);
-    };
-    if !guest_run_alias_available(host) {
-        return Err(AttachmentWindowMiss::NoAlias);
-    }
-    let Some((gpas, runs)) = mapping_window_guest_runs(state, host, mapping_id, base_off, span)
-    else {
-        return Err(AttachmentWindowMiss::Untileable);
-    };
-    let page = state.page_size();
-    let source = GuestRunSource {
-        runs: std::sync::Arc::new(runs),
-        source_offset: 0,
-        total_len: span,
-        row_length_texels,
-        pages: guest_page_window(host, gpas, page, base_off % page, span),
-        direct_image: None,
-    };
-    crate::backend::provider_render::load_seed_run_windows(&source, extent)
-        .map_err(AttachmentWindowMiss::Runs)
-}
-
 /// The attachment's own guest window for one **GVA** LOAD elision (B1).
 ///
 /// The GVA sibling of [`mapper_ref_attachment_window`] on the same three rules:
@@ -10108,6 +10021,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // and the format is the resident's own — the identity the record
             // names is the mapper-ref identity by the guard this block is
             // inside, so this is the same value the elision door reads.
+            //
+            // The cut is [`mapper_ref_attachment_window`], the elision door's
+            // own call: it lands the frame the surface's pages are owed before
+            // it names them (`INV-LAND`, `pay_for_mapping`'s
+            // `landed_or_current()`), and that gate is what makes these pages
+            // the record's previous contents rather than merely the pages the
+            // surface happens to occupy. A window the payment or the walk
+            // refuses travels out as its own route and the class keeps the
+            // record on the engine by name.
             #[cfg(feature = "provider-render")]
             if resources.load_guest_target_backing {
                 if let (Some(c0), Some(extent)) = (req.colors.first(), attachment_window_extent) {
@@ -10116,7 +10038,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .as_ref()
                         .map(|identity| identity.resident_format())
                         .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
-                    match mapper_ref_seed_window_measure(
+                    match mapper_ref_attachment_window(
                         state,
                         host,
                         c0.mapping_id,
