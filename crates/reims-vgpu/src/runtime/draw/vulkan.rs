@@ -8832,6 +8832,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut mapper_ref_load_handover: Option<
             crate::backend::vulkan::engine::TargetIdentity,
         > = None;
+        // R34: which of the two LOAD elisions opened this record's chain, so
+        // the class's one `resident_source` refusal can be counted by the door
+        // that produced it (`provider_render::ResidentSourceRoute`). The third
+        // door — the serialized packet chain — is
+        // `chain_source_is_engine_resident` above, and the three are mutually
+        // exclusive by construction, because each elision returns early when
+        // `chain_load_from_target` is already set.
+        //
+        // The class cannot tell the doors apart: the request it reads carries
+        // no field that names an elision, and all three arrive as the same
+        // sentence — the caller can neither read a frame this rail keeps nor
+        // hand the frame over. That is why the route is the seam's fact and the
+        // class is only its counter.
+        //
+        // Each flag is taken from its own door's answer rather than from
+        // `chain_load_from_target`, which all three of them set — so the GVA
+        // one is bound where its call answers, below, rather than here.
+        #[cfg(feature = "provider-render")]
+        let mut mapper_ref_load_elided = false;
         // Resolved once and read by both the Load gate below and the
         // `target_identity` assignment further down, so the record that loads
         // from a resident is by construction the record that renders into it.
@@ -8861,6 +8880,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // pages. Honour that here, or put the seed back.
         let mut gva_load_identity =
             honour_gva_load_elision(state, host, req, &mut chain_load_from_target);
+        // R34: this door's own flag, taken from the call's answer. It is `Some`
+        // exactly on the arm that chained (`gvaseed_chained`), and `None` for
+        // both the re-seeded arm and the arm that never ran — neither of which
+        // leaves a chain the class can refuse under this route.
+        #[cfg(feature = "provider-render")]
+        let gva_load_elided = gva_load_identity.is_some();
         // Mapper-ref-texture composite Load. A retained guest-allocation target is the
         // guest's texture resource itself, so its LOAD is authoritative without
         // comparing two copies. A device-allocation target is a mirror: only
@@ -8980,6 +9005,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if resident_current {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("mapper_ref_texture_seed_elided");
+                    // R34: this door's own flag, beside the hand-over above it.
+                    // A record without the guest writeback elides its LOAD but
+                    // lands nothing, so it has no frame to hand on and no
+                    // landing to advance the epoch the elision reads — and it
+                    // is exactly that half of the door the census has to be
+                    // able to count.
+                    #[cfg(feature = "provider-render")]
+                    {
+                        mapper_ref_load_elided = true;
+                    }
                     // R26: this record's own frame is the one that lands in the
                     // mapping's guest pages, so this is the record whose frame
                     // the canonical rail may be handed — and whose landing
@@ -10359,11 +10394,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // gate is pure and these bytes have to be part of the request it
             // answers.
             #[cfg(feature = "provider-render")]
+            let mut chain_source_miss = None;
+            #[cfg(feature = "provider-render")]
             let resident_source_frame = if chain_source_is_engine_resident {
-                resources
-                    .target_identity
-                    .as_ref()
-                    .and_then(|identity| resident_chain_source_frame(&resources, identity))
+                match resources.target_identity.as_ref() {
+                    Some(identity) => match resident_chain_source_frame(&resources, identity) {
+                        Ok(frame) => Some(frame),
+                        // R34: the read declined, and the class is about to
+                        // refuse this record under `resident_source` — unless an
+                        // earlier gate answers first, which is why the route is
+                        // charged by the gate and not here.
+                        Err(miss) => {
+                            chain_source_miss = Some(miss);
+                            None
+                        }
+                    },
+                    // The class refuses a chain that names no identity under
+                    // its own slug (`render_provider_out_of_class_resident_
+                    // identity`) before it reaches this refusal, so no route of
+                    // this bucket's is reachable for such a record.
+                    None => None,
+                }
             } else {
                 None
             };
@@ -10380,6 +10431,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // cannot travel as four-byte colour, and for a readback that is not
             // ready; those keep the class's refusal by name.
             #[cfg(feature = "provider-render")]
+            let mut mapper_ref_source_miss = None;
+            #[cfg(feature = "provider-render")]
             let surface_resident_source_frame = match mapper_ref_load_handover.as_ref() {
                 // The identity the elision named has to be the identity this
                 // record's own attachment names, or the frame read here would
@@ -10391,13 +10444,35 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // asked rather than assumed, and a disagreement hands nothing
                 // over (the class then refuses the record by name).
                 Some(identity) if resources.target_identity.as_ref() == Some(identity) => {
-                    let frame = resident_chain_source_frame(&resources, identity);
-                    if frame.is_some() {
-                        crate::runtime::drain::note_store_route("mapper_ref_texture_seed_carried");
+                    match resident_chain_source_frame(&resources, identity) {
+                        Ok(frame) => {
+                            crate::runtime::drain::note_store_route(
+                                "mapper_ref_texture_seed_carried",
+                            );
+                            Some(frame)
+                        }
+                        // R34: this door's third route, one arm for all four of
+                        // `ChainFrameMiss`'s — the door's first question is
+                        // whether it landed at all.
+                        Err(_) => {
+                            mapper_ref_source_miss = Some(MapperRefFrameMiss::Frame);
+                            None
+                        }
                     }
-                    frame
                 }
-                _ => None,
+                Some(_) => {
+                    mapper_ref_source_miss = Some(MapperRefFrameMiss::Identity);
+                    None
+                }
+                // R34: the elision fired and this record's own frame does not
+                // land in the mapping's guest pages. The flag is what separates
+                // this arm from the record that was never a candidate at all —
+                // the hand-over is `None` for both, and only one of them is
+                // this bucket's population.
+                None => {
+                    mapper_ref_source_miss = Some(MapperRefFrameMiss::NoLanding);
+                    None
+                }
             };
             // This record's place in the packet the exec loop is walking: the
             // store plan's `do_writeback` says where the frame goes, and
@@ -10467,6 +10542,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             #[cfg(feature = "provider-render")]
             let sampled_target_frames =
                 sampled_target_frames(&resources, &mut sampled_target_frame_store);
+            // R34: the route the class's one `resident_source` refusal is
+            // charged under, for the record whose chain neither byte arm above
+            // carried. The doors are this layer's own facts (each is set where
+            // its door fired) and the two misses are its two reads' own
+            // answers; the class charges the route only where it refuses, so a
+            // record an earlier gate answers first — no target identity, or
+            // guest bytes beside the live image — leaves the route uncounted
+            // instead of filing it under a refusal it never got.
+            #[cfg(feature = "provider-render")]
+            let resident_source_route = ResidentSourceDoors {
+                chain_load_from_target,
+                chain_elided: chain_source_is_engine_resident,
+                gva_elided: gva_load_elided,
+                mapper_ref_elided: mapper_ref_load_elided,
+                chain_miss: chain_source_miss,
+                mapper_ref_miss: mapper_ref_source_miss,
+            }
+            .route();
             let inputs = RenderRailInputs {
                 vertex_air: resolved.vertex_air.as_ref(),
                 fragment_air: resolved.fragment_air.as_ref(),
@@ -10510,6 +10603,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // mapper-ref-texture records without a guest writeback hand
                 // nothing over and keep the class's refusal by name.
                 surface_resident_source_bytes: surface_resident_source_frame.as_deref(),
+                // R34: which door left this record's chain uncarried, when
+                // neither arm above could carry it. The class's refusal for
+                // that shape is one slug and one sentence, and this is the fact
+                // that says which of the three doors — the serialized chain,
+                // the GVA elision, the mapper-ref-texture elision — produced
+                // it, together with what the read declined on.
+                resident_source_route,
                 // R25: the frame the record *before* this one produced, when
                 // this record is the packet's middle and the caller holds that
                 // frame as the walk's own chain value
@@ -11925,8 +12025,11 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
 ///
 /// This is a *question* rather than a payment, which is why it is not
 /// [`read_resident_chain`]: a caller asks whether the chain's frame can travel
-/// as bytes into the canonical rail, and `None` is the class's own answer — the
-/// record then stays on the engine, which loads the image in place. Nothing
+/// as bytes into the canonical rail, and a [`ChainFrameMiss`] is the class's own
+/// answer — the record then stays on the engine, which loads the image in
+/// place. R34 makes the four declines nameable rather than one shared `None`,
+/// because the class charges them under four census routes
+/// ([`ChainFrameMiss::chain_route`]); the read itself is unchanged. Nothing
 /// here reports `chain_resident_land_fail`, because that name belongs to the
 /// rails that *owed* a frame and could not produce one; census v15's 6 824 land
 /// failures are the population that rule exists for, and a speculative read
@@ -11935,35 +12038,188 @@ pub(crate) fn gva_resident_format(format: u16) -> ash::vk::Format {
 /// The order is the identity's own ([`TargetIdentity::is_bgra`]), which is what
 /// `DrawRequest::target_seed_order` documents as the attachment's order, and the
 /// readback narrows four-byte colour only: a resident wider than that (`Native`)
-/// answers `None` here and the class keeps its refusal by name. The bytes are
-/// the whole tightly packed extent, which is the length the canonical
-/// attachment's declaration has to carry.
+/// answers [`ChainFrameMiss::Texel`] here and the class keeps its refusal by
+/// name. The bytes are the whole tightly packed extent, which is the length the
+/// canonical attachment's declaration has to carry.
 #[cfg(feature = "provider-render")]
 fn resident_chain_source_frame(
     req: &crate::backend::vulkan::engine::DrawRequest,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, ChainFrameMiss> {
     // The bytes have to be the attachment's own texel at the attachment's own
     // extent, because the canonical rail uploads them verbatim into the pass's
     // image. The identity's order is the attachment's by the rule
     // `DrawRequest::target_seed_order` states, and the two extents are one
     // value here by construction — but a request whose attachment view names
     // the other order, or another geometry, is a shape this arm does not carry,
-    // and `None` is the answer that keeps it on the engine.
-    let attachment_bgra = req
+    // and the refusal below is the answer that keeps it on the engine.
+    let Some(attachment_bgra) = req
         .color_attachment
-        .map(|state| translate::pixel::has_bgra_order(state.format()))?;
-    if attachment_bgra != identity.is_bgra()
-        || identity.width() != req.width
-        || identity.height() != req.height
-    {
-        return None;
+        .map(|state| translate::pixel::has_bgra_order(state.format()))
+    else {
+        return Err(ChainFrameMiss::Order);
+    };
+    if attachment_bgra != identity.is_bgra() {
+        return Err(ChainFrameMiss::Order);
     }
-    let frame = crate::backend::vulkan::engine::read_target(identity).ok()?;
-    if identity.is_bgra() {
+    if identity.width() != req.width || identity.height() != req.height {
+        return Err(ChainFrameMiss::Geometry);
+    }
+    let Ok(frame) = crate::backend::vulkan::engine::read_target(identity) else {
+        return Err(ChainFrameMiss::Read);
+    };
+    let narrowed = if identity.is_bgra() {
         frame.into_bgra8()
     } else {
         frame.into_rgba8()
+    };
+    narrowed.ok_or(ChainFrameMiss::Texel)
+}
+
+/// Why [`resident_chain_source_frame`] handed nothing over (R34).
+///
+/// One arm per `return` in that function, because the four are four different
+/// answers about a record the class then refuses under one name: an order the
+/// caller could fold, an extent the two rails disagree about, a registry read
+/// that is not ready (the ready/content question, which is state rather than
+/// shape), and a frame that exists but is wider than the four-byte colour this
+/// arm narrows. The recon that precedes this increment could not separate even
+/// the first two from the two LOAD elisions, because every one of them arrived
+/// at the class's refusal as the same `None`.
+///
+/// The four arms are the chain door's own vocabulary; the mapper-ref door reads
+/// through the same function and states one route for all four
+/// ([`provider_render::ResidentSourceRoute::MapperRefFrameUnavailable`]), since
+/// what that door has to answer first is whether it landed at all.
+#[cfg(feature = "provider-render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChainFrameMiss {
+    /// The request states no colour attachment, or the attachment's own order
+    /// and the identity's are not one value. The class refuses a record with no
+    /// attachment earlier and by name
+    /// (`render_provider_out_of_class_attachment_state`), so only the second
+    /// half of this arm can be charged beside this refusal.
+    Order,
+    /// The identity's extent is not the attachment's
+    /// (`identity.width/height != req.width/height`).
+    Geometry,
+    /// `read_target` declined: the frame is not ready, or the registry holds
+    /// nothing under this identity.
+    Read,
+    /// The frame read back but is not four-byte colour (an `Rgba16Float`
+    /// attachment, or any wider resident the pass would have to quantize).
+    Texel,
+}
+
+/// The census route one [`ChainFrameMiss`] answers under, for the *chain* door.
+#[cfg(feature = "provider-render")]
+impl ChainFrameMiss {
+    fn chain_route(self) -> crate::backend::provider_render::ResidentSourceRoute {
+        use crate::backend::provider_render::ResidentSourceRoute;
+        match self {
+            Self::Order => ResidentSourceRoute::ChainOrderMismatch,
+            Self::Geometry => ResidentSourceRoute::ChainGeometryMismatch,
+            Self::Read => ResidentSourceRoute::ChainReadUnavailable,
+            Self::Texel => ResidentSourceRoute::ChainTexelUnavailable,
+        }
+    }
+}
+
+/// Why the mapper-ref-texture door handed nothing over (R34).
+///
+/// Three arms, and the third folds [`ChainFrameMiss`]'s four into one: that
+/// door's first question is whether it had a landing to hand a frame through at
+/// all (`mapper_ref_texture_resident_handover`), and only a record that has one
+/// can be asked what its read declined on. A census that reads
+/// [`crate::backend::provider_render::ResidentSourceRoute::MapperRefFrameUnavailable`]
+/// as a population worth splitting is the reading that says to split it.
+#[cfg(feature = "provider-render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MapperRefFrameMiss {
+    /// The elision fired for a record whose own frame does not land in the
+    /// mapping's guest pages, so there is no landing to advance the
+    /// `surface_content_epoch` the elision's currency test reads.
+    NoLanding,
+    /// The elision fired and the record lands, but the identity the elision
+    /// returned is no longer the one the record's own attachment names.
+    Identity,
+    /// The identities agree and [`resident_chain_source_frame`] still declined.
+    Frame,
+}
+
+/// The census route one [`MapperRefFrameMiss`] answers under.
+#[cfg(feature = "provider-render")]
+impl MapperRefFrameMiss {
+    fn route(self) -> crate::backend::provider_render::ResidentSourceRoute {
+        use crate::backend::provider_render::ResidentSourceRoute;
+        match self {
+            Self::NoLanding => ResidentSourceRoute::MapperRefNoLanding,
+            Self::Identity => ResidentSourceRoute::MapperRefIdentityMismatch,
+            Self::Frame => ResidentSourceRoute::MapperRefFrameUnavailable,
+        }
+    }
+}
+
+/// Which door opened one record's chain, and what its read declined on (R34).
+///
+/// The class's `resident_source` refusal is one slug and one sentence three
+/// different doors answer under, and this is the seam's side of the separation:
+/// the door flags are this layer's facts (they are set where each door fires)
+/// and the two misses are its two reads' own answers. Composed as a value
+/// rather than as a chain of `if`s at the call site so the rule can be read —
+/// and tested — as the decision table it is, without a device: the module's own
+/// tests drive every row.
+#[cfg(feature = "provider-render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidentSourceDoors {
+    /// The record's previous contents are a live GPU image at all
+    /// (`DrawRequest::load_from_target`). `false` is every record the class
+    /// never refuses under this route, and it wins outright: no door can have
+    /// opened a chain that was not named.
+    chain_load_from_target: bool,
+    /// The door the serialized packet chain opened
+    /// (`chain_from_resident` beside `render_chain_identity`).
+    chain_elided: bool,
+    /// The door `honour_gva_load_elision` opened.
+    gva_elided: bool,
+    /// The door the mapper-ref-texture composite's LOAD elision opened.
+    mapper_ref_elided: bool,
+    /// What [`resident_chain_source_frame`] declined on, when the chain door
+    /// opened and the frame did not travel.
+    chain_miss: Option<ChainFrameMiss>,
+    /// What the mapper-ref door's hand-over declined on, when that door opened.
+    mapper_ref_miss: Option<MapperRefFrameMiss>,
+}
+
+#[cfg(feature = "provider-render")]
+impl ResidentSourceDoors {
+    /// The route the class charges beside its refusal, or `None` when no
+    /// refusal of that route's is reachable for this record.
+    ///
+    /// The three doors are mutually exclusive by construction — each elision
+    /// returns early when `chain_load_from_target` is already set — so the
+    /// order below is documentation rather than precedence. `None` is the
+    /// honest answer for the two records no door carried: one that named no
+    /// chain at all, and one whose chain frame *did* travel (the class then
+    /// answers it, or refuses it for another reason, and either way this route
+    /// is not what it answered). `Undeclared` is the canary for the third:
+    /// `load_from_target` set by a door that stated no route, which must read
+    /// zero in the census.
+    fn route(self) -> Option<crate::backend::provider_render::ResidentSourceRoute> {
+        use crate::backend::provider_render::ResidentSourceRoute;
+        if !self.chain_load_from_target {
+            return None;
+        }
+        if self.chain_elided {
+            return self.chain_miss.map(ChainFrameMiss::chain_route);
+        }
+        if self.gva_elided {
+            return Some(ResidentSourceRoute::GvaElision);
+        }
+        if self.mapper_ref_elided {
+            return self.mapper_ref_miss.map(MapperRefFrameMiss::route);
+        }
+        Some(ResidentSourceRoute::Undeclared)
     }
 }
 
@@ -16806,6 +17062,158 @@ mod mapper_ref_handover_tests {
             None,
             "no elision, no frame to hand over — the GVA elision and every record whose previous \
              contents are not this surface's resident are refused by the class's own name"
+        );
+    }
+}
+
+/// R34's route composition, as a decision table.
+///
+/// The rule this pins is which census route the class charges beside its one
+/// `resident_source` refusal — a fact about the *seam*, not about the class, and
+/// one that no boot can be asked directly: the three doors are set in three
+/// different blocks of one very large function, and a device is what it takes to
+/// reach any of them. The table is driven here instead, row by row, and the
+/// class's own half (the counter, the price, the unchanged slug and sentence) is
+/// driven in `tests/provider_render_rail.rs`.
+#[cfg(all(test, feature = "provider-render"))]
+mod resident_source_doors_tests {
+    use super::{ChainFrameMiss, MapperRefFrameMiss, ResidentSourceDoors};
+    use crate::backend::provider_render::ResidentSourceRoute;
+
+    /// A record whose `load_from_target` came through the serialized chain and
+    /// whose frame travelled: the one row that answers no route at all, and the
+    /// base every other row is one field away from.
+    fn doors() -> ResidentSourceDoors {
+        ResidentSourceDoors {
+            chain_load_from_target: true,
+            chain_elided: true,
+            gva_elided: false,
+            mapper_ref_elided: false,
+            chain_miss: None,
+            mapper_ref_miss: None,
+        }
+    }
+
+    /// The two LOAD elisions, which are the families census v24's 646 records
+    /// mix: each answers its own route, and neither can be mistaken for a
+    /// read-side miss of the chain door.
+    #[test]
+    fn the_two_load_elisions_answer_under_their_own_routes() {
+        assert_eq!(
+            ResidentSourceDoors {
+                chain_elided: false,
+                gva_elided: true,
+                ..doors()
+            }
+            .route(),
+            Some(ResidentSourceRoute::GvaElision),
+            "the GVA LOAD elision's frame stays in the registry on purpose: no read of this \
+             layer's declined, the door itself handed nothing over"
+        );
+        for (miss, route) in [
+            (
+                MapperRefFrameMiss::NoLanding,
+                ResidentSourceRoute::MapperRefNoLanding,
+            ),
+            (
+                MapperRefFrameMiss::Identity,
+                ResidentSourceRoute::MapperRefIdentityMismatch,
+            ),
+            (
+                MapperRefFrameMiss::Frame,
+                ResidentSourceRoute::MapperRefFrameUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                ResidentSourceDoors {
+                    chain_elided: false,
+                    mapper_ref_elided: true,
+                    mapper_ref_miss: Some(miss),
+                    ..doors()
+                }
+                .route(),
+                Some(route),
+                "the mapper-ref-texture elision's own three answers are three routes: {miss:?}"
+            );
+        }
+    }
+
+    /// The serialized chain's four read-side misses, each its own route: the
+    /// four are four different repairs, and the recon could not separate even
+    /// the first two from the elisions above.
+    #[test]
+    fn the_chains_four_declines_are_four_routes() {
+        for (miss, route) in [
+            (
+                ChainFrameMiss::Order,
+                ResidentSourceRoute::ChainOrderMismatch,
+            ),
+            (
+                ChainFrameMiss::Geometry,
+                ResidentSourceRoute::ChainGeometryMismatch,
+            ),
+            (
+                ChainFrameMiss::Read,
+                ResidentSourceRoute::ChainReadUnavailable,
+            ),
+            (
+                ChainFrameMiss::Texel,
+                ResidentSourceRoute::ChainTexelUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                ResidentSourceDoors {
+                    chain_miss: Some(miss),
+                    ..doors()
+                }
+                .route(),
+                Some(route),
+                "the chain door answers for its own read's decline: {miss:?}"
+            );
+        }
+    }
+
+    /// The three rows that must charge nothing, and the one canary that must
+    /// stay a number rather than a silence.
+    #[test]
+    fn a_carried_frame_and_a_nameless_chain_are_not_this_refusals() {
+        assert_eq!(
+            ResidentSourceDoors {
+                chain_load_from_target: false,
+                ..doors()
+            }
+            .route(),
+            None,
+            "a record that named no live image never reaches this refusal, whichever doors were \
+             taken for other records"
+        );
+        assert_eq!(
+            doors().route(),
+            None,
+            "a chain whose frame the caller did carry reaches this refusal only for another \
+             reason, and this route is not what it answered"
+        );
+        assert_eq!(
+            ResidentSourceDoors {
+                chain_elided: false,
+                gva_elided: true,
+                chain_miss: Some(ChainFrameMiss::Read),
+                ..doors()
+            }
+            .route(),
+            Some(ResidentSourceRoute::GvaElision),
+            "an elision's own door answers it: a stale chain miss from a rail this record did \
+             not take is not this record's reason"
+        );
+        assert_eq!(
+            ResidentSourceDoors {
+                chain_elided: false,
+                ..doors()
+            }
+            .route(),
+            Some(ResidentSourceRoute::Undeclared),
+            "a `load_from_target` no door claims is the canary, not a silence: a fourth door \
+             added without its own route must read as a number in the census"
         );
     }
 }

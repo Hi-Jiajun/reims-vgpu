@@ -4925,6 +4925,25 @@ pub struct RenderRailInputs<'a> {
     /// elision keeps the class's refusal by name, and so does the GVA
     /// elision, whose witness is a readiness flag no in-tree API can clear.
     pub surface_resident_source_bytes: Option<&'a [u8]>,
+    /// Which door left this record's chain uncarried, when neither byte arm
+    /// above could hand its frame over (R34).
+    ///
+    /// The class's refusal for that shape is one slug and one sentence — the
+    /// caller can neither read a frame this rail keeps nor hand the frame over
+    /// — but the reasons behind it are not one fact: the *serialized* packet
+    /// chain fails on a read-side condition the caller could repair, while the
+    /// two LOAD elisions fail by design, because not paying that read is what
+    /// they exist for. Only the seam can tell them apart: it is the layer that
+    /// elected the door and holds the read that declined, and the request the
+    /// class sees carries no field that names which elision fired.
+    ///
+    /// `None` is every record that never named a chain at all
+    /// (`!DrawRequest::load_from_target`), and those never reach the refusal
+    /// this route is charged beside. The class charges the route only where it
+    /// refuses, so a record refused by an earlier gate — for naming no
+    /// identity, or for stating guest bytes beside the live image — leaves the
+    /// route uncounted rather than filing it under a refusal it did not get.
+    pub resident_source_route: Option<ResidentSourceRoute>,
     /// The frame a middle record's previous contents are, when the caller
     /// hands it over (R25).
     ///
@@ -6231,6 +6250,138 @@ fn note_stage_buffer_shape(stage_buffer_shape: StageBufferShapeRoute) {
     crate::runtime::drain::note_store_route(stage_buffer_shape_route(stage_buffer_shape));
 }
 
+/// The census route of one `resident_source` refusal (R34).
+///
+/// The refusal slug is one name three doors answer under, and census v24
+/// (`evidence/gate3-census-v24-2026-09-18`) counted 646 records (11.3 % of that
+/// boot's draws) under the bare slug while nothing in the log could say which
+/// door had produced them: the recon that precedes this increment could only
+/// decompose the bucket arithmetically (`gvaseed_elided` 330 + the mapper-ref
+/// elision's unlanded half 316 = 646), because no counter separates the two.
+///
+/// That separation is the point, because the populations are priced completely
+/// differently. A record whose *serialized* chain the caller failed to hand
+/// over is one read-side repair away (fold the order, carry the wider texel,
+/// wait for the readback, agree on the extent), while both LOAD elisions fail
+/// here *by design*: their whole purpose is not to pay the frame copy this
+/// refusal is about, so answering them means reversing a policy rather than
+/// fixing a read.
+///
+/// Each arm charges its own route beside the refusal, [`resident_source_route`]
+/// names it, `note_store_route` counts it, and
+/// [`resident_source_route_bytes`] prices it. The sentence every arm answers
+/// with is unchanged: this increment moves no admit/refuse edge.
+pub fn resident_source_route(route: ResidentSourceRoute) -> &'static str {
+    match route {
+        ResidentSourceRoute::ChainOrderMismatch => "resident_source_chain_order_mismatch",
+        ResidentSourceRoute::ChainGeometryMismatch => "resident_source_chain_geometry_mismatch",
+        ResidentSourceRoute::ChainReadUnavailable => "resident_source_chain_read_unavailable",
+        ResidentSourceRoute::ChainTexelUnavailable => "resident_source_chain_texel_unavailable",
+        ResidentSourceRoute::GvaElision => "resident_source_gva_elision",
+        ResidentSourceRoute::MapperRefNoLanding => "resident_source_mapper_ref_no_landing",
+        ResidentSourceRoute::MapperRefIdentityMismatch => {
+            "resident_source_mapper_ref_identity_mismatch"
+        }
+        ResidentSourceRoute::MapperRefFrameUnavailable => {
+            "resident_source_mapper_ref_frame_unavailable"
+        }
+        ResidentSourceRoute::Undeclared => "resident_source_undeclared",
+    }
+}
+
+/// The byte price of one [`resident_source_route`], charged beside it.
+///
+/// One name per route rather than one total, because the two families the
+/// bucket mixes sit at the two ends of the range: the mapper-ref-texture
+/// composites are 1280x1024 (5 MiB a frame) while the chained GVA records are
+/// 64..186 wide (16..74 KiB), so a single sum would be dominated by whichever
+/// population happens to be larger. The number is the *whole* attachment the
+/// record's previous contents are ([`NarrowPass::extent`], the same length the
+/// byte arms have to carry), which is what a readback — or any other witness
+/// standing in for one — would have to move.
+pub fn resident_source_route_bytes(route: ResidentSourceRoute) -> &'static str {
+    match route {
+        ResidentSourceRoute::ChainOrderMismatch => "resident_source_chain_order_mismatch_bytes",
+        ResidentSourceRoute::ChainGeometryMismatch => {
+            "resident_source_chain_geometry_mismatch_bytes"
+        }
+        ResidentSourceRoute::ChainReadUnavailable => "resident_source_chain_read_unavailable_bytes",
+        ResidentSourceRoute::ChainTexelUnavailable => {
+            "resident_source_chain_texel_unavailable_bytes"
+        }
+        ResidentSourceRoute::GvaElision => "resident_source_gva_elision_bytes",
+        ResidentSourceRoute::MapperRefNoLanding => "resident_source_mapper_ref_no_landing_bytes",
+        ResidentSourceRoute::MapperRefIdentityMismatch => {
+            "resident_source_mapper_ref_identity_mismatch_bytes"
+        }
+        ResidentSourceRoute::MapperRefFrameUnavailable => {
+            "resident_source_mapper_ref_frame_unavailable_bytes"
+        }
+        ResidentSourceRoute::Undeclared => "resident_source_undeclared_bytes",
+    }
+}
+
+/// Which of [`resident_source_route`]'s doors and misses a record answered.
+///
+/// An enum rather than a `&'static str` at the call sites for the reason the
+/// routes themselves exist: arms that answer with different census names are
+/// different facts, and a typo in a bare string would file two of them under
+/// one name with nothing failing. The seam (`runtime::draw::vulkan`) is the
+/// only producer — it is the only place the door is known — and the class's one
+/// refusal is the only charger, so a route can only be counted for a record
+/// this class actually refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentSourceRoute {
+    /// The serialized packet chain named the engine's registry resident
+    /// (`render_chain_identity`), and the caller's readback declined because
+    /// the attachment's own texel order and the identity's are not one value —
+    /// or because the request states no colour attachment at all, which the
+    /// class refuses earlier by name (`render_provider_out_of_class_
+    /// attachment_state`) and which therefore cannot be charged here.
+    ChainOrderMismatch,
+    /// The same door, refused because the identity's extent is not the
+    /// attachment's (`identity.width/height != req.width/height`).
+    ChainGeometryMismatch,
+    /// The same door, refused because the registry read itself failed
+    /// (`read_target`) — the ready/content question, not a shape question.
+    ChainReadUnavailable,
+    /// The same door, refused because the frame read back is wider than the
+    /// four-byte colour this arm narrows (an `Rgba16Float` attachment, or any
+    /// other resident the class would have to quantize to carry).
+    ChainTexelUnavailable,
+    /// The GVA LOAD elision chained (`honour_gva_load_elision`): the engine
+    /// still holds the frame and its witness is a readiness flag no in-tree API
+    /// can clear, so this door deliberately hands nothing over.
+    GvaElision,
+    /// The mapper-ref-texture composite's LOAD elision fired for a record whose
+    /// own frame does *not* land in the mapping's guest pages (`writeback_guest`
+    /// clear), so there is no landing to advance the `surface_content_epoch`
+    /// the elision's currency test reads — the door hands nothing over.
+    MapperRefNoLanding,
+    /// The elision fired and the record does land, but the identity the elision
+    /// returned is no longer the one the record's own attachment names.
+    MapperRefIdentityMismatch,
+    /// The elision fired, the identities agree, and the read itself declined
+    /// (order, geometry, readiness, or a texel wider than four-byte colour —
+    /// the four [`Self::ChainOrderMismatch`] and siblings name for the chain
+    /// door).
+    MapperRefFrameUnavailable,
+    /// A record reached this refusal on a `load_from_target` chain that no door
+    /// the seam knows produced. Unreachable by construction (three sites set
+    /// it), and named rather than folded into a neighbour so that a fourth door
+    /// which forgets to state its route reads as a number in the census instead
+    /// of quietly inflating one.
+    Undeclared,
+}
+
+/// Charge one `resident_source` arm's route, and its byte price, beside the
+/// refusal it answers.
+#[inline]
+fn note_resident_source(route: ResidentSourceRoute, extent: u64) {
+    crate::runtime::drain::note_store_route(resident_source_route(route));
+    crate::runtime::drain::note_store_route_n(resident_source_route_bytes(route), extent);
+}
+
 /// Drop every render registration that belonged to a device incarnation.
 ///
 /// Called by [`super::provider_compute::recover_after_device_loss`]: the
@@ -6967,6 +7118,19 @@ fn narrow_class<'a>(
                 (Some(bytes), _) => (bytes, false),
                 (None, Some(bytes)) => (bytes, true),
                 (None, None) => {
+                    // R34: the one refusal these three doors share, counted by
+                    // the door whose own read declined and priced by the frame
+                    // a readback would have had to carry. `Undeclared` is the
+                    // canary for a door that reached this point without naming
+                    // itself; it can only be earned here, by a record this
+                    // class refused, so a nonzero census reading is evidence
+                    // about the seam rather than about the shape.
+                    note_resident_source(
+                        inputs
+                            .resident_source_route
+                            .unwrap_or(ResidentSourceRoute::Undeclared),
+                        extent,
+                    );
                     return Err(OutOfClass::new(
                         "render_provider_out_of_class_resident_source",
                         "a record whose previous contents are the live GPU image stays on the \
