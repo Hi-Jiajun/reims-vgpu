@@ -8305,6 +8305,159 @@ fn the_formats_beyond_the_widened_window_stay_on_the_engine_by_name() {
     );
 }
 
+/// The channel-mapping half of the `texture_bind` door, as one read-only probe
+/// (2026-09-19; the 2026-09-18 reconnaissance of census v29's residual buckets).
+///
+/// Census v29 leaves 472 records at `render_provider_out_of_class_texture_bind`,
+/// and 471 of them are one shape: every axis the sentence prints is inside the
+/// class, the view's format is the `r8_unorm` lane the device's own frame lists,
+/// and the class still answers by name. The sentence names seven of that gate's
+/// eight conditions; the eighth is `swizzle_is_identity`, the *channel mapping*,
+/// which the sentence deliberately does not print — and the mapping a bind
+/// arrives with is one folded plan rather than two separate facts
+/// (`runtime/draw/vulkan.rs` composes the guest's own texture-view swizzle
+/// `after` the plan the texel's format contributes, because an image view
+/// carries one component mapping).
+///
+/// The reading below is the increment the reconnaissance asked for *before*
+/// anything is folded into bytes, because a fold that did not know which half of
+/// the plan it was answering for would answer for both at once:
+///
+/// - the refusal a bind with a folded plan earns keeps its slug and its sentence
+///   — the class's own answer, byte for byte, is a function of the bind's format
+///   and its shape axes and has never named the plan;
+/// - and it now also charges one of two read-only counters,
+///   `render_provider_texture_bind_swizzled_view` or
+///   `render_provider_texture_bind_swizzled_format`, by the classification the
+///   rail's own `swizzled_bind_route` documents: the one standing format plan
+///   (`A8Unorm`'s `ALPHA_IN_RED` on the `R8_UNORM` its byte rides in) is counted
+///   as the format's, every other non-identity plan as the view's.
+///
+/// So the census's next round reads `view + format + (the bucket's other
+/// conditions) = the bucket`, and the two counts say which half of the folded
+/// plan the fold has to answer for. Nothing here folds anything.
+///
+/// The three fixtures are one shape: the `r8_unorm` lane, one byte per texel,
+/// eight by four, on a device whose own frame lists the lane. The first is the
+/// control that says so — with an identity mapping the same bind is *in* class —
+/// and the other two differ from it in the plan alone.
+#[test]
+fn the_folded_channel_plan_charges_the_counter_of_the_half_it_came_from() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    // The plan a bind arrives with, spelled the way the guest's own view spells
+    // it: `runtime/draw/texture_view.rs` decodes a carrying view's selectors
+    // with `pixel_format::swizzle_plan`, so the fixture uses the same decoder
+    // rather than a second spelling of its alphabet (`0..=5` is
+    // zero/one/r/g/b/a, one selector per output channel).
+    let plan = |selectors: [u8; 4]| {
+        reims_vgpu::protocol::pixel_format::swizzle_plan(&selectors)
+            .expect("the fixture's selectors are the decoder's own alphabet")
+    };
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+    let bind = |plan: reims_vgpu::protocol::pixel_format::SwizzlePlan| -> DrawRequest {
+        let mut req = sampled_narrow_request(
+            &stages,
+            vec![0x40u8; (width * height) as usize],
+            (width, height),
+            ash::vk::Format::R8_UNORM,
+        );
+        req.sampled_images[0].swizzle = plan;
+        req
+    };
+    let answer = |label: &str, req: &DrawRequest| -> (String, String) {
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the bind's mapping is not the identity: {other:?}"),
+        }
+    };
+
+    // The control: one byte per texel under the lane the frame lists, with the
+    // identity mapping, is the shape this class states. So the two refusals
+    // below fail on the mapping and on nothing else.
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &bind(plan([2, 3, 4, 5])),
+    ) {
+        RenderRailOutcome::ProviderCompleted(_) => (),
+        other => panic!(
+            "the lane with an identity channel mapping is in class, so the refusals below have \
+             one failing condition: {other:?}"
+        ),
+    }
+
+    let bucket = count("render_provider_out_of_class_texture_bind");
+    let view = count("render_provider_texture_bind_swizzled_view");
+    let format = count("render_provider_texture_bind_swizzled_format");
+
+    // (A) The view's own swizzle: what a guest texture view states — here the
+    //     lane read into all four channels, the shape a mask or coverage view
+    //     takes. The format contributes nothing to this plan.
+    let (view_slug, view_detail) = answer("a view's own swizzle", &bind(plan([2, 2, 2, 2])));
+    // (B) The format's own plan: `A8Unorm` presents `(0,0,0,a)` while it rides
+    //     in `R8_UNORM`, so its plan alone is exactly the plan bound here — the
+    //     one plan this gate can attribute to the format rather than the view.
+    let (format_slug, format_detail) = answer(
+        "a format's own plan",
+        &bind(reims_vgpu::backend::vulkan::translate::pixel::ALPHA_IN_RED),
+    );
+
+    // The reading, printed before it is asserted: a reader comparing this
+    // increment's log to the one the same fixture gave before the counter
+    // existed has the sentence in front of them either way.
+    eprintln!(
+        "folded channel plan: `r8_unorm` {width}x{height} with an identity mapping is in class; a \
+         view swizzle (r,r,r,r) -> {view_slug} and charges \
+         `render_provider_texture_bind_swizzled_view`; `A8Unorm`'s own plan -> {format_slug} and \
+         charges `render_provider_texture_bind_swizzled_format`; both sentences are byte for byte \
+         the one this door wrote before the counter existed:\n  {view_detail}"
+    );
+
+    // The class's answer is unchanged by any of it: one slug, and one sentence
+    // for both plans, because the sentence has never named the plan. A plan that
+    // had leaked into the sentence would make these two differ.
+    assert_eq!(view_slug, "render_provider_out_of_class_texture_bind");
+    assert_eq!(
+        view_slug, format_slug,
+        "the plan does not move the bucket: {view_slug} vs {format_slug}"
+    );
+    assert_eq!(
+        view_detail, format_detail,
+        "the plan does not move the sentence: a bind's answer is its format and its shape axes"
+    );
+    for detail in [&view_detail, &format_detail] {
+        assert!(
+            detail.contains("an identity channel mapping"),
+            "the criterion the sentence states is the one this door always stated: {detail}"
+        );
+        assert!(
+            detail.contains("R8_UNORM"),
+            "and the sentence still names the bind's own format: {detail}"
+        );
+    }
+
+    // The reading itself: the two plans split the door's records, and neither
+    // charges the other's counter. The identity control above charged neither.
+    assert_eq!(
+        count("render_provider_texture_bind_swizzled_view"),
+        view + 1,
+        "the view's own swizzle is counted as the view's"
+    );
+    assert_eq!(
+        count("render_provider_texture_bind_swizzled_format"),
+        format + 1,
+        "the format's own plan is counted as the format's"
+    );
+    assert_eq!(
+        count("render_provider_out_of_class_texture_bind"),
+        bucket + 2,
+        "and both are still this door's records: the two counts split the bucket"
+    );
+}
+
 /// R39: the two narrow lanes the census's `texture_bind` bucket is made of, and
 /// the whole reading that says the class now executes them.
 ///

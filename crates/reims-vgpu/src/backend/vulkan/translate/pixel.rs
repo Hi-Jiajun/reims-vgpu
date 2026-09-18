@@ -40,7 +40,8 @@ pub use rail::{
     sample_view_format, srgb_texel_layout, storage_format, storage_image_components,
     storage_image_from_selector, stored_bytes_agree, texel_layout_of, verbatim_texel,
     vk_block_geometry, vk_component_mapping, vk_storage_image, vk_texel_layout, PixelFormat,
-    ResidentFormat, TransferFunction, RESIDENT_RGBA_FORMAT, SCANOUT_FORMAT, TRANSIENT_DEPTH_FORMAT,
+    ResidentFormat, TransferFunction, ALPHA_IN_RED, RESIDENT_RGBA_FORMAT, SCANOUT_FORMAT,
+    TRANSIENT_DEPTH_FORMAT,
 };
 
 /// This device's name for a decline the rail crate made in its own vocabulary.
