@@ -127,16 +127,20 @@
 //!   declaration at a time** (R45, census v39): the registration pairs one AIR
 //!   static sampler with one sampled texture that reads through one and
 //!   refuses a stage whose two counts disagree by name
-//!   (`render_stage_reflection_mismatch`), and it weighs every AIR sampler the
-//!   stage carries before that pairing, so an unpaired sampler is refused there
-//!   by its own state too (`render_stage_unsupported_interface`). This walk
-//!   consulted a static sampler only where a declaration paired with one, so a
-//!   stage carrying one more than its sampled half reads left for the provider
-//!   and came back a refusal no rail answered — census v39's four
+//!   (`render_stage_reflection_mismatch`), and it weighs the AIR samplers the
+//!   module's own instructions read through before that pairing (E-RS5/v118),
+//!   so an unpaired sampler is refused there by its own state too
+//!   (`render_stage_unsupported_interface`). This walk consulted a static
+//!   sampler only where a declaration paired with one, so a stage carrying one
+//!   more than its sampled half reads left for the provider and came back a
+//!   refusal no rail answered — census v39's four
 //!   `draws_skipped_after_engine_refusal`, every one of them a fragment stage
 //!   whose AIR sampler states `coord::pixel` beside a state inside the family.
-//!   The counts are compared where the declarations are in hand and the shape
-//!   stays on the engine by name
+//!   R48 then read the same two facts the registration reads: the weighed set is
+//!   the AIR samplers the module's own sample sites name (a `coord::pixel` state
+//!   a lowered sample leaves behind is weighed by neither rail and admitted),
+//!   and the counts are compared where the declarations are in hand. A shape
+//!   that still disagrees stays on the engine by name
 //!   (`render_provider_out_of_class_texture_static_sampler_unpaired`), with the
 //!   axis of an unpaired sampler outside the family named in the sentence
 //!   (`RenderUnsupportedStaticSampler`).
@@ -1414,36 +1418,42 @@ pub struct RenderRuntimeSampler {
 /// Two lists rather than one because the class asks two different questions of
 /// them: which runtime `[[sampler(n)]]` arguments the stage binds (each of which
 /// the canonical contract has to pair with a texture, or the provider refuses
-/// the registration by name), and how many AIR static samplers it carries
-/// (R37) — the canonical rail pairs those positionally, one per sampled texture
-/// that reads through one, while the runtime half pairs by the index a
-/// declaration names. One stage may carry both forms; each texture is declared
-/// in the form the module's own sample sites name, and a module whose sites name
-/// *two* samplers for one image — which no per-texture declaration can state —
-/// stays on the engine by name.
+/// the registration by name), and how many AIR static samplers it reads through
+/// (R37; E-RS5/v118) — the canonical rail pairs those positionally, one per
+/// sampled texture that reads through one, while the runtime half pairs by the
+/// index a declaration names. One stage may carry both forms; each texture is
+/// declared in the form the module's own sample sites name, and a module whose
+/// sites name *two* samplers for one image — which no per-texture declaration
+/// can state — stays on the engine by name.
 ///
 /// The third list is the same AIR half read the way the *registration* reads it
-/// (R45). The registration weighs every AIR sampler the stage carries before it
-/// pairs one, so an AIR state outside the family is refused there whether or not
-/// a sampled texture reads through it — and a stage whose sampler count and
-/// sampled-half count disagree is refused by its own name
-/// (`render_stage_reflection_mismatch`). This class consulted a static sampler
-/// only where a declaration paired with one, so a stage carrying one more than
-/// its sampled half reads was handed to the provider for a refusal the engine
-/// never got to answer (census v39's four `draws_skipped_after_engine_refusal`);
-/// the list below is the fact that lets the gate answer that shape by name.
+/// (R45). The registration weighs the AIR samplers the module's own
+/// instructions read through before it pairs one (E-RS5/v118), so an AIR state
+/// outside the family is refused there wherever it sits among them — and a
+/// stage whose sampler count and sampled-half count disagree is refused by its
+/// own name (`render_stage_reflection_mismatch`). This class consulted a static
+/// sampler only where a declaration paired with one, so a stage carrying one
+/// more than its sampled half reads was handed to the provider for a refusal
+/// the engine never got to answer (census v39's four
+/// `draws_skipped_after_engine_refusal`); the list below is the fact that lets
+/// the gate answer that shape by name. It is the *weighed* set on both sides
+/// (`weighed_static_samplers`): a sampler a lowered sample leaves behind is
+/// named by neither the registration nor this class.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RenderSamplerFamily {
     pub runtime: Arc<[RenderRuntimeSampler]>,
-    /// The Metal index of every `ResourceKind::StaticSampler` binding, in the
-    /// reflection's own order — the order the canonical rail's positional
-    /// pairing counts against.
+    /// The Metal index of every `ResourceKind::StaticSampler` binding the
+    /// module's own instructions read through, in the reflection's own order —
+    /// the order the canonical rail's positional pairing counts against
+    /// (E-RS5/v118; R48). A sampler no `OpSampledImage` names is a state a
+    /// lowered sample left behind, and the registration weighs neither it nor
+    /// any other: the two walks have to count one set.
     pub statics: Arc<[u32]>,
-    /// The AIR static samplers this stage carries whose decoded state is
-    /// *outside* the family the canonical rail creates, in the reflection's own
-    /// order (R45). The registration refuses such a sampler wherever it sits —
-    /// paired or not — so the gate reads the same list rather than only the
-    /// entries its per-texture walk happened to pair.
+    /// The AIR static samplers the class weighs whose decoded state is *outside*
+    /// the family the canonical rail creates, in the reflection's own order
+    /// (R45). The registration refuses such a sampler wherever it sits — paired
+    /// or not — so the gate reads the same list rather than only the entries its
+    /// per-texture walk happened to pair.
     pub outside_family_statics: Arc<[RenderUnsupportedStaticSampler]>,
     /// What the module's own sample sites state (`R37`): the pairing the
     /// runtime half of every declaration is read off, one texture at a time.
@@ -1621,6 +1631,74 @@ fn air_sampler_policy(
     Ok(metal_api_core::provider::SamplerPolicy { filter, address })
 }
 
+/// The descriptor slots a module's own sample sites name as their *sampler*
+/// operand (`research/docs/23` §3.3, E-RS5/v118; R48).
+///
+/// The canonical rail's registration weighs the AIR static samplers a module's
+/// instructions read through, and only those (`metal-api-vulkan`'s own
+/// `descriptor_reads`): a `coord::pixel` sample is emulated with shader-side
+/// fetches, so the finished module still *declares* its `constexpr sampler`
+/// while no `OpSampledImage` names it, and a state nothing can read cannot change
+/// what the pass executes. This class has to weigh the same set, or a draw it
+/// admits meets a registration refusal the engine never got to answer — census
+/// v39's four `draws_skipped_after_engine_refusal`, answered by R45's counting
+/// rule on the wrong side of E-RS5.
+///
+/// `None` is the fail-closed answer, and keeps every AIR static sampler in the
+/// walks below exactly as the registration does: [`SamplePairing::MultipleSamplers`]
+/// is a module whose own sites name two samplers for one image — no per-texture
+/// declaration can state it, so its textures are answered by name through
+/// [`RenderSampleSites`] — and [`SamplePairing::Unresolved`] is a sample site
+/// whose sampler operand this walk cannot follow to a decorated descriptor, a
+/// module the registration weighs by name as well.
+#[cfg(feature = "provider-render")]
+fn read_sampler_slots(
+    pairing: &crate::runtime::spirv_bind::SamplePairing,
+) -> Option<std::collections::BTreeSet<u32>> {
+    match pairing {
+        crate::runtime::spirv_bind::SamplePairing::Paired(pairs) => Some(
+            pairs
+                .iter()
+                .map(|(_, sampler)| *sampler)
+                .collect::<std::collections::BTreeSet<u32>>(),
+        ),
+        crate::runtime::spirv_bind::SamplePairing::MultipleSamplers
+        | crate::runtime::spirv_bind::SamplePairing::Unresolved => None,
+    }
+}
+
+/// The AIR static samplers this class weighs, in the reflection's own order
+/// (E-RS5/v118; R48).
+///
+/// `slots` is [`read_sampler_slots`]'s answer: `Some` keeps the samplers whose
+/// descriptor slot some `OpSampledImage` names as its sampler operand, and
+/// `None` keeps every AIR static sampler — the same fail-closed reading the
+/// registration takes for a module whose pairing it cannot state. A sampler
+/// whose own descriptor the reflection never located stays in the list either
+/// way: the registration refuses that shape by name
+/// (`render_stage_unsupported_interface`, "the reflected AIR static sampler
+/// consumes no Vulkan descriptor"), so this class may not bypass it.
+#[cfg(feature = "provider-render")]
+fn weighed_static_samplers<'a>(
+    fragment: &'a metal2vulkan::reflect::ShaderReflection,
+    slots: Option<&std::collections::BTreeSet<u32>>,
+) -> Vec<&'a metal2vulkan::reflect::ResourceBinding> {
+    use metal2vulkan::reflect::ResourceKind;
+
+    fragment
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+        .filter(|binding| match slots {
+            None => true,
+            Some(slots) => match binding.descriptor {
+                None => true,
+                Some(descriptor) => slots.contains(&descriptor.binding),
+            },
+        })
+        .collect()
+}
+
 /// The `[[texture(i)]]` arguments one fragment stage's reflection declares, with
 /// the AIR sampler state its samples were lowered against (R10,
 /// `research/docs/23` §101) — or the sampler-free answer a texture only
@@ -1631,7 +1709,11 @@ fn air_sampler_policy(
 /// `translated_texture_slots`), so this walk makes the same pairing over the
 /// same reflection — one list of textures, one list of static samplers, paired
 /// by position — instead of a second rule that could disagree about which state
-/// belongs to which texture.
+/// belongs to which texture. The static half of that list is the AIR samplers
+/// the module's own instructions read through ([`weighed_static_samplers`],
+/// E-RS5/v118; R48), because the registration weighs and pairs the same set:
+/// a sampler the lowered module never names in an `OpSampledImage` takes no
+/// position on either side, so the two walks keep naming one state per texture.
 ///
 /// The state is mapped into the canonical policy family here, once per resolved
 /// pipeline, because that is the question the class gate asks on every draw:
@@ -1690,21 +1772,23 @@ pub fn texture_declarations(
         RenderTextureShape::Sampled2D
     }
 
-    // The AIR static samplers first: the canonical rail pairs them with the
-    // *sampled* textures that read through one by position — a texel-fetched
-    // texture states no sampler at all (R15) and a runtime-sampled one states
-    // the `[[sampler(n)]]` argument its own sample sites name (R37), so neither
-    // takes a position in that pairing — and so does the loop below.
-    let samplers = reflection
-        .bindings
-        .iter()
-        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
-        .collect::<Vec<_>>();
-    // The runtime `[[sampler(n)]]` arguments beside the pairing the module's
-    // own sample sites state (R12): the walk answers with *descriptor
-    // bindings*, and this list is what turns a binding back into the Metal
-    // index the contract names.
+    // The pairing the module's own sample sites state (R12), read first
+    // because both halves of this walk are read off it: which sampler each
+    // texture reads through, and which AIR static samplers the registration
+    // weighs at all (E-RS5/v118; R48).
     let pairing = crate::runtime::spirv_bind::sampled_image_pairs(words);
+    // The AIR static samplers the canonical rail pairs with the *sampled*
+    // textures that read through one by position — a texel-fetched texture
+    // states no sampler at all (R15) and a runtime-sampled one states the
+    // `[[sampler(n)]]` argument its own sample sites name (R37), so neither
+    // takes a position in that pairing — and so does the loop below. The list
+    // is the one the registration pairs against as well (E-RS5/v118): a
+    // sampler no `OpSampledImage` names is a state the lowered module never
+    // reads, and the registration neither weighs it nor pairs it.
+    let samplers = weighed_static_samplers(reflection, read_sampler_slots(&pairing).as_ref());
+    // The runtime `[[sampler(n)]]` arguments beside that pairing (R12): the
+    // walk answers with *descriptor bindings*, and this list is what turns a
+    // binding back into the Metal index the contract names.
     let runtime_samplers = reflection
         .bindings
         .iter()
@@ -1922,12 +2006,16 @@ pub fn texture_interface_refusals(
 /// per resolved pipeline from the same reflection they are: which runtime
 /// `[[sampler(n)]]` arguments the stage binds — each of which the canonical
 /// contract has to pair with a sampled texture, or the registration is refused
-/// by name — and how many AIR static samplers it carries, because the canonical
+/// by name — and how many AIR static samplers it weighs, because the canonical
 /// rail pairs those positionally (one per sampled texture that reads through
-/// one) while the runtime half pairs by the index a declaration names. A stage
-/// may carry both forms at once (R37); the pairing the module's own sample sites
-/// state is what the per-texture declarations are read off, and its one
-/// unstateable answer keeps the stage on the engine by name.
+/// one) while the runtime half pairs by the index a declaration names. The
+/// weighed half is the AIR samplers the module's own instructions read through
+/// (E-RS5/v118; R48), not every sampler the reflection declares: the
+/// registration weighs the same set, so a state a lowered sample leaves behind
+/// counts on neither side. A stage may carry both forms at once (R37); the
+/// pairing the module's own sample sites state is what the per-texture
+/// declarations are read off, and its one unstateable answer keeps the stage on
+/// the engine by name.
 #[cfg(feature = "provider-render")]
 pub fn sampler_family(
     fragment: &metal2vulkan::reflect::ShaderReflection,
@@ -1947,23 +2035,30 @@ pub fn sampler_family(
                 .unwrap_or(0),
         })
         .collect::<Vec<_>>();
-    let statics = fragment
-        .bindings
+    // The pairing the per-texture declarations are read off (`R12`), in its own
+    // three answers (R37): the class keeps the stage on the engine when it is
+    // not one sampler per image. Read first because the AIR half beside it is
+    // filtered by the same walk (E-RS5/v118; R48).
+    let pairing = crate::runtime::spirv_bind::sampled_image_pairs(words);
+    // The AIR static samplers the registration weighs (E-RS5/v118): the ones
+    // the module's own `OpSampledImage` instructions read through. A state a
+    // lowered sample leaves behind cannot change what the pass executes, so
+    // weighing it here would keep a draw on the engine — or hand it to a
+    // provider that admits it — for a fact neither rail's execution names.
+    let weighed = weighed_static_samplers(fragment, read_sampler_slots(&pairing).as_ref());
+    let statics = weighed
         .iter()
-        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
         .map(|binding| binding.metal_index)
         .collect::<Vec<_>>();
     // The same bindings read for their own state (R45): the registration weighs
-    // every AIR sampler the stage carries before it pairs one, so a state
-    // outside the family is refused there whether or not a sampled texture
-    // reads through it. A binding whose state the translator could not decode
-    // is reported beside them — the per-texture walk answers those as
-    // `AirState` too (`the AIR static sampler carries no decoded state`), and
-    // the registration refuses them by the same door.
-    let outside_family_statics = fragment
-        .bindings
+    // the AIR samplers a module reads through before it pairs one, so a state
+    // outside the family is refused there wherever it sits among them. A
+    // binding whose state the translator could not decode is reported beside
+    // them — the per-texture walk answers those as `AirState` too (`the AIR
+    // static sampler carries no decoded state`), and the registration refuses
+    // them by the same door.
+    let outside_family_statics = weighed
         .iter()
-        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
         .filter_map(|binding| {
             let axis = match binding.static_sampler.as_ref() {
                 Some(state) => air_sampler_policy(state).err()?,
@@ -1979,10 +2074,7 @@ pub fn sampler_family(
         runtime: runtime.into(),
         statics: statics.into(),
         outside_family_statics: outside_family_statics.into(),
-        // The pairing the per-texture declarations are read off (`R12`), in
-        // its own three answers (R37): the class keeps the stage on the engine
-        // when it is not one sampler per image.
-        sample_sites: match crate::runtime::spirv_bind::sampled_image_pairs(words) {
+        sample_sites: match pairing {
             crate::runtime::spirv_bind::SamplePairing::Paired(_) => RenderSampleSites::Paired,
             crate::runtime::spirv_bind::SamplePairing::MultipleSamplers => {
                 RenderSampleSites::MultipleSamplers
@@ -3165,18 +3257,28 @@ fn sampled_textures<'a>(
     // static sampler with one sampled texture that reads through one and
     // refuses a stage whose two counts disagree by name
     // (`render_stage_reflection_mismatch`, "this rail pairs one AIR static
-    // sampler with one sampled texture") — and it weighs every AIR sampler the
-    // stage carries *before* that pairing, so an unpaired sampler is refused
-    // there by its own state too (`render_stage_unsupported_interface`). This
-    // walk consulted a static sampler only where a declaration paired with one,
-    // so a stage carrying one more than its sampled half reads was handed to
-    // the provider for a refusal the engine never got to answer: census v39's
-    // four `draws_skipped_after_engine_refusal`, every one of them a fragment
-    // stage whose one AIR sampler states `coord::pixel` — a state the
-    // translation lowers with fetches, so the declaration beside it states no
-    // sampler at all and the pairing above never reached it. A refusal is a
-    // decline rather than a fallback, so the class answers the shape here
-    // instead of letting the provider decline a draw the engine could run.
+    // sampler with one sampled texture") — and it weighs the AIR samplers the
+    // module's own instructions read through *before* that pairing, so an
+    // unpaired sampler is refused there by its own state too
+    // (`render_stage_unsupported_interface`). This walk consulted a static
+    // sampler only where a declaration paired with one, so a stage carrying one
+    // more than its sampled half reads was handed to the provider for a refusal
+    // the engine never got to answer: census v39's four
+    // `draws_skipped_after_engine_refusal`, every one of them a fragment stage
+    // whose one AIR sampler states `coord::pixel` — a state the translation
+    // lowers with fetches, so the declaration beside it states no sampler at all
+    // and the pairing above never reached it. A refusal is a decline rather than
+    // a fallback, so the class answers the shape here instead of letting the
+    // provider decline a draw the engine could run.
+    //
+    // E-RS5/v118 then narrowed *both* sides of that weigh to the AIR samplers
+    // the module's own `OpSampledImage` instructions read through — the
+    // registration weighs that set and no other — and this class's lists are
+    // filtered by the same predicate (R48): the `coord::pixel` shape above is
+    // *admitted* rather than answered here, because the leftover state is not
+    // one the registration can refuse. What this rule keeps answering is the
+    // direction that survived: a module that reads through more AIR samplers
+    // than its sampled half declares.
     let static_declarations = inputs
         .fragment_texture_declarations
         .iter()
@@ -3197,8 +3299,8 @@ fn sampled_textures<'a>(
     // `a_declaration_that_does_not_repeat_the_module_is_refused_by_name` holds.
     if family.statics.len() > static_declarations {
         // Which of the two refusals the registration would have answered with,
-        // named where the facts are still in hand: an unpaired sampler whose
-        // own state is outside the family is the *state* door's
+        // named where the facts are still in hand: a sampler the module reads
+        // through whose own state is outside the family is the *state* door's
         // (`render_stage_unsupported_interface`), and one whose state is inside
         // it is the counting rule's alone.
         let outside = family
@@ -3214,20 +3316,21 @@ fn sampled_textures<'a>(
             })
             .unwrap_or_else(|| {
                 String::from(
-                    "; every AIR sampler the stage carries is inside the state family, so the \
-                     counting rule is the only half that refuses this stage",
+                    "; every AIR sampler the module's own instructions read through is inside \
+                     the state family, so the counting rule is the only half that refuses this \
+                     stage",
                 )
             });
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_texture_static_sampler_unpaired",
             format!(
-                "a fragment stage that carries {} AIR static samplers against {} sampled \
+                "a fragment stage that reads through {} AIR static samplers against {} sampled \
                  textures reading through one stays on the engine: the canonical rail's \
-                 registration pairs one AIR static sampler with one sampled texture, weighs \
-                 every AIR sampler the stage carries before it pairs one, and refuses the counts \
-                 by name (`render_stage_reflection_mismatch`, \"this rail pairs one AIR static \
-                 sampler with one sampled texture\") rather than executing a sample through a \
-                 state nothing pairs it with{}",
+                 registration pairs one AIR static sampler with one sampled texture, weighs the \
+                 AIR samplers the module's own instructions read through before it pairs one, \
+                 and refuses the counts by name (`render_stage_reflection_mismatch`, \"this rail \
+                 pairs one AIR static sampler with one sampled texture\") rather than executing \
+                 a sample through a state nothing pairs it with{}",
                 family.statics.len(),
                 static_declarations,
                 outside,

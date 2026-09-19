@@ -57,3 +57,15 @@ name (`render_provider_out_of_class_texture_sampler_family`). The `.ll` bodies a
 owned synthetic fixtures — `metal-api-emulator`'s `render_sample_texture_2d_static_and_runtime.frag.ll`
 carries the same two-form body for the canonical side's probe (E `41308a1`) — re-assembled from
 the `.ll` with `llvm-as` 22.1.8 like every other fixture here.
+
+The R45/R48 pair is the two sides of "which AIR samplers the module's own instructions read
+through". `render_frag_pixel_sampler.{ll,air}` (R45, census v39's four lost draws) is the
+leftover shape: its one AIR `constexpr sampler` states `coord::pixel`, the pinned translator
+lowers the sample to shader-side fetches, and the finished module names no sampler at all — so
+the registration does not weigh that state (E-RS5/v118) and the class admits the draw rather
+than answering it by count (R48). `render_frag_mixed_filters.{ll,air}` (R48) is the bound
+sibling: the same body with the magnification filter raised to linear and the coordinates left
+normalized, so the module *does* read through its sampler, the class weighs the state, and the
+draw stays on the engine by name. One axis (the sampler word's bits 9-10) is the only difference
+between the two, which is what makes "read through" the fact that moves both readings; both are
+re-assembled from their `.ll` with `llvm-as` 22.1.8 like every other fixture here.
