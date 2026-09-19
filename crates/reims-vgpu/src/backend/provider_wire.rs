@@ -419,16 +419,27 @@ pub struct OneDimensionSupport {
     pub window: u64,
 }
 
-/// The three-dimensional sampled window and the lane it carries, read out of
-/// the same capability frame (2026-09-20, the `D3` sampled texture arm).
+/// The three-dimensional sampled arm's lanes and window, read out of the same
+/// capability frame (2026-09-20, the `D3` sampled texture arm and, one
+/// increment later, census v48's volume lane gate).
 ///
 /// [`render_texture_one_dimension_window`]'s sibling two axes over, and the
 /// fifteenth reading of the same one-snapshot rule: the frame states two facts
-/// about the arm — whether its section's format list carries `r32_float` (the
-/// lane the census's volumes are), and how large a volume the snapshot admits
-/// per axis (`max_render_texture_dimension_3d`, the tail's own `0x00 0x0D`
-/// section) — and they are one answer rather than two questions, because a lane
-/// without a window names no volume and a window without a lane names no texels.
+/// about the arm — **which lanes** it admits for a volume
+/// (`supported_render_texture_volume_formats`, the tail's own `0x00 0x11`
+/// section) and how large a volume it admits per axis
+/// (`max_render_texture_dimension_3d`, the `0x00 0x0D` section beside it) — and
+/// they are one answer rather than two questions, because a lane without a
+/// window names no volume and a window without a lane names no texels.
+///
+/// The lane half is a *device* answer and not a reading of the render-sampler
+/// block's format list: a device may list `bgra8_unorm` as a sampled surface
+/// and still refuse a `TYPE_3D` image in that lane, which is exactly the
+/// reading the `D3` arm's own first increment met (the RTX 5060 refuses the
+/// linear `R32_SFLOAT` volume the pre-device-copy arm created while Lavapipe
+/// accepts it). The census's remaining LPF pipeline binds its three volumes in
+/// the `B8G8R8A8_UNORM` lane, so the list is what decides whether that bind
+/// travels.
 ///
 /// The window is **per axis**, not a texel count: Vulkan's
 /// `maxImageDimension3D` bounds a `TYPE_3D` image's width, height *and* depth,
@@ -436,32 +447,113 @@ pub struct OneDimensionSupport {
 /// product — which is the one way this reading differs from the
 /// one-dimensional window's own.
 ///
-/// `false`/`0` is the fail-closed reading of each half, and it is what a frame
-/// written before the arm existed decodes to: the lane is absent from an older
-/// list, and the section itself is absent from an older tail — the tag is the
-/// escape family's own, so a decoder that predates it answers [`WireDecline`]
-/// rather than a value, and a decoder that carries the tag reads `0` out of a
-/// frame that ends before it. A device that states either half as its default
-/// is a device that keeps its own refusal by name for the shape.
+/// The absent sections are the older readings, and each one is the rule the arm
+/// carried before its own increment: a frame written before the *lane* section
+/// existed reads as `r32_float` alone — the one lane the `D3` arm shipped with
+/// — and a frame that ends before the window reads `0`, the fail-closed
+/// direction. That is why an old frame's meaning does not move: every lane
+/// beside `r32_float` keeps its refusal by name under the older reading, which
+/// is what the census counted before this increment.
 pub fn render_texture_dimension_3d_window(
     epoch: DeviceEpoch,
     capabilities: &ProviderCapabilities,
 ) -> Result<VolumeSupport, WireDecline> {
     let decoded = capabilities_frame(epoch, capabilities)?;
+    // The lane list is the device's own answer, and its **absence** is the
+    // pre-increment reading *verbatim* rather than an empty set or an
+    // unconditional `r32_float`: before the section existed the arm's lane came
+    // out of the render-sampler block's own format list, so a frame written
+    // before it keeps exactly that rule — `r32_float` where the surface list
+    // carries it, and no lane where it does not. A provider that lists lanes
+    // states the closed set instead, and a frame that names none of them is one
+    // whose device has no volume lane at all.
+    let lanes = if decoded.declares_render_texture_volume_formats() {
+        VolumeLanes::of(&decoded.supported_render_texture_volume_formats)
+    } else if decoded
+        .supported_render_texture_formats
+        .contains(&TextureFormat::R32Float)
+    {
+        VolumeLanes::of(&[TextureFormat::R32Float])
+    } else {
+        VolumeLanes::NONE
+    };
     Ok(VolumeSupport {
-        r32f: decoded
-            .supported_render_texture_formats
-            .contains(&TextureFormat::R32Float),
+        lanes,
         window: decoded.max_render_texture_dimension_3d,
     })
 }
 
+/// The lanes one provider's frame lists for its three-dimensional sampled arm
+/// (2026-09-20, census v48's volume lane gate).
+///
+/// One bit per contract lane rather than a `Vec<TextureFormat>` for the two
+/// reasons the window beside it is a number: the whole answer travels as one
+/// `Copy` value through the pure class gate, and the family is closed — the
+/// contract names every format a `TYPE_3D` sampled image can carry on this rail,
+/// and the wire section is decoded against the same closed list.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VolumeLanes(u8);
+
+impl VolumeLanes {
+    /// The set a frame that lists no lane at all states.
+    pub const NONE: Self = Self(0);
+
+    /// The bit one contract format occupies in the set, or `None` for a format
+    /// this reading cannot state as a volume lane.
+    ///
+    /// The seven are [`TextureFormat::RENDER_SAMPLED`]'s own: the lanes the
+    /// render sampler admits as a sampled source are the only ones the rail's
+    /// volume arm can name, so a frame that listed another format would name a
+    /// lane no declaration of this class could restate.
+    const fn bit(format: TextureFormat) -> Option<u8> {
+        match format {
+            TextureFormat::Rgba8Unorm => Some(1 << 0),
+            TextureFormat::Bgra8Unorm => Some(1 << 1),
+            TextureFormat::R8Unorm => Some(1 << 2),
+            TextureFormat::R8G8Unorm => Some(1 << 3),
+            TextureFormat::Rgba16Float => Some(1 << 4),
+            TextureFormat::R32Float => Some(1 << 5),
+            TextureFormat::R16Float => Some(1 << 6),
+            TextureFormat::R32Uint => None,
+        }
+    }
+
+    /// The set one frame's decoded lane list states.
+    pub fn of(formats: &[TextureFormat]) -> Self {
+        formats
+            .iter()
+            .fold(Self::NONE, |set, format| set.with(*format))
+    }
+
+    /// The same set with one more lane in it; a format this reading cannot
+    /// state leaves the set alone rather than inventing a bit for it.
+    pub const fn with(self, format: TextureFormat) -> Self {
+        match Self::bit(format) {
+            Some(bit) => Self(self.0 | bit),
+            None => self,
+        }
+    }
+
+    /// Whether the set names this contract format.
+    pub const fn contains(self, format: TextureFormat) -> bool {
+        match Self::bit(format) {
+            Some(bit) => self.0 & bit != 0,
+            None => false,
+        }
+    }
+
+    /// How many lanes the set names.
+    pub const fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+}
+
 /// The two facts one provider's frame states about its three-dimensional
-/// sampled window, one value each.
+/// sampled arm: which lanes it carries, and how large a volume it admits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VolumeSupport {
-    /// Whether the frame's format list carries `r32_float`.
-    pub r32f: bool,
+    /// The lanes the frame lists for the arm.
+    pub lanes: VolumeLanes,
     /// The largest extent the frame admits on **each** of a volume's three
     /// axes; `0` for a frame that does not carry the section at all.
     pub window: u64,
@@ -472,23 +564,35 @@ impl VolumeSupport {
     /// which is also what every request whose binds name no volume reads: the
     /// class gate then answers exactly as it did before this increment.
     pub const NONE: Self = Self {
-        r32f: false,
+        lanes: VolumeLanes::NONE,
         window: 0,
     };
 
     /// The contract format this device's answer states for one bind's own
     /// Vulkan view of a volume lane, or `None` when the frame does not list it.
     ///
-    /// `r32_float` alone, for the reason the one-dimensional window names its
-    /// own two lanes and no others: a volume whose texel is another format is a
-    /// shape this arm does not state, and the census's own volumes are
-    /// single-component floats (`texture3d<float, sample>`). The three-axis
-    /// window beside the lane is a limit rather than a second format, which is
-    /// why a lane the frame lists is still refused by the same door when the
-    /// bind's extents fall outside it.
+    /// One term per lane rather than `r32_float` alone, and the terms are the
+    /// contract's own [`TextureFormat`] names: the census's volumes arrive in
+    /// two shapes — the single-component float lane
+    /// (`texture3d<float, sample>` over `R32_SFLOAT`) and the eight-bit
+    /// four-component order (`B8G8R8A8_UNORM`) — and which of them a device
+    /// carries is a fact only the device states. The three-axis window beside
+    /// the list is a limit rather than a second format, which is why a lane the
+    /// frame lists is still refused by the same door when the bind's extents
+    /// fall outside it.
     pub const fn admits(self, format: ash::vk::Format) -> Option<TextureFormat> {
-        match format {
-            ash::vk::Format::R32_SFLOAT if self.r32f => Some(TextureFormat::R32Float),
+        let lane = match format {
+            ash::vk::Format::R32_SFLOAT => Some(TextureFormat::R32Float),
+            ash::vk::Format::R8G8B8A8_UNORM => Some(TextureFormat::Rgba8Unorm),
+            ash::vk::Format::B8G8R8A8_UNORM => Some(TextureFormat::Bgra8Unorm),
+            ash::vk::Format::R8_UNORM => Some(TextureFormat::R8Unorm),
+            ash::vk::Format::R8G8_UNORM => Some(TextureFormat::R8G8Unorm),
+            ash::vk::Format::R16G16B16A16_SFLOAT => Some(TextureFormat::Rgba16Float),
+            ash::vk::Format::R16_SFLOAT => Some(TextureFormat::R16Float),
+            _ => None,
+        };
+        match lane {
+            Some(lane) if self.lanes.contains(lane) => Some(lane),
             _ => None,
         }
     }

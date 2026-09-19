@@ -12652,6 +12652,37 @@ fn volume_bytes(moved: bool) -> Vec<u8> {
         .collect()
 }
 
+/// The same `4 x 4 x 2` volume in the **eight-bit** lane the census's own LPF
+/// pipeline declares (`B8G8R8A8_UNORM`), four bytes a texel.
+///
+/// The lane's memory order is `blue, green, red, alpha`, and the fixture's four
+/// samples take `.x` — which a `B8G8R8A8_UNORM` view fills from the format's
+/// *red* channel, the third byte of each texel. So each sampled texel carries
+/// the byte the frame has to land in its red position, with the blue decoy
+/// (`0x11`) and the green one (`0x22`) beside it: `0x11` is exactly what a
+/// declaration that named the other four-byte order would read, which is the
+/// mix-up the decoys are for, and the fill texel's red byte is `0x00`, which no
+/// sampled lane of the expectation holds.
+fn eight_bit_volume_bytes(moved: bool) -> Vec<u8> {
+    const FILL: [u8; 4] = [0x11, 0x22, 0x00, 0x33];
+    let mut texels = [FILL; VOLUME_WIDTH * VOLUME_HEIGHT * VOLUME_DEPTH];
+    {
+        let mut set = |x: usize, y: usize, z: usize, red: u8| {
+            texels[volume_texel(x, y, z)][2] = red;
+        };
+        // The same four positions the float fixture samples, in the same
+        // order, and the same numbers its own frames carry.
+        set(0, 0, 0, 0x40);
+        set(2, 0, 1, if moved { 0x33 } else { 0xff });
+        set(0, 2, 0, 0xbf);
+        set(2, 2, 1, 0xdf);
+    }
+    texels
+        .iter()
+        .flat_map(|texel| texel.iter().copied())
+        .collect()
+}
+
 /// The attachment-covering draw with one **three-dimensional** volume bound
 /// (2026-09-20, the `D3` sampled texture arm): the reviewed position stream, the
 /// fragment stage's own declaration, the AIR static sampler the module carries,
@@ -12744,7 +12775,9 @@ fn the_volume_is_read_from_the_frame_and_keeps_the_old_window_by_name() {
         provider_wire::render_texture_dimension_3d_window(epoch, &provider.capabilities())
             .expect("the capability frame round-trips");
     assert!(
-        declared.r32f,
+        declared
+            .lanes
+            .contains(metal_api_core::provider::TextureFormat::R32Float),
         "the acceptance environment's provider lists the volume's own float lane \
          (E's 2026-09-20 arm): {declared:?}"
     );
@@ -12825,18 +12858,20 @@ fn the_volume_is_read_from_the_frame_and_keeps_the_old_window_by_name() {
     // other lane the frame does not list is refused at. Nothing reaches the
     // provider either way.
     // The pre-increment frame itself, built here the way the census's own boots
-    // carried it: `r32_float` absent from the format list and the tail's window
-    // section left out (`0`), read back through the same wire.
+    // carried it: no lane section at all — the arm's own `r32_float`-only rule —
+    // and the tail's window section left out (`0`), read back through the same
+    // wire.
     let mut refused = provider.capabilities();
-    refused
-        .supported_render_texture_formats
-        .retain(|format| *format != metal_api_core::provider::TextureFormat::R32Float);
+    refused.supported_render_texture_volume_formats.clear();
     refused.max_render_texture_dimension_3d = 0;
     let silent = provider_wire::render_texture_dimension_3d_window(epoch, &refused)
         .expect("the shorter frame still round-trips");
     assert!(
-        !silent.r32f && silent.window == 0,
-        "a frame that drops the window reads as the refusal: {silent:?}"
+        silent.lanes.count() == 1
+            && silent.admits(ash::vk::Format::R32_SFLOAT).is_some()
+            && silent.window == 0,
+        "a frame that drops the lane section reads the pre-increment rule (`r32_float` alone) \
+         and the window it never stated: {silent:?}"
     );
     // One door, one sentence: inside the pre-increment device the *admitted*
     // extent and an extent past any window are two reads of one sentence, which
@@ -12970,6 +13005,364 @@ fn the_volume_is_read_from_the_frame_and_keeps_the_old_window_by_name() {
          reflection keeps `render_provider_out_of_class_texture_shape` and the reflection's own \
          sentence",
         declared.window,
+    );
+}
+
+/// Which arm one rail outcome took, so a failed assertion prints the answer
+/// rather than the frame it carried (a landed frame is an attachment's worth of
+/// bytes and buries the reading it is supposed to compare).
+fn outcome_name(outcome: &RenderRailOutcome) -> &'static str {
+    match outcome {
+        RenderRailOutcome::ProviderCompleted(_) => "ProviderCompleted",
+        RenderRailOutcome::ProviderCompletedResident(_) => "ProviderCompletedResident",
+        RenderRailOutcome::NotInNarrowClass(_) => "NotInNarrowClass",
+        RenderRailOutcome::ProviderDeclined(_) => "ProviderDeclined",
+    }
+}
+
+/// The volume **lane list** is the device's own answer beside the window
+/// (2026-09-20, census v48's volume lane gate): the eight-bit lane the census's
+/// LPF pipeline declares travels when — and only when — the frame lists it, and
+/// the readings this door stated before the section keep their sentences.
+///
+/// The same `4 x 4 x 2` volume the `D3` fixture samples, one lane over: the
+/// bind's own bytes are `B8G8R8A8_UNORM` texels, the frame the two rails land
+/// is the four sampled texels' own red bytes, and the decoys beside each one
+/// (the blue byte a declaration of the *other* four-byte order would read, and
+/// the fill) are values no lane of the expectation holds.
+#[test]
+fn the_eight_bit_volume_lane_is_read_from_the_frame_and_keeps_the_old_sentence() {
+    let _guard = engine_test_session();
+    let stages = volume_sample_stages();
+    let (width, height) = extent();
+    let volume = (4u32, 4u32, 2u32);
+    let frame_for = |moved: bool| {
+        sampled_volume_request(
+            &stages,
+            eight_bit_volume_bytes(moved),
+            volume,
+            ash::vk::Format::B8G8R8A8_UNORM,
+        )
+    };
+    // The same four bytes the float lane's own volumes land in this fixture's
+    // order (`red` = slice 0's (0, 0), `green` = slice 1's (2, 0), `blue` =
+    // slice 0's (0, 2), `alpha` = slice 1's (2, 2)).
+    let wanted: [u8; 4] = [0x40, 0xff, 0xbf, 0xdf];
+
+    // The device's own frame states the arm's two facts, read exactly as the
+    // class reads them: the lane list out of the tail's own `0x00 0x11`
+    // section, and the per-axis window beside it.
+    let executor =
+        metal_api_vulkan::VulkanExecutor::new().expect("the acceptance environment has a device");
+    let provider = metal_api_vulkan::VulkanComputeProvider::with_executor(executor)
+        .expect("the canonical provider builds");
+    let epoch = provider.device_epoch();
+    let declared =
+        provider_wire::render_texture_dimension_3d_window(epoch, &provider.capabilities())
+            .expect("the capability frame round-trips");
+    assert_eq!(
+        declared.admits(ash::vk::Format::B8G8R8A8_UNORM),
+        Some(metal_api_core::provider::TextureFormat::Bgra8Unorm),
+        "the device answers for the census's own volume lane: {declared:?}"
+    );
+    assert!(
+        declared.covers([volume.0, volume.1, volume.2]),
+        "and states a window covering each of the volume's three extents: {declared:?}"
+    );
+
+    // The admitted arm: the bind reaches the provider, the frame is the
+    // eight-bit volume's own bytes, and the engine lands the same bytes for the
+    // same request.
+    let delivered = provider_render::provider_submissions();
+    let frame = provider_pixels("eight-bit volume", &stages, &frame_for(false));
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "a lane the frame lists, with a window covering all three extents, reaches the canonical \
+         provider"
+    );
+    assert_uniform_frame("eight-bit volume (provider)", &frame, width, height, wanted);
+    // The falsifiers: the byte the frame carries is the texel's *red* one (the
+    // third of the lane's four), it is neither the blue decoy beside it (which
+    // is what a declaration of the other four-byte order would read) nor the
+    // fill's red byte.
+    let uploaded = eight_bit_volume_bytes(false);
+    assert_eq!(
+        uploaded.len(),
+        VOLUME_WIDTH * VOLUME_HEIGHT * VOLUME_DEPTH * 4,
+        "the volume's own byte extent at this lane's texel width"
+    );
+    assert_eq!(
+        frame[1], wanted[1],
+        "the green lane is the sampled texel's own red byte"
+    );
+    assert_ne!(
+        frame[1],
+        uploaded[GREEN_TEXEL * 4],
+        "not the blue byte the other four-byte order would hand the module"
+    );
+    assert_ne!(frame[1], 0x00, "and not the fill texel's red byte");
+    if let Some(engine) = engine_pixels("eight-bit volume", &stages, frame_for(false)) {
+        assert_eq!(
+            frame, engine,
+            "the provider's frame and the engine's frame are one frame"
+        );
+    }
+
+    // Another volume moves the texel in the *second* slice, so the reading is
+    // the upload — and the third axis at this texel width — rather than the run.
+    let moved = provider_pixels("eight-bit volume moved", &stages, &frame_for(true));
+    assert_eq!(
+        moved[0], wanted[0],
+        "the red lane reads slice 0's own texel in both volumes"
+    );
+    assert_eq!(
+        moved[1], 0x33,
+        "and the green lane follows slice 1's own texel in the moved volume"
+    );
+    if let Some(engine) = engine_pixels("eight-bit volume moved", &stages, frame_for(true)) {
+        assert_eq!(
+            moved, engine,
+            "the two rails agree about the moved eight-bit volume too"
+        );
+    }
+
+    // The lane list is what admits the shape, and the reading this door stated
+    // before the section keeps its sentence: a frame whose *only* volume lane is
+    // `r32_float` — the arm's own shipped rule, which is also what a frame
+    // written before the section decodes to — refuses the eight-bit bind under
+    // the same slug and the same words, at the same point in the same order as
+    // every other lane the frame does not list.
+    let (r32f_only, delivered) = {
+        let _r32f_alone = provider_render::override_render_texture_dimension_3d_window(Some(true));
+        let delivered = provider_render::provider_submissions();
+        let detail = match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &frame_for(false),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_texture_bind",
+                    "the door every unlisted lane is refused at"
+                );
+                reason.detail().to_owned()
+            }
+            other => panic!(
+                "an eight-bit volume the frame does not list stays on the engine: {}",
+                outcome_name(&other)
+            ),
+        };
+        (detail, delivered)
+    };
+    assert!(
+        r32f_only
+            .contains("`r32_float` texels (the one volume lane the provider's own frame lists)"),
+        "the sentence is the one this door has stated since the `D3` arm: {r32f_only}"
+    );
+    assert!(
+        r32f_only.contains("at most 2048 texels"),
+        "with the window the instrument states: {r32f_only}"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "and it never reaches the provider"
+    );
+
+    // The absent section is the *pre-increment* reading rather than an empty
+    // set: the same frame with the lane list dropped reads `r32_float` alone,
+    // which is what the arm carried before the device question existed — the
+    // reading an older consumer keeps and the one this door's old sentence is
+    // written for.
+    let mut pre_increment = provider.capabilities();
+    pre_increment
+        .supported_render_texture_volume_formats
+        .clear();
+    let read = provider_wire::render_texture_dimension_3d_window(epoch, &pre_increment)
+        .expect("the frame without the section still round-trips");
+    assert_eq!(
+        read.lanes.count(),
+        1,
+        "the absent section reads the pre-increment rule: {read:?}"
+    );
+    assert_eq!(
+        read.admits(ash::vk::Format::R32_SFLOAT),
+        Some(metal_api_core::provider::TextureFormat::R32Float)
+    );
+    assert_eq!(read.admits(ash::vk::Format::B8G8R8A8_UNORM), None);
+    eprintln!(
+        "2026-09-20 volume lanes: the device states {declared:?}; the eight-bit frame is {} \
+         (wanted {}), the moved one is {}, and an `r32_float`-only frame keeps {r32f_only}",
+        frame
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        wanted
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        moved
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    );
+}
+
+/// The volume arm's **swizzle and fold** rule (2026-09-20, census v48's volume
+/// lane gate): the plan a bind's own *texel format* contributes is folded into
+/// the bytes the class uploads one axis over from R41's surface arm, and every
+/// plan a *guest's view* asked for keeps the refusal by name.
+///
+/// The fold's own shape is what this reading measures: a one-byte volume lane
+/// (`A8Unorm`'s `R8_UNORM` bind under the format's `ALPHA_IN_RED` plan) is
+/// widened into the four-byte lane the declaration can name — `rgba8_unorm`,
+/// which the device has to list for a *volume* before the fold is taken — and
+/// the provider executes the widened declaration end to end, which is where the
+/// fold's own texel width is held to the contract's `width * height * depth * 4`
+/// (`render_texture_format_unsupported` is what a wrong width would meet). The
+/// fixture's four samples take `.x`, and the folded texels carry their byte in
+/// alpha, so this reading separates the fold's *shape* from its values: the
+/// module that would separate the values is a `.w`-sampling volume sibling this
+/// increment did not build.
+#[test]
+fn the_volume_fold_widens_the_lane_and_a_view_swizzle_keeps_its_name() {
+    let _guard = engine_test_session();
+    let stages = volume_sample_stages();
+    let (width, height) = extent();
+    let volume = (4u32, 4u32, 2u32);
+    let plan = reims_vgpu::backend::vulkan::translate::pixel::ALPHA_IN_RED;
+    // The one-byte lane's own texels, chosen so a rail that read them at the
+    // wrong width (four bytes a texel, say) could not land the fill.
+    let bytes: Vec<u8> = (0..(VOLUME_WIDTH * VOLUME_HEIGHT * VOLUME_DEPTH))
+        .map(|index| ((index as u32 * 7 + 0x1f) & 0xff) as u8)
+        .collect();
+    let request = |swizzle: reims_vgpu::protocol::pixel_format::SwizzlePlan| {
+        let mut req =
+            sampled_volume_request(&stages, bytes.clone(), volume, ash::vk::Format::R8_UNORM);
+        req.sampled_images[0].swizzle = swizzle;
+        req
+    };
+
+    // The device's own answer, read the way the class reads it: both lanes the
+    // fold needs — the one the bind's view states and the four-byte one the
+    // declaration names — have to be volume lanes of the same frame.
+    let executor =
+        metal_api_vulkan::VulkanExecutor::new().expect("the acceptance environment has a device");
+    let provider = metal_api_vulkan::VulkanComputeProvider::with_executor(executor)
+        .expect("the canonical provider builds");
+    let declared = provider_wire::render_texture_dimension_3d_window(
+        provider.device_epoch(),
+        &provider.capabilities(),
+    )
+    .expect("the capability frame round-trips");
+    assert_eq!(
+        declared.admits(ash::vk::Format::R8_UNORM),
+        Some(metal_api_core::provider::TextureFormat::R8Unorm),
+        "the device lists the one-byte lane the bind states: {declared:?}"
+    );
+    assert_eq!(
+        declared.admits(ash::vk::Format::R8G8B8A8_UNORM),
+        Some(metal_api_core::provider::TextureFormat::Rgba8Unorm),
+        "and the four-byte lane the widened declaration names: {declared:?}"
+    );
+
+    // The fold is taken: the bind reaches the provider, which is where the
+    // widened declaration's own byte count is held to the contract.
+    let delivered = provider_render::provider_submissions();
+    let folded = provider_pixels("A8 volume (provider)", &stages, &request(plan));
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the format's own plan is folded into the bytes and the bind travels"
+    );
+    assert_uniform_frame(
+        "A8 volume (provider)",
+        &folded,
+        width,
+        height,
+        [0x00, 0x00, 0x00, 0x00],
+    );
+    if let Some(engine) = engine_pixels("A8 volume", &stages, request(plan)) {
+        assert_eq!(
+            folded, engine,
+            "the two rails land one frame for the folded volume too"
+        );
+    }
+
+    // The half the increment does not fold keeps the census's own name: a plan
+    // the *view* asked for — here the luma's (r, r, r, r) — stays on the engine
+    // under the bind door, and its route is charged as the view's, exactly as
+    // R41 left it.
+    let view_plan = reims_vgpu::protocol::pixel_format::swizzle_plan(&[2, 2, 2, 2])
+        .expect("the fixture's selectors are the decoder's own alphabet");
+    let charged_before = route_count("render_provider_texture_bind_swizzled_view");
+    let delivered = provider_render::provider_submissions();
+    let detail = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request(view_plan),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_bind",
+                "a view swizzle over a volume is the bind door's own shape"
+            );
+            reason.detail().to_owned()
+        }
+        other => panic!(
+            "a volume whose view spells a channel plan stays on the engine: {}",
+            outcome_name(&other)
+        ),
+    };
+    assert!(
+        detail.contains("identity channel mapping"),
+        "the sentence names the mapping this door requires: {detail}"
+    );
+    assert_eq!(
+        route_count("render_provider_texture_bind_swizzled_view"),
+        charged_before + 1,
+        "and the census charges it as the view's half, as R41's probe does"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a view swizzle never reaches the provider"
+    );
+
+    // The one-byte lane under an *identity* view is the arm's own plain shape
+    // rather than the fold's: `r8_unorm` is a volume lane the frame lists and
+    // the view's mapping is the unit, so the bind travels with its image named
+    // as the one-byte format — and the frame carries the four sampled texels'
+    // own bytes, which is what a rail that walked this source at four bytes a
+    // texel could not land.
+    let identity = reims_vgpu::protocol::pixel_format::swizzle_identity();
+    let plain = provider_pixels("r8 volume (provider)", &stages, &request(identity));
+    let sampled = [
+        bytes[volume_texel(0, 0, 0)],
+        bytes[volume_texel(2, 0, 1)],
+        bytes[volume_texel(0, 2, 0)],
+        bytes[volume_texel(2, 2, 1)],
+    ];
+    assert_uniform_frame("r8 volume (provider)", &plain, width, height, sampled);
+    if let Some(engine) = engine_pixels("r8 volume", &stages, request(identity)) {
+        assert_eq!(
+            plain, engine,
+            "the two rails land one frame for the one-byte lane too"
+        );
+    }
+    eprintln!(
+        "2026-09-20 volume fold: the device states {declared:?}; the folded frame is {}, the \
+         one-byte lane's own frame is {}, and the view's own plan keeps {detail}",
+        folded
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        sampled
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
     );
 }
 

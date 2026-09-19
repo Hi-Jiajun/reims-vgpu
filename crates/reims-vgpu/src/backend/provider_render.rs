@@ -2331,18 +2331,71 @@ fn sampled_bind_window_1d(window: OneDimensionWindow) -> String {
 /// product is not the question either here or at the provider, so the phrase
 /// says "each of its three extents" rather than one texel count.
 fn sampled_bind_window_3d(window: provider_wire::VolumeSupport) -> String {
-    if window.r32f {
-        format!(
-            "`r32_float` texels (the one volume lane the provider's own frame lists) whose three \
-             extents are each at most {} texels (the provider's own three-dimensional window)",
-            window.window,
-        )
-    } else {
-        format!(
-            "no volume texel lane at all (the provider's own frame does not list `r32_float`) and \
-             a window of at most {} texels per axis (the provider's own three-dimensional window)",
-            window.window,
-        )
+    // The two readings this door stated before the lane list existed keep their
+    // sentences **verbatim**: a frame that lists no lane at all (the
+    // instrumented pre-increment device, and the degenerate frame every
+    // instrument that states no window builds), and a frame whose only lane is
+    // `r32_float` — which is both the `D3` arm's own shipped rule and the
+    // reading every frame written before the lane section decodes to. So a
+    // census record this door counted under those sentences keeps its key, and
+    // the wider sets below are the ones this increment added.
+    let lanes = match window.lanes.count() {
+        0 => {
+            return format!(
+                "no volume texel lane at all (the provider's own frame does not list \
+                 `r32_float`) and a window of at most {} texels per axis (the provider's own \
+                 three-dimensional window)",
+                window.window,
+            )
+        }
+        1 if window.lanes.contains(TextureFormat::R32Float) => {
+            "`r32_float` texels (the one volume lane the provider's own frame lists)".to_owned()
+        }
+        _ => format!(
+            "{} texels (the volume lanes the provider's own frame lists)",
+            volume_lane_names(window.lanes),
+        ),
+    };
+    format!(
+        "{lanes} whose three extents are each at most {} texels (the provider's own \
+         three-dimensional window)",
+        window.window,
+    )
+}
+
+/// The lanes one volume bind sentence names, in the contract's own closed order
+/// and its own names (2026-09-20, census v48's volume lane gate).
+///
+/// Assembled from the set rather than written out per shape, which is the one
+/// way this door's phrasing is built instead of spelled: the one-dimensional
+/// sibling enumerates its phrases because its arm states exactly two lanes, and
+/// this one answers a *device's* set with many shapes. The order and the names
+/// are the contract's own, so the string is a function of the set alone and two
+/// readings of one device print one sentence.
+fn volume_lane_names(lanes: provider_wire::VolumeLanes) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for format in TextureFormat::RENDER_SAMPLED {
+        if !lanes.contains(format) {
+            continue;
+        }
+        names.push(match format {
+            TextureFormat::Rgba8Unorm => "`rgba8_unorm`",
+            TextureFormat::Bgra8Unorm => "`bgra8_unorm`",
+            TextureFormat::R8Unorm => "`r8_unorm`",
+            TextureFormat::R8G8Unorm => "`r8g8_unorm`",
+            TextureFormat::Rgba16Float => "`rgba16_float`",
+            TextureFormat::R32Float => "`r32_float`",
+            TextureFormat::R16Float => "`r16_float`",
+            // `r32_uint` is not a lane this reading states, so the set never
+            // holds it; the arm keeps the match exhaustive rather than
+            // inventing a name for a format no volume carries.
+            TextureFormat::R32Uint => continue,
+        });
+    }
+    match names.split_last() {
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => "no volume texel lane at all".to_owned(),
     }
 }
 
@@ -2717,13 +2770,14 @@ fn sampled_textures<'a>(
     // neither lane and no width, which is the pre-increment device's whole
     // answer.
     render_texture_one_dimension_window: OneDimensionWindow,
-    // The device's own answer to the volume arm's window (2026-09-20, the `D3`
-    // sampled texture arm), read by [`submit_render`] out of the same frame
+    // The device's own answer to the volume arm's two facts (2026-09-20, the
+    // `D3` sampled texture arm, and the lane list beside the window since census
+    // v48's volume lane gate), read by [`submit_render`] out of the same frame
     // exactly when the request names a sampled bind whose kind is the
     // three-dimensional view ([`sampled_bind_of_a_volume`]) — the gate below is
     // pure and reads no device answer of its own.
-    // `provider_wire::VolumeSupport::NONE` states neither lane nor window,
-    // which is the pre-increment device's whole answer.
+    // `provider_wire::VolumeSupport::NONE` states no lane and no window, which
+    // is the pre-increment device's whole answer.
     render_texture_volume_window: provider_wire::VolumeSupport,
     // Whether this draw's provider executes the texel space **and** this
     // draw's own fragment module has the explicit-LOD sibling such a sample
@@ -3210,14 +3264,16 @@ fn sampled_textures<'a>(
             // bind of a one-dimensional lane would.
             //
             // The volume arm (2026-09-20, the `D3` sampled texture arm) reads
-            // the lane the *same* frame's format list carries one axis over:
-            // the census's volumes are single-component floats, which the
-            // two-dimensional window's own list states only where the contract
-            // appended `r32_float` for the sampled arm — and that lane is the
-            // one this arm weighs, so a volume bind of any other format keeps
-            // the bind door's refusal rather than being uploaded under a
-            // four-byte order whose texel the module's own sample does not
-            // read.
+            // the lanes the *same* frame states for the arm one axis over —
+            // since census v48's volume lane gate that is the section of the
+            // frame that answers "which lanes can this device create and fill a
+            // `TYPE_3D` image with", rather than a second reading of the
+            // surface list beside it. The census's volumes arrive in two of
+            // those lanes (the single-component float one and the eight-bit
+            // four-component order), and a volume bind whose format the frame
+            // does not list keeps the bind door's refusal rather than being
+            // uploaded under an order whose texel the module's own sample does
+            // not read.
             listed if !one_dim && !volume => render_texture_sampled_lanes.admits(listed),
             listed if volume => render_texture_volume_window.admits(listed),
             listed => render_texture_one_dimension_window.admits(listed),
@@ -3230,8 +3286,25 @@ fn sampled_textures<'a>(
         // float LUT has no channel plan to fold, and the widened name a fold
         // would produce (`rgba8_unorm`) is not a lane this arm uploads, so the
         // one-dimensional binds state no plan at all.
-        let fold = if one_dim || volume {
+        //
+        // The volume arm reads the same plan one axis over (2026-09-20, census
+        // v48's volume lane gate): the fold widens a one-byte volume into the
+        // four-byte `rgba8_unorm` lane, so it is taken exactly when the
+        // *device's* own frame lists that lane for a volume — a condition the
+        // two-dimensional arm never had to ask, because the name its fold
+        // produces rides the render-sampler list the fold's own lane was
+        // admitted from. A device that lists the one-byte lane but not the
+        // four-byte one therefore keeps this bind on the engine under the same
+        // door, which is the reading the widened declaration would otherwise
+        // have to meet at the provider by name.
+        let fold = if one_dim {
             None
+        } else if volume {
+            folded_channel_plan(image).filter(|_| {
+                render_texture_volume_window
+                    .admits(ash::vk::Format::R8G8B8A8_UNORM)
+                    .is_some()
+            })
         } else {
             folded_channel_plan(image)
         };
@@ -6920,62 +6993,63 @@ pub fn override_render_texture_one_dimension_window(
     }
 }
 
-/// The device's own answer for the three-dimensional sampled window
-/// (2026-09-20, the `D3` sampled texture arm), and the states the test
-/// instrument below can put it in.
-const VOLUME_WINDOW_DEVICE: u8 = 0;
-const VOLUME_WINDOW_NOT_DECLARED: u8 = 1;
-const VOLUME_WINDOW_DECLARED: u8 = 2;
+/// The device's own answer for the three-dimensional sampled arm's frame
+/// (2026-09-20, the `D3` sampled texture arm; the lane list beside the window
+/// since census v48's volume lane gate), and the states the test instrument
+/// below can put it in.
+const VOLUME_FRAME_DEVICE: u8 = 0;
+const VOLUME_FRAME_PRE_INCREMENT: u8 = 1;
+const VOLUME_FRAME_R32F_AT_THE_CEILING: u8 = 2;
 
-/// Whether the three-dimensional window is read from the device's own frame
-/// ([`VOLUME_WINDOW_DEVICE`], what production runs) or from an answer a test
-/// stated.
-static VOLUME_WINDOW_ANSWER: AtomicU8 = AtomicU8::new(VOLUME_WINDOW_DEVICE);
+/// Whether the three-dimensional arm's frame is read from the device's own
+/// capability snapshot ([`VOLUME_FRAME_DEVICE`], what production runs) or from
+/// an answer a test stated.
+static VOLUME_FRAME_ANSWER: AtomicU8 = AtomicU8::new(VOLUME_FRAME_DEVICE);
 
-/// A test's own answer for the three-dimensional window, restored when it
+/// A test's own answer for the three-dimensional arm's frame, restored when it
 /// drops.
 ///
 /// The same guard shape as [`RenderTextureOneDimensionWindowOverride`] and for
-/// the same two reasons — the rail reads the window out of the provider's
-/// capability frame, and a test that has to see the fail-closed arm cannot make
-/// an admitted device stop stating it; a decision rather than an observation,
-/// so an unwound assertion must not leave the next shape answering from a
-/// device that is not its own. The *instrument is separate* from the
-/// one-dimensional window's because the two windows are two capabilities: this
-/// one replaces the snapshot's format list *and* the tail's `0x00 0x0D` section
-/// together, exactly as the frame states them, and a device that carries one of
-/// the two windows and not the other is a combination one instrument could not
-/// spell.
-pub struct RenderTextureVolumeWindowOverride {
+/// the same two reasons — the rail reads the arm's two facts out of the
+/// provider's capability frame, and a test that has to see the fail-closed arm
+/// cannot make an admitted device stop stating them; a decision rather than an
+/// observation, so an unwound assertion must not leave the next shape answering
+/// from a device that is not its own. The *instrument is separate* from the
+/// one-dimensional window's because the two arms are two capabilities: this one
+/// replaces the snapshot's **volume lane list** and the tail's `0x00 0x0D`
+/// window together, exactly as one frame states them, and a device that carries
+/// one of the two halves and not the other is a combination one instrument
+/// could not spell.
+pub struct RenderTextureVolumeFrameOverride {
     previous: u8,
 }
 
-impl Drop for RenderTextureVolumeWindowOverride {
+impl Drop for RenderTextureVolumeFrameOverride {
     fn drop(&mut self) {
-        VOLUME_WINDOW_ANSWER.store(self.previous, Ordering::Relaxed);
+        VOLUME_FRAME_ANSWER.store(self.previous, Ordering::Relaxed);
     }
 }
 
-/// Ask the three-dimensional window as `declared` until the returned guard
+/// Ask the three-dimensional arm's frame as `declared` until the returned guard
 /// drops, or as the device's own answer for `None` (2026-09-20).
 ///
-/// `Some(true)` states the lane and the *contract's* review ceiling — the
-/// largest window any provider may declare, which is the only way a test can
-/// exercise the three-axis rule the real device's own `maxImageDimension3D`
-/// merely bounds. `Some(false)` states the **pre-increment** device: the lane
-/// absent from the list and a zero window, which is exactly the frame every
-/// census boot so far carried and exactly what the shape's fail-closed arm has
-/// to read.
+/// `Some(true)` states `r32_float` as the frame's **only** volume lane at the
+/// *contract's* review ceiling — the largest window any provider may declare,
+/// which is the only way a test can exercise the three-axis rule the real
+/// device's own `maxImageDimension3D` merely bounds. `Some(false)` states the
+/// **pre-increment** device: no lane list at all and a zero window, which is
+/// exactly the frame every census boot before the lane section carried and
+/// exactly what the shape's fail-closed arm has to read.
 pub fn override_render_texture_dimension_3d_window(
     declared: Option<bool>,
-) -> RenderTextureVolumeWindowOverride {
+) -> RenderTextureVolumeFrameOverride {
     let answer = match declared {
-        None => VOLUME_WINDOW_DEVICE,
-        Some(false) => VOLUME_WINDOW_NOT_DECLARED,
-        Some(true) => VOLUME_WINDOW_DECLARED,
+        None => VOLUME_FRAME_DEVICE,
+        Some(false) => VOLUME_FRAME_PRE_INCREMENT,
+        Some(true) => VOLUME_FRAME_R32F_AT_THE_CEILING,
     };
-    RenderTextureVolumeWindowOverride {
-        previous: VOLUME_WINDOW_ANSWER.swap(answer, Ordering::Relaxed),
+    RenderTextureVolumeFrameOverride {
+        previous: VOLUME_FRAME_ANSWER.swap(answer, Ordering::Relaxed),
     }
 }
 
@@ -7233,26 +7307,30 @@ fn declared_render_texture_one_dimension_window(
     })
 }
 
-/// The three-dimensional sampled window the device's own frame states
-/// (2026-09-20, the `D3` sampled texture arm).
+/// The three-dimensional sampled arm's lanes and window, as the device's own
+/// frame states them (2026-09-20, the `D3` sampled texture arm; the lane list
+/// since census v48's volume lane gate).
 ///
 /// The sixteenth reading of the one-snapshot rule
 /// ([`declared_render_texture_one_dimension_window`] is the thirteenth, and the
 /// three E-side readings between them are the vertex count, the fragment
 /// interface and the fragment-output superset), and it is the same rule one
-/// spatial axis further: the frame's format list is what says whether the
-/// provider creates a `TYPE_3D` view for `r32_float` texels, and the capability
-/// tail's `0x00 0x0D` section is what says how large each of the volume's three
+/// spatial axis further: the capability tail's `0x00 0x11` section is what says
+/// **which lanes** the provider creates and fills a `TYPE_3D` image in — a
+/// *device* answer rather than a reading of the surface format list, which the
+/// `D3` arm's own first increment learned the hard way when the RTX 5060
+/// refused the linear `R32_SFLOAT` volume Lavapipe accepted — and the `0x00
+/// 0x0D` section beside it is what says how large each of the volume's three
 /// extents may be. Both travel in one frame and both are read here, because the
 /// shape needs both facts at once.
 ///
-/// `false`/`0` is the fail-closed answer, and it is what a frame written before
-/// the arm existed decodes to: the lane is absent from an older list, and the
-/// section is absent from an older tail (a decoder that predates the tag
-/// refuses the frame rather than reading a value, and one that carries the tag
-/// reads `0` out of a frame that ends before it). A device whose frame states
-/// neither half is a device that keeps those binds on the engine under the
-/// class's own name.
+/// The two absences are the older readings rather than one fail-closed answer:
+/// a frame written before the *lane* section existed reads as the arm's own
+/// pre-increment rule (`r32_float` alone, what the `D3` arm shipped with), and
+/// a frame that ends before the window reads `0` — the fail-closed direction a
+/// device with no three-dimensional arm at all states. A device whose frame
+/// states neither half is a device that keeps those binds on the engine under
+/// the class's own name.
 fn declared_render_texture_dimension_3d_window(
 ) -> Result<provider_wire::VolumeSupport, ProviderRenderDecline> {
     let rail = rail().map_err(IntoRender::into_render)?;
@@ -7262,19 +7340,32 @@ fn declared_render_texture_dimension_3d_window(
     // snapshot — never a second opinion read beside it.
     let capabilities = {
         let declared = rail.provider.capabilities();
-        match VOLUME_WINDOW_ANSWER.load(Ordering::Relaxed) {
-            VOLUME_WINDOW_DEVICE => declared,
+        match VOLUME_FRAME_ANSWER.load(Ordering::Relaxed) {
+            VOLUME_FRAME_DEVICE => declared,
             answer => {
                 let mut declared = declared;
-                let state_the_window = answer == VOLUME_WINDOW_DECLARED;
-                let lane = TextureFormat::R32Float;
-                declared
-                    .supported_render_texture_formats
-                    .retain(|format| state_the_window || *format != lane);
-                if state_the_window && !declared.supported_render_texture_formats.contains(&lane) {
-                    declared.supported_render_texture_formats.push(lane);
+                // The instrument states a *frame*, so it replaces the two
+                // halves one frame carries together: the lane list and the
+                // window. The surface format list is left alone, because the
+                // arm's lane no longer comes from it — that is the whole point
+                // of the section this reading added.
+                let states_r32f_alone = answer == VOLUME_FRAME_R32F_AT_THE_CEILING;
+                declared.supported_render_texture_volume_formats.clear();
+                if states_r32f_alone {
+                    declared
+                        .supported_render_texture_volume_formats
+                        .push(TextureFormat::R32Float);
+                } else {
+                    // The pre-increment device is the frame the census's own
+                    // boots carried: the arm's lane came out of the surface
+                    // format list, so that list is what the older reading
+                    // consults — and the instrument has to drop `r32_float` from
+                    // it, or the fallback would keep a lane the frame never had.
+                    declared
+                        .supported_render_texture_formats
+                        .retain(|format| *format != TextureFormat::R32Float);
                 }
-                declared.max_render_texture_dimension_3d = if state_the_window {
+                declared.max_render_texture_dimension_3d = if states_r32f_alone {
                     metal_api_core::provider::MAX_RENDER_TEXTURE_DIMENSION_3D
                 } else {
                     0
