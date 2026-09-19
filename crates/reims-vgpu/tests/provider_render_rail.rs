@@ -23151,6 +23151,9 @@ fn texture_source_arm(source: &TextureSource) -> String {
         TextureSource::StagedLease(lease) => format!("staged_lease={}", lease.get()),
         TextureSource::BorrowedNoCopy(lease) => format!("borrowed_lease={}", lease.get()),
         TextureSource::TraceView => "trace_view".to_owned(),
+        // E-TX15's pass-entry snapshot arm names no bytes of its own: the
+        // provider reads the attachment as it stood when the pass opened.
+        TextureSource::PassEntrySnapshot => "pass_entry_snapshot".to_owned(),
     }
 }
 
