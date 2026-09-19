@@ -29556,10 +29556,7 @@ fn the_two_static_textures_that_pair_one_to_one_land_their_own_texels_and_agree_
 /// `[[texture(11)]]` — the first texture past the position a one-state-per-
 /// texture rule reaches.
 fn sampler_reuse_stages() -> Stages {
-    sampled_fragment_stages(
-        "render_frag_sampler_reuse.air",
-        "reims_sampler_reuse_frag",
-    )
+    sampled_fragment_stages("render_frag_sampler_reuse.air", "reims_sampler_reuse_frag")
 }
 
 /// The reuse shape's request (R50): one `rgba8_unorm` texture per declaration,
@@ -29586,11 +29583,8 @@ fn sampler_reuse_request(
         .iter()
         .zip(texels.iter())
     {
-        req.sampled_images.push(image_resource(
-            declaration.binding,
-            texels.clone(),
-            extent,
-        ));
+        req.sampled_images
+            .push(image_resource(declaration.binding, texels.clone(), extent));
     }
     for declaration in stages.fragment_texture_declarations.iter() {
         if req
@@ -29714,8 +29708,14 @@ fn the_reused_air_sampler_is_declared_for_every_texture_that_reads_through_it() 
         stages.texture_interface_refusals
     );
 
-    let request = |textures: &[Vec<Vec<u8>>]| sampler_reuse_request(&stages, textures, (width, height));
-    let all = vec![texels.clone(), texels.clone(), texels.clone(), texels.clone()];
+    let request =
+        |textures: &[Vec<Vec<u8>>]| sampler_reuse_request(&stages, textures, (width, height));
+    let all = vec![
+        texels.clone(),
+        texels.clone(),
+        texels.clone(),
+        texels.clone(),
+    ];
     let base = provider_pixels("sampler reuse", &stages, &request(&all));
     assert_uniform_frame(
         "sampler reuse",

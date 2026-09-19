@@ -1914,10 +1914,7 @@ pub fn texture_declarations(
             // texture that reads through it.
             let named_static = named.and_then(|slot| {
                 samplers.iter().find(|sampler| {
-                    sampler
-                        .descriptor
-                        .map(|descriptor| descriptor.binding)
-                        == Some(slot)
+                    sampler.descriptor.map(|descriptor| descriptor.binding) == Some(slot)
                 })
             });
             // The static half's positional pairing: the AIR static samplers, in
