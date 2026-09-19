@@ -3054,6 +3054,154 @@ fn a_non_indexed_draw_the_provider_would_refuse_stays_on_the_engine_by_name() {
     );
 }
 
+/// R48: the layout-free count above the milestone's three vertices — the census
+/// v45 `vertex_span` bucket's own population (`attrs=0`, a draw that names six
+/// vertices) — enters the provider whose capability frame declares the widened
+/// arm, lands the frame the engine lands byte for byte, and keeps the census's
+/// refusal, sentence and slug on every frame that ends before the bit.
+///
+/// The fixture is the shape's own module: positions computed from
+/// `[[vertex_id]]` alone, no `[[stage_in]]` attribute and no `[[buffer(n)]]`
+/// argument. Its six vertices are a quad's left half in two triangles sharing
+/// the seam `x = 0`, so the count is what decides the covered texels — a rail
+/// that kept issuing the milestone's three vertices lands a *different* frame
+/// from one that issues the count the draw named, and the engine's own frame is
+/// the reading both are held to.
+#[test]
+fn a_layout_free_count_above_the_triangle_is_read_from_the_device_frame() {
+    let _guard = engine_test_session();
+    let stages = stages("render_vtx_vertex_id_quad.air", "reims_vertex_id_quad", &[]);
+
+    // The census shape as this rail states it: no declared vertex stream at
+    // all, no index buffer, and a count the contract admits from three up.
+    let request = |count: u32| {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &[]);
+        req.indexed = None;
+        req.vertex_count = count;
+        req
+    };
+    // The contract's own face of the shape, before any device is asked: the
+    // six-vertex layout-free draw is structurally valid from this increment on.
+    // (`DrawRequest` is the rail's request, not the canonical pass; the
+    // contract's rule is pinned by `metal-api-core`'s own tests and by the
+    // provider's admission, which the frame assertions below reach.)
+
+    // The device's own frame states the widened arm, read exactly as the class
+    // reads it: one bit out of the capability frame the provider would send.
+    let executor =
+        metal_api_vulkan::VulkanExecutor::new().expect("the acceptance environment has a device");
+    let provider = metal_api_vulkan::VulkanComputeProvider::with_executor(executor)
+        .expect("the canonical provider builds");
+    let declared = provider_wire::render_vertex_count_above_triangle(
+        provider.device_epoch(),
+        &provider.capabilities(),
+    )
+    .expect("the capability frame round-trips");
+    assert!(
+        declared,
+        "the acceptance environment's provider declares the layout-free count above three \
+         (E's 2026-09-19 widening)"
+    );
+
+    // The admitted arm: the draw reaches the provider and the frame is the
+    // count's own. Three vertices carry the first triangle alone, six carry the
+    // second one as well, so the two frames cannot be one frame.
+    let delivered = provider_render::provider_submissions();
+    let six_frame = provider_pixels("layout-free quad, six vertices", &stages, &request(6));
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "a layout-free draw whose count the frame declares reaches the canonical provider"
+    );
+    let three_frame = provider_pixels("layout-free quad, three vertices", &stages, &request(3));
+    let covered = |frame: &[u8]| {
+        frame
+            .chunks_exact(4)
+            .filter(|texel| *texel == FRAGMENT_TEXEL)
+            .count()
+    };
+    assert_ne!(
+        six_frame, three_frame,
+        "the fixture's second triangle is the half the first one leaves clear, so the two counts \
+         cannot land the same frame"
+    );
+    assert!(
+        covered(&six_frame) > covered(&three_frame),
+        "the six-vertex draw covers strictly more texels than the three-vertex one: {} against {}",
+        covered(&six_frame),
+        covered(&three_frame)
+    );
+
+    // The engine's own frame for the same request: the rail that ran these
+    // draws before the widening has to land the same bytes, which is what makes
+    // "the class admits the count" a claim about the two rails and not about
+    // one of them twice.
+    if let Some(engine) = engine_pixels("layout-free quad, six vertices", &stages, request(6)) {
+        assert_eq!(
+            six_frame, engine,
+            "the provider's frame and the engine's are one frame"
+        );
+    }
+    if let Some(engine) = engine_pixels("layout-free quad, three vertices", &stages, request(3)) {
+        assert_eq!(
+            three_frame, engine,
+            "and so are the two rails' three-vertex frames"
+        );
+    }
+
+    // A frame written before the bit existed keeps the census's sentence, its
+    // slug and the count it measured — and it never touches the provider.
+    {
+        let _closed = provider_render::override_render_vertex_count_above_triangle(Some(false));
+        let before = provider_render::provider_submissions();
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(6),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(reason.slug(), "render_provider_out_of_class_vertex_span");
+                assert!(
+                    reason.detail().contains("exactly the 3")
+                        && reason.detail().contains("names 6"),
+                    "the pre-increment sentence is the census's own: {}",
+                    reason.detail()
+                );
+            }
+            other => panic!("a frame without the bit keeps the shape on the engine: {other:?}"),
+        }
+        assert_eq!(
+            provider_render::provider_submissions(),
+            before,
+            "the refusal never hands the draw to the provider"
+        );
+    }
+
+    // Below the triangle's three the count's own floor answers, whichever the
+    // device says: the contract refuses that shape and this class never takes
+    // it. The sentence is its own — the device's window is not the reason.
+    for bit in [None, Some(true), Some(false)] {
+        let _answer = provider_render::override_render_vertex_count_above_triangle(bit);
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(2),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(reason.slug(), "render_provider_out_of_class_vertex_span");
+                assert!(
+                    reason.detail().contains("fewer than"),
+                    "the floor's sentence names the floor: {}",
+                    reason.detail()
+                );
+                assert!(
+                    !reason.detail().contains("exactly the 3"),
+                    "and it is not the pre-increment device's sentence: {}",
+                    reason.detail()
+                );
+            }
+            other => panic!("two vertices rasterize no triangle: {other:?}"),
+        }
+    }
+}
+
 /// The widest interface the canonical contract can state, and the first one it
 /// cannot.
 ///

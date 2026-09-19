@@ -308,6 +308,35 @@ pub fn render_texture_one_dimension_window(
     })
 }
 
+/// Whether the provider whose snapshot this is executes a *layout-free*
+/// non-indexed draw whose count is above the milestone's three vertices
+/// (2026-09-19, census v45's `vertex_span` bucket).
+///
+/// The fourteenth reading of the same one-snapshot rule
+/// ([`render_texture_one_dimension_window`] is the thirteenth), and the one
+/// R39's vertex-span gate needs now that the canonical contract admits the
+/// count from three vertices up: the shape is well formed whoever executes it,
+/// so the only thing left to ask is whether *this* provider runs it. The
+/// contract's own widening is what makes the two questions separate — before
+/// it, a count above three was refused by name on every rail, and the class's
+/// refusal was the only answer.
+///
+/// `false` is the fail-closed reading, and it is what a frame written before
+/// the arm existed decodes to: the bit is the escape family's next tagged
+/// section (`0x00 0x0B`), so a decoder that predates the tag answers
+/// [`WireDecline`] rather than a value, and one that carries the tag reads
+/// `false` out of a frame that ends before it. A device that does not state the
+/// bit is a device that keeps the census's refusal, its slug and its sentence,
+/// for the shape — which is exactly the native rail's answer, whose reviewed
+/// `vertex_id` module carries three positions.
+pub fn render_vertex_count_above_triangle(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_vertex_count_above_triangle)
+}
+
 /// The three facts one provider's frame states about its one-dimensional
 /// sampled window, one value each.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
