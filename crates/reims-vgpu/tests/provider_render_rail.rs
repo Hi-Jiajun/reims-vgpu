@@ -25853,8 +25853,9 @@ fn a_preserving_gva_tails_own_window_leaves_for_the_provider_and_lands_the_same_
     );
 }
 
-/// The shape census v39's four lost draws carry (R45): the R10 sampled
-/// fixture's own body with its sampler state moved to `coord::pixel`
+/// The shape census v39's four lost draws carry (R45), re-read the way the
+/// registration weighs it (E-RS5/v118; R48): the R10 sampled fixture's own body
+/// with its sampler state moved to `coord::pixel`
 /// (`render_frag_pixel_sampler.air`), the state the translation lowers with
 /// shader-side fetches rather than a sampler.
 ///
@@ -25862,11 +25863,28 @@ fn a_preserving_gva_tails_own_window_leaves_for_the_provider_and_lands_the_same_
 /// is *fetched* in the emitted words, so this rail's declaration states no
 /// sampler for it — while the reflection still reports the AIR `constexpr
 /// sampler` the fetch was lowered from, whose state
-/// (`coordinates: Pixel`) is outside the family on that one axis. One AIR
-/// sampler against zero sampled declarations is exactly the count the
-/// registration refuses and the class gate used to hand over.
+/// (`coordinates: Pixel`) is outside the family on that one axis. That leftover
+/// state is what the registration does *not* weigh (E-RS5/v118): no
+/// `OpSampledImage` names it, so it can change nothing the pass executes, and
+/// the class's two walks have to read the same set or a draw the provider admits
+/// is answered here by name.
 fn pixel_sampler_stages() -> Stages {
     sampled_fragment_stages("render_frag_pixel_sampler.air", "reims_pixel_sampler_frag")
+}
+
+/// The *bound* sibling of the pixel-coordinate fixture (E-RS5/v118; R48): the
+/// same body with the magnification filter raised to linear and the coordinates
+/// left normalized (`render_frag_mixed_filters.air`).
+///
+/// The pinned translator lowers a normalized sample to a genuine
+/// `OpSampledImage`, so this module really reads through its sampler: the class
+/// weighs the state, reads it outside the family on the min/mag axis, and keeps
+/// the draw on the engine by name. It is the falsifiable other side of the
+/// predicate [`pixel_sampler_stages`] states — a walk that filtered samplers by
+/// anything but the module's own reads would either weigh the leftover state or
+/// bypass this one.
+fn mixed_filter_stages() -> Stages {
+    sampled_fragment_stages("render_frag_mixed_filters.air", "reims_mixed_filters_frag")
 }
 
 /// The pairing's own positive control (R45): one fragment stage that carries two
@@ -25909,49 +25927,73 @@ fn two_static_textures_request(
     req
 }
 
-/// R45, census v39 (the red line): a fragment stage that carries one more AIR
-/// `constexpr sampler` than its sampled half reads stays on the engine by name,
-/// and the engine really draws it.
+/// The mixed-filter fixture's request (R48): one `rgba8_unorm` texture at the
+/// declaration's own device binding, beside the module's own AIR state spelled
+/// as a sampler resource — nearest minification with linear magnification,
+/// clamped. The engine arm binds it; the class refuses the shape before the
+/// provider is ever asked, so this request is the reading of "the state the
+/// module named, handed to the rail that executes it".
+fn mixed_filter_request(stages: &Stages, texels: Vec<Vec<u8>>, extent: (u32, u32)) -> DrawRequest {
+    use reims_vgpu::protocol::sampler as mtl;
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    let declaration = stages.fragment_texture_declarations[0];
+    req.sampled_images
+        .push(image_resource(declaration.binding, texels, extent));
+    let mut sampler = sampled_sampler_resource(declaration.sampler_binding);
+    sampler.mag_filter = mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+    req.samplers.push(sampler);
+    req
+}
+
+/// R45's shape re-read (census v39's red line; E-RS5/v118; R48): a fragment
+/// stage whose one AIR `constexpr sampler` is a state the lowered module never
+/// reads through is weighed by neither walk, so the class admits the draw and
+/// the canonical provider completes the frame.
 ///
-/// The four draws v39 lost were this shape: the class gate paired the stage's
-/// AIR samplers only against the declarations its per-texture walk reached, so a
-/// sampler no texture reads through never met the family table — while the
-/// canonical rail's registration weighs *every* AIR sampler the stage carries
-/// before it pairs one, and refused this module at registration
-/// (`render_stage_unsupported_interface`, "an AIR sampler with pixel
-/// coordinates is outside the reviewed family", beside the counting rule's own
-/// `render_stage_reflection_mismatch`). A refusal is a decline rather than a
-/// fallback, so the draw was skipped: `draws_skipped_after_engine_refusal` read
-/// 4 in census v39 and 0 in every round before it.
+/// The four draws v39 lost were this shape: the module's one AIR sampler states
+/// `coord::pixel`, the pinned translator lowers the sample to shader-side
+/// fetches, and the finished module names no sampler at all — while the
+/// reflection still reports the `constexpr sampler` the fetch was lowered from.
+/// R45 answered the stage by *count* (one AIR sampler against zero declarations)
+/// and kept it on the engine; E-RS5/v118 then narrowed the registration to the
+/// AIR samplers the module's own instructions read through, which does not
+/// include this leftover state, so the class's counting rule has to read the
+/// same set (R48) or it answers a draw the provider would run.
 ///
-/// Three readings, and each is falsifiable on its own:
+/// Four readings, each falsifiable on its own:
 ///
-/// - the production walks really report one AIR sampler against zero
-///   declarations (the pixel-coordinate read is lowered to a fetch, so the
-///   texture's declaration states no sampler), with the sampler's own state
-///   outside the family on the coordinates axis — so the fixture states the
-///   shape rather than a shape *near* it;
-/// - the class answers it by name, with the counts and the axis in the sentence,
-///   and the provider is never asked (a submitted request is the drop's first
-///   half);
-/// - the engine draws this module and lands the texel its one sample reads, which
-///   is the half the red line lost.
+/// - the production walks report no weighed sampler at all — both lists are
+///   empty although the reflection still carries the AIR state — and the
+///   texture's declaration states no sampler (the pixel-coordinate read is a
+///   fetch), so the fixture states the shape rather than a shape *near* it;
+/// - the class admits the request and the provider completes a frame, which is
+///   the half the by-name answer never produces;
+/// - that frame is the engine's own, byte for byte: the leftover state moved
+///   nothing;
+/// - moving the texel the lowered fetch reads moves the frame, so the provider
+///   really executed the sample's own fetch rather than landing a constant.
 #[test]
-fn the_air_sampler_a_pixel_coordinate_read_leaves_unpaired_stays_on_the_engine_by_name() {
+fn the_air_sampler_a_pixel_coordinate_read_leaves_behind_does_not_weigh_on_the_registration() {
     let _guard = engine_test_session();
     let stages = pixel_sampler_stages();
     let (width, height) = (8u32, 4u32);
     let texels = sampled_texels(width, height);
 
-    // The shape, from the production walks: one AIR static sampler, one
-    // declaration that states no sampler at all (the pixel-coordinate read is a
-    // fetch), and the sampler's state outside the family on the coordinates
-    // axis alone.
-    assert_eq!(
-        stages.sampler_family.statics.len(),
-        1,
-        "the module's `!air.sampler_states` root lists one AIR sampler: {:?}",
+    // The shape, from the production walks: the module's `!air.sampler_states`
+    // root still lists one AIR sampler, but no `OpSampledImage` names it, so
+    // neither weighed list carries it — the registration weighs the same set —
+    // and the texture's declaration states no sampler at all.
+    assert!(
+        stages.sampler_family.statics.is_empty(),
+        "a sampler no `OpSampledImage` names takes no part in the weighing: {:?}",
         stages.sampler_family.statics
+    );
+    assert!(
+        stages.sampler_family.outside_family_statics.is_empty(),
+        "and its state is not reported outside the family either: {:?}",
+        stages.sampler_family.outside_family_statics
     );
     assert_eq!(
         stages.fragment_texture_declarations.len(),
@@ -25966,6 +26008,108 @@ fn the_air_sampler_a_pixel_coordinate_read_leaves_unpaired_stays_on_the_engine_b
         "the pixel-coordinate read is lowered to a texel fetch, which states no sampler: {:?}",
         stages.fragment_texture_declarations[0].sampler
     );
+
+    // The class answer: admitted to the provider, which completes the frame.
+    let deliveries = provider_render::provider_submissions();
+    let request = |texels: Vec<Vec<u8>>| fetched_request(&stages, texels, (width, height));
+    let frame = provider_pixels(
+        "pixel-coordinate leftover sampler",
+        &stages,
+        &request(texels.clone()),
+    );
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the class hands the shape to the provider rather than answering it by name"
+    );
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    // The fixture's coordinates are texel `(6, 3)`'s centre in a
+    // pixel-coordinate reading, which is the same texel the R10 sibling samples
+    // by its normalized centre.
+    assert_uniform_frame(
+        "pixel-coordinate leftover sampler",
+        &frame,
+        width,
+        height,
+        [
+            16 * read_x as u8,
+            64 * read_y as u8,
+            8 * (read_x + read_y) as u8,
+            255,
+        ],
+    );
+    let engine = engine_pixels(
+        "pixel-coordinate leftover sampler",
+        &stages,
+        request(texels.clone()),
+    );
+    let Some(engine) = engine else {
+        return;
+    };
+    assert_frames_equal("pixel-coordinate leftover sampler", &frame, &engine);
+
+    // The falsifiable half: the frame follows the texel the lowered fetch reads.
+    let mut moved = texels;
+    moved[read_y * width as usize + read_x] = vec![255, 0, 255, 255];
+    let moved_frame = provider_pixels("the read texel moved", &stages, &request(moved));
+    assert_uniform_frame(
+        "the read texel moved",
+        &moved_frame,
+        width,
+        height,
+        [255, 0, 255, 255],
+    );
+    assert_frames_differ("the read texel moved the frame", &frame, &moved_frame);
+    eprintln!(
+        "R48 pixel-coordinate leftover sampler: attachment {width}x{height} — no `OpSampledImage` \
+         names the stage's one AIR sampler, so both weighed lists are empty (statics {:?}), the \
+         class admits the request, the provider's frame is the engine's byte for byte, and moving \
+         texel ({read_x}, {read_y}) moved it",
+        stages.sampler_family.statics,
+    );
+}
+
+/// R48's other side (E-RS5/v118): an AIR sampler the module *does* read
+/// through is still weighed, and a state outside the family keeps the draw on
+/// the engine by name.
+///
+/// The predicate the class reads is "the module's own instructions read this
+/// slot", not "the reflection declares this sampler": this fixture's one AIR
+/// `constexpr sampler` states min `Nearest` against mag `Linear`, the
+/// coordinates stay normalized, so the pinned translator emits a genuine
+/// `OpSampledImage` and the sample really is a sampler read the module named.
+/// Weighing it is the half that keeps the filter from becoming a silent
+/// widening: the registration refuses this state by name
+/// (`render_stage_unsupported_interface`, "an AIR sampler whose min (Nearest)
+/// and mag (Linear) filters differ is outside the reviewed family"), so the
+/// class has to answer it here rather than hand the provider the same refusal
+/// the engine never gets to answer.
+///
+/// Three readings, and each is falsifiable on its own:
+///
+/// - the production walks report exactly one weighed AIR sampler beside the one
+///   declaration that reads through it, with the min/mag axis named in
+///   `outside_family_statics` — the fixture states the *bound* shape, not the
+///   leftover one [`pixel_sampler_stages`] states;
+/// - the class answers it by name and the provider is never asked (a
+///   submission here is the red line's first half);
+/// - the engine draws the shape — it is kept, not dropped — landing the texel
+///   the module's own normalized coordinate reads.
+#[test]
+fn the_air_sampler_the_module_reads_through_is_still_weighed_by_name() {
+    let _guard = engine_test_session();
+    let stages = mixed_filter_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+
+    // The shape, from the production walks: one AIR sampler, read through by
+    // the module itself, on the one declaration — and its state outside the
+    // family on the min/mag axis alone.
+    assert_eq!(
+        stages.sampler_family.statics.len(),
+        1,
+        "the module samples through its one AIR sampler, so the class weighs it: {:?}",
+        stages.sampler_family.statics
+    );
     assert_eq!(
         stages
             .sampler_family
@@ -25973,43 +26117,45 @@ fn the_air_sampler_a_pixel_coordinate_read_leaves_unpaired_stays_on_the_engine_b
             .iter()
             .map(|sampler| (sampler.index, sampler.axis))
             .collect::<Vec<_>>(),
-        vec![(0, "its coordinates are pixel coordinates")],
-        "the AIR sampler is outside the family on the coordinates axis"
+        vec![(0, "its min and mag filters differ")],
+        "the weighed state is outside the family on the min/mag axis"
+    );
+    assert_eq!(
+        stages.fragment_texture_declarations.len(),
+        1,
+        "one `[[texture(0)]]` argument is sampled"
+    );
+    assert!(
+        matches!(
+            stages.fragment_texture_declarations[0].sampler,
+            RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState)
+        ),
+        "the module samples through its own AIR state, which is outside the family: {:?}",
+        stages.fragment_texture_declarations[0].sampler
     );
 
-    // The class answer: by name, with both counts and the axis, and without
-    // asking the provider — a submission here is the drop's first half.
+    // The class answer: by name, without asking the provider — a submission
+    // here is the red line's first half.
     let deliveries = provider_render::provider_submissions();
     match provider_render::submit_render(
         &inputs(&stages, RenderChainRole::SoleOrTail),
-        &fetched_request(&stages, texels.clone(), (width, height)),
+        &mixed_filter_request(&stages, texels.clone(), (width, height)),
     ) {
         RenderRailOutcome::NotInNarrowClass(reason) => {
-            eprintln!("R45 door: {}\n  {}", reason.slug(), reason.detail());
+            eprintln!("R48 door: {}\n  {}", reason.slug(), reason.detail());
             assert_eq!(
                 reason.slug(),
-                "render_provider_out_of_class_texture_static_sampler_unpaired"
-            );
-            assert!(
-                reason.detail().contains("1 AIR static samplers")
-                    && reason
-                        .detail()
-                        .contains("0 sampled textures reading through one"),
-                "the sentence names both counts: {}",
-                reason.detail()
+                "render_provider_out_of_class_texture_sampler"
             );
             assert!(
                 reason
                     .detail()
-                    .contains("its coordinates are pixel coordinates")
-                    && reason.detail().contains("Metal index 0"),
-                "the sentence names the unpaired sampler and the axis that read it: {}",
+                    .contains("the AIR state is outside the family the canonical rail creates"),
+                "the sentence names the AIR state's family as the reason: {}",
                 reason.detail()
             );
         }
-        other => panic!(
-            "a stage carrying an AIR sampler no texture pairs with stays on the engine: {other:?}"
-        ),
+        other => panic!("a sampler the module reads through is weighed by name: {other:?}"),
     }
     assert_eq!(
         provider_render::provider_submissions(),
@@ -26019,19 +26165,16 @@ fn the_air_sampler_a_pixel_coordinate_read_leaves_unpaired_stays_on_the_engine_b
 
     // The engine draws it: the shape is kept, not dropped.
     let engine = engine_pixels(
-        "pixel sampler",
+        "mixed-filter sampler",
         &stages,
-        fetched_request(&stages, texels, (width, height)),
+        mixed_filter_request(&stages, texels, (width, height)),
     );
     let Some(engine) = engine else {
         return;
     };
     let (read_x, read_y) = SAMPLED_TEXEL;
-    // The fixture's coordinates are texel `(6, 3)`'s centre in a
-    // pixel-coordinate reading, which is the same texel the R10 sibling samples
-    // by its normalized centre.
     assert_uniform_frame(
-        "pixel sampler (engine)",
+        "mixed-filter sampler (engine)",
         &engine,
         width,
         height,
@@ -26041,6 +26184,11 @@ fn the_air_sampler_a_pixel_coordinate_read_leaves_unpaired_stays_on_the_engine_b
             8 * (read_x + read_y) as u8,
             255,
         ],
+    );
+    eprintln!(
+        "R48 bound mixed-filter sampler: attachment {width}x{height} — the module reads through \
+         its one AIR sampler (min Nearest, mag Linear), the class weighs it, names the axis and \
+         keeps the draw on the engine, and the engine lands texel ({read_x}, {read_y})"
     );
 }
 

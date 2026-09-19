@@ -15,14 +15,17 @@
 ; What makes this fixture the red line: the lowering is a *fetch*, so this
 ; rail's own read of the module's sample sites says the texture is fetched and
 ; declares it with no sampler at all — while the reflection still reports the
-; AIR `constexpr sampler` it was lowered *from*. The registration weighs every
-; AIR sampler the stage carries before it pairs one, so it refuses this module
-; twice: by the state (`render_stage_unsupported_interface`, "an AIR sampler
-; with pixel coordinates is outside the reviewed family") and by the counts
+; AIR `constexpr sampler` it was lowered *from*. R45 read that leftover state as
+; the class's own business — the registration then weighed every AIR sampler a
+; stage carried, so it refused this module twice: by the state
+; (`render_stage_unsupported_interface`, "an AIR sampler with pixel coordinates
+; is outside the reviewed family") and by the counts
 ; (`render_stage_reflection_mismatch`, "this rail pairs one AIR static sampler
-; with one sampled texture"). The class gate consulted a static sampler only
-; where a declaration paired with one, so the module left for the provider and
-; came back a refusal the engine never got to answer.
+; with one sampled texture") — and R48 re-reads it the way E-RS5/v118 narrowed
+; the registration: a sampler no `OpSampledImage` names is weighed by neither
+; rail, so this fixture is the shape the class now *admits* to the provider. Its
+; `render_frag_mixed_filters.ll` sibling is the bound half that still stays on
+; the engine by name.
 ;
 ; The sample's coordinates are the centre of texel `(6, 3)` in *both* the
 ; conventions a pixel-coordinate read can use — `floor(6.5, 3.5)` is that texel,
