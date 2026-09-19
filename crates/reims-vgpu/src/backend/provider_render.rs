@@ -14509,7 +14509,7 @@ fn narrow_class<'a>(
                 "render_provider_out_of_class_vertex_format",
                 "a vertex attribute outside the canonical format set stays on the engine \
                  (Float32x2, Float32x3, Float32x4, Uint32, Unorm8x2, Unorm8x4, Unorm16x2, \
-                 Unorm16x4)",
+                 Unorm16x4, Float32x1)",
             ));
         };
         let stride = u64::from(attribute.stride);
@@ -14878,6 +14878,14 @@ fn f32_to_half_bits(value: f32) -> u16 {
 /// three-channel 8/16-bit shapes, the packed words, the `_bgra` channel order —
 /// keeps the engine under the gate's own name.
 ///
+/// The scalar `float32` lane is the widening of 2026-09-20 (census v46's
+/// `vertex_format` bucket): `MTL_VERTEX_FORMAT_FLOAT` is one raw 32-bit
+/// component, which is the contract's appended `float32x1`, and no conversion
+/// sits between the fetched bytes and the member. The neighbouring *scalar*
+/// storages stay out of the map — `Half` is two bytes of a different width and
+/// `UChar`/`Char` are not the raw `float32` the contract's name spells — so the
+/// widening names exactly one storage rather than "the scalar shapes".
+///
 /// The *component shape* a storage pairs with is not this map's answer: an
 /// `unorm*4` declaration beside a `float4` AIR member is the reviewed pairing,
 /// and the same declaration beside a `float2` member is refused by the
@@ -14888,6 +14896,7 @@ fn vertex_format(
 ) -> Option<VertexFormat> {
     use crate::protocol::vertex_format as raw;
     match format.ordinal() {
+        raw::MTL_VERTEX_FORMAT_FLOAT => Some(VertexFormat::Float32x1),
         raw::MTL_VERTEX_FORMAT_FLOAT2 => Some(VertexFormat::Float32x2),
         raw::MTL_VERTEX_FORMAT_FLOAT3 => Some(VertexFormat::Float32x3),
         raw::MTL_VERTEX_FORMAT_FLOAT4 => Some(VertexFormat::Float32x4),
