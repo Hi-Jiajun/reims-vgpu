@@ -10385,19 +10385,21 @@ fn a_bgra_sampled_texture_lands_the_byte_order_the_bind_states() {
     );
 }
 
-/// R19/R39: the formats beyond the widened window keep the class's own
-/// boundary.
+/// R19/R39/2026-09-19: the formats beyond the widened window keep the class's
+/// own boundary.
 ///
 /// The window the class states is the provider's whole `RENDER_SAMPLED` list,
-/// and two increments have moved its edge: E-TX1 opened the two four-byte 8-bit
-/// UNORM byte orders (`research/docs/23` §107), and R39 states the device's two
-/// narrow lanes beside them when its own frame lists them (the reading below,
-/// and `the_narrow_lanes_land_their_own_channels_and_agree_with_the_engine`).
-/// What is left here is everything outside either widening — the census's wide
-/// half-float (`evidence/gate3-census-v25b-2026-09-18`'s `texture_bind` bucket,
-/// `R16G16B16A16_SFLOAT`) beside the two sRGB spellings of the same 8-bit
-/// orders: the provider's sampled window names linear byte orders, so an sRGB
-/// *view* is another name the class does not state.
+/// and three increments have moved its edge: E-TX1 opened the two four-byte
+/// 8-bit UNORM byte orders (`research/docs/23` §107), R39 states the device's
+/// two narrow lanes beside them when its own frame lists them (the reading
+/// below, and `the_narrow_lanes_land_their_own_channels_and_agree_with_the_engine`),
+/// and the 2026-09-19 widening appended the eight-byte half-float lane
+/// (`the_eight_byte_lane_is_read_from_the_frame_and_keeps_the_old_window_by_name`).
+/// What is left here is everything outside those widenings — the
+/// single-component float the census counts beside the two sRGB spellings of
+/// the same 8-bit orders: the provider's sampled window names linear byte
+/// orders and the three sized lanes, so a one-component float or an sRGB *view*
+/// is another name the class does not state.
 ///
 /// Each refusal keeps the class's existing bucket, names the bind's own format
 /// and the provider's own refusal (`render_texture_format_unsupported`), and
@@ -10411,7 +10413,7 @@ fn the_formats_beyond_the_widened_window_stay_on_the_engine_by_name() {
     let texels = sampled_texels(width, height);
     let delivered = provider_render::provider_submissions();
     for format in [
-        ash::vk::Format::R16G16B16A16_SFLOAT,
+        ash::vk::Format::R32_SFLOAT,
         ash::vk::Format::R8G8B8A8_SRGB,
         ash::vk::Format::B8G8R8A8_SRGB,
     ] {
@@ -11526,8 +11528,9 @@ fn a_device_that_lists_neither_narrow_lane_keeps_the_window_by_name() {
         .expect("the render-texture section round-trips");
     assert!(
         section.formats.contains(&TextureFormat::R8Unorm)
-            && section.formats.contains(&TextureFormat::R8G8Unorm),
-        "the section's format list is where the two lanes are stated: {:?}",
+            && section.formats.contains(&TextureFormat::R8G8Unorm)
+            && section.formats.contains(&TextureFormat::Rgba16Float),
+        "the section's format list is where the lanes are stated: {:?}",
         section.formats
     );
     let mut refused = provider.capabilities();
@@ -11546,6 +11549,12 @@ fn a_device_that_lists_neither_narrow_lane_keeps_the_window_by_name() {
     let texels = (width * height) as usize;
     let delivered = provider_render::provider_submissions();
     let _undeclared = provider_render::override_render_texture_narrow_lanes(Some(false));
+    // The same fail-closed shape one width over: this test is about the window
+    // the class stated *before* either widening, so the eight-byte lane the
+    // 2026-09-19 increment added is dropped from the snapshot too — otherwise
+    // the sentence below would name a lane this device's frame does carry, and
+    // the byte-for-byte reading would be of a device that never existed.
+    let _undeclared_wide = provider_render::override_render_texture_rgba16f_lane(Some(false));
     for (format, bytes) in [
         (
             ash::vk::Format::R8_UNORM,
@@ -11605,6 +11614,146 @@ fn a_device_that_lists_neither_narrow_lane_keeps_the_window_by_name() {
          {:?}); the same snapshot without them reads {silent:?} and its binds keep the \
          pre-increment sentence under `render_provider_out_of_class_texture_bind`",
         section.formats,
+    );
+}
+
+/// The eight-byte lane (2026-09-19, census v44's `texture_bind` bucket): the
+/// answer comes out of the *frame* on the same terms as the narrow pair's, an
+/// `R16G16B16A16_SFLOAT` bind reaches the canonical provider when the frame
+/// lists the lane, and the pre-increment device — the four-format frame every
+/// census boot so far carried — keeps the refusal sentence the census counted,
+/// byte for byte.
+///
+/// The lane's own instrument is separate from the narrow pair's
+/// ([`provider_render::override_render_texture_rgba16f_lane`]) because the two
+/// answers are two facts: this rail's acceptance environment lists the 8-bit
+/// lanes, so the fail-closed arm below is *that* device with `rgba16_float`
+/// dropped, which is exactly the frame the 285 records were refused under.
+#[test]
+fn the_eight_byte_lane_is_read_from_the_frame_and_keeps_the_old_window_by_name() {
+    use metal_api_core::provider::TextureFormat;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    // One colour for every texel, as IEEE 754 binary16: red 2.5, green 0.6,
+    // blue -0.5, alpha 0.25. The read texel's values are chosen so the frame
+    // they convert to is not the texel's own leading byte: 2.5's encoding is
+    // `00 41`, while the attachment lands `ff` (the 8-bit clamp).
+    let colour: [u16; 4] = [0x4100, 0x38cd, 0xb800, 0x3400];
+    let wanted: [u8; 4] = [0xff, 0x99, 0x00, 0x40];
+    let texels: Vec<u8> = colour
+        .iter()
+        .flat_map(|half| half.to_le_bytes())
+        .cycle()
+        .take((width * height) as usize * 8)
+        .collect();
+    let request = |bytes: Vec<u8>| {
+        sampled_narrow_request(
+            &stages,
+            bytes,
+            (width, height),
+            ash::vk::Format::R16G16B16A16_SFLOAT,
+        )
+    };
+
+    // The device's own frame states the lane, read exactly as the class reads
+    // it: one membership question over the render-sampler section's list.
+    let executor =
+        metal_api_vulkan::VulkanExecutor::new().expect("the acceptance environment has a device");
+    let provider = metal_api_vulkan::VulkanComputeProvider::with_executor(executor)
+        .expect("the canonical provider builds");
+    let epoch = provider.device_epoch();
+    let declared = provider_wire::render_texture_rgba16f_lane(epoch, &provider.capabilities())
+        .expect("the capability frame round-trips");
+    assert!(
+        declared,
+        "the acceptance environment's provider lists the eight-byte lane (E's 2026-09-19 \
+         widening)"
+    );
+    let mut refused = provider.capabilities();
+    refused
+        .supported_render_texture_formats
+        .retain(|format| *format != TextureFormat::Rgba16Float);
+    let silent = provider_wire::render_texture_rgba16f_lane(epoch, &refused)
+        .expect("the shorter list still round-trips");
+    assert!(
+        !silent,
+        "a snapshot whose list drops the lane reads as the refusal"
+    );
+
+    // The admitted arm: the same bind the census's 285 records state reaches
+    // the provider and the frame is the half floats' own conversion.
+    let delivered = provider_render::provider_submissions();
+    let frame = provider_pixels(
+        "rgba16_float sampled texture",
+        &stages,
+        &request(texels.clone()),
+    );
+    assert!(
+        provider_render::provider_submissions() >= delivered + 1,
+        "a bind the frame lists the lane for reaches the canonical provider"
+    );
+    assert_uniform_frame(
+        "rgba16_float sampled texture (provider)",
+        &frame,
+        width,
+        height,
+        wanted,
+    );
+    assert_ne!(
+        texel_at(&frame, 0, 0)[0],
+        texels[0],
+        "the frame is the half's converted value, not the texel's leading byte"
+    );
+
+    // The fail-closed arm: the pre-increment device — the two 8-bit lanes
+    // listed, `rgba16_float` not — keeps the sentence the census counted, byte
+    // for byte, and never reaches the provider.
+    let _undeclared = provider_render::override_render_texture_rgba16f_lane(Some(false));
+    let delivered = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request(texels.clone()),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_bind",
+                "the bind's own bucket"
+            );
+            let detail = reason.detail();
+            assert!(
+                detail.contains("R16G16B16A16_SFLOAT"),
+                "the sentence names the bind's own format: {detail}"
+            );
+            assert!(
+                detail.contains(
+                    "`rgba8_unorm`, `bgra8_unorm`, `r8_unorm` or `r8g8_unorm` texels (the \
+                     provider's whole `RENDER_SAMPLED` window)"
+                ),
+                "the pre-increment device reads the window the census counted, verbatim: {detail}"
+            );
+            assert!(
+                !detail.contains("rgba16_float`"),
+                "and the sentence names no lane the frame does not carry: {detail}"
+            );
+            eprintln!(
+                "texture-bind door (undeclared eight-byte lane): {}",
+                reason.slug()
+            );
+        }
+        other => panic!("an undeclared eight-byte lane stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a lane the device's frame does not list stays on the engine without the provider seeing it"
+    );
+    eprintln!(
+        "2026-09-19 eight-byte lane: the device's own frame lists it ({declared}); the same \
+         snapshot without it reads {silent} and its bind keeps the pre-increment sentence under \
+         `render_provider_out_of_class_texture_bind`"
     );
 }
 
@@ -11709,6 +11858,30 @@ fn the_sampled_texture_shapes_beside_the_entry_stay_on_the_engine_by_name() {
     assert!(
         detail.contains("arrayed texture"),
         "the sentence names the reflected shape: {detail}"
+    );
+    // The dimension probe (2026-09-19, C2): the census's 622 `texture_shape`
+    // rows are 311 records whose reflected dimension is not D2, and the bucket
+    // alone cannot say which dimension those records carry. The sentence now
+    // names the reflected value *and* the draw's own bind kind, which is the
+    // pair a widening has to answer ("the reflection says Buffer, the guest's
+    // view is a D2 texture").
+    let mut buffer = sampled_stages();
+    buffer.fragment_texture_declarations = vec![RenderTextureDeclaration {
+        shape: RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Dimension(
+            metal2vulkan::meta::TextureDimension::Buffer,
+        )),
+        ..buffer.fragment_texture_declarations[0]
+    }];
+    let (slug, detail) = answer("texel-buffer texture", &buffer, &sampled());
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_shape");
+    assert!(
+        detail.contains("the reflection states `Buffer`"),
+        "the sentence names the reflected dimension: {detail}"
+    );
+    assert!(
+        detail.contains("binds a D2 view"),
+        "and the draw's own bind kind beside it: {detail}"
     );
     let mut runtime_sampler = sampled_stages();
     runtime_sampler.fragment_texture_declarations = vec![RenderTextureDeclaration {
