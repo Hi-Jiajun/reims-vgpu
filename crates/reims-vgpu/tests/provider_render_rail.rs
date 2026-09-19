@@ -175,6 +175,27 @@ fn reviewed_stages() -> Stages {
     stages("reims_indexed_tri.air", "reims_indexed_vertex", &[0])
 }
 
+/// The two-output fragment entry (2026-09-20, the third door behind census
+/// v46's `stage_buffer_footprint` bucket).
+const TWO_OUTPUTS_FRAGMENT_ENTRY: &str = "reims_two_outputs_frag";
+
+/// The superset fragment interface's shape: the reviewed one-stream vertex
+/// module beside a fragment stage whose own reflection declares **two** colour
+/// locations while the class's contract attaches one.
+///
+/// The module stores `(64/255, 128/255, 192/255, 1)` at `Location 0` — the
+/// reviewed fixture's own texel, `40 80 c0 ff` in an 8-bit UNORM attachment —
+/// and `(1, 0, 0, 1)` at the `Location 1` no attachment covers. Vulkan discards
+/// the second store, so a rail that executes the shape lands the first
+/// location's texel; one that bound the dropped store to the attached location
+/// would land `ff 00 00 ff` instead.
+fn two_outputs_stages() -> Stages {
+    let mut stages = reviewed_stages();
+    stages.air.1 = fixture("render_frag_two_outputs.air");
+    stages.fragment_entry = TWO_OUTPUTS_FRAGMENT_ENTRY;
+    stages
+}
+
 /// The two-stream shape: position at location 0 and an offset at location 1,
 /// each its own stream and each read by the vertex stage.
 fn two_stream_stages() -> Stages {
@@ -2450,6 +2471,121 @@ fn out_of_class_shapes_stay_on_the_self_contained_engine() {
     req.width = window_width * 8;
     req.height = window_height * 8;
     class(&req);
+}
+
+/// The superset fragment interface (2026-09-20, the third door behind census
+/// v46's `stage_buffer_footprint` bucket).
+///
+/// Census v46's remaining LPF pipeline stores three colour locations while the
+/// draw attaches one. Vulkan defines what the provider does with the extra
+/// stores — a fragment output whose location has no attachment behind it is
+/// discarded — so the shape is executable exactly when the provider's
+/// registration gate admits it, and that is the one thing the provider's own
+/// capability frame answers. The three readings below are the arm's whole
+/// statement:
+///
+/// * with the face declared, the class hands the draw over and both rails land
+///   the same frame — the attached location's texel, with the dropped store
+///   nowhere in it;
+/// * with the frame ending before the face, the class keeps the draw on the
+///   engine under the MRT door's own slug and sentence, **without** making a
+///   submission: the provider would refuse the registration by name, and a draw
+///   the class handed such a provider is a draw no rail answered (the census red
+///   line `draws_skipped_after_engine_refusal`);
+/// * a module that declares no colour location of its own (the reviewed solid
+///   stage) never asks the frame at all, so the face's presence moves no other
+///   shape.
+#[test]
+fn a_fragment_that_stores_more_than_the_pass_attaches_follows_the_providers_frame() {
+    let _guard = engine_test_session();
+    let stages = two_outputs_stages();
+    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    // The attached location's texel, in every pixel of the attachment: the
+    // fixture's own `(64/255, 128/255, 192/255, 1)`.
+    let expected: Vec<u8> = [0x40, 0x80, 0xc0, 0xff]
+        .iter()
+        .copied()
+        .cycle()
+        .take((extent().0 * extent().1 * 4) as usize)
+        .collect();
+    // The dropped location's texel: a rail that bound it to the attached one
+    // would land this instead, which is what keeps the first reading
+    // falsifiable.
+    let dropped: Vec<u8> = [0xff, 0x00, 0x00, 0xff]
+        .iter()
+        .copied()
+        .cycle()
+        .take(expected.len())
+        .collect();
+    assert_ne!(expected, dropped);
+
+    {
+        let _declared = provider_render::override_render_fragment_output_superset(Some(true));
+        let frame = provider_pixels("two outputs", &stages, &req);
+        assert_texel_count("two outputs", &frame);
+        assert_frames_equal(
+            "two outputs against the fixture's own texel",
+            &frame,
+            &expected,
+        );
+        // The engine arm takes its request by value, exactly as the reviewed
+        // cases' do; the two requests are the same shape, so the comparison is
+        // between two rails and not between two fixtures.
+        let Some(engine) = engine_pixels(
+            "two outputs",
+            &stages,
+            narrow_request(MTL_FORMAT_RGBA8_UNORM),
+        ) else {
+            return;
+        };
+        assert_frames_equal("two outputs against the engine", &frame, &engine);
+        eprintln!(
+            "the superset fragment interface lands [{}] in every one of its {} texels, on both \
+             rails",
+            frame
+                .chunks_exact(4)
+                .next()
+                .map(|texel| texel
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>())
+                .unwrap_or_default(),
+            frame.len() / 4
+        );
+    }
+
+    {
+        let _undeclared = provider_render::override_render_fragment_output_superset(Some(false));
+        let before = provider_render::provider_submissions();
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                eprintln!(
+                    "superset fragment interface, undeclared frame: {}\n  {}",
+                    reason.slug(),
+                    reason.detail()
+                );
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_mrt",
+                    "the shape keeps the MRT door's own bucket when the provider does not \
+                     execute it"
+                );
+                assert_eq!(
+                    reason.detail(),
+                    "MRT stays on the engine",
+                    "the door's sentence is the one it has always had, byte for byte"
+                );
+            }
+            other => panic!(
+                "a provider that does not declare the face cannot receive the draw: {other:?}"
+            ),
+        }
+        assert_eq!(
+            provider_render::provider_submissions(),
+            before,
+            "the refusal happens before the provider is asked"
+        );
+    }
 }
 
 /// The census half of the class boundary: every out-of-class answer is counted

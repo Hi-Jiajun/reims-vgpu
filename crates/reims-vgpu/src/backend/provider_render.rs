@@ -6574,6 +6574,102 @@ fn declared_render_vertex_count_above_triangle() -> Result<bool, ProviderRenderD
         })
 }
 
+/// The device's own answer for the superset fragment interface, and the states
+/// the test instrument below can put it in (2026-09-20).
+const FRAGMENT_OUTPUT_SUPERSET_DEVICE: u8 = 0;
+const FRAGMENT_OUTPUT_SUPERSET_NOT_DECLARED: u8 = 1;
+const FRAGMENT_OUTPUT_SUPERSET_DECLARED: u8 = 2;
+
+/// Whether the superset fragment interface is read from the device's own frame
+/// ([`FRAGMENT_OUTPUT_SUPERSET_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static FRAGMENT_OUTPUT_SUPERSET_ANSWER: AtomicU8 = AtomicU8::new(FRAGMENT_OUTPUT_SUPERSET_DEVICE);
+
+/// A test's own answer for the superset fragment interface, restored when it
+/// drops.
+///
+/// The same guard shape as [`RenderVertexCountAboveTriangleOverride`] and for
+/// the same two reasons — the rail reads the bit out of the provider's
+/// capability frame, and a test that has to see the fail-closed arm cannot make
+/// an admitted device stop stating it; a decision rather than an observation,
+/// so an unwound assertion must not leave the next shape answering from a
+/// device that is not its own.
+pub struct FragmentOutputSupersetOverride {
+    previous: u8,
+}
+
+impl Drop for FragmentOutputSupersetOverride {
+    fn drop(&mut self) {
+        FRAGMENT_OUTPUT_SUPERSET_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the superset fragment interface as `declared` until the returned guard
+/// drops, or as the device's own answer for `None` (2026-09-20).
+///
+/// `Some(true)` states the widened arm, `Some(false)` the pre-increment device:
+/// a frame whose tail ends before the `0x00 0x0E` section, which is exactly what
+/// every census boot so far carried and exactly what the shape's fail-closed
+/// arm has to read.
+pub fn override_render_fragment_output_superset(
+    declared: Option<bool>,
+) -> FragmentOutputSupersetOverride {
+    let answer = match declared {
+        None => FRAGMENT_OUTPUT_SUPERSET_DEVICE,
+        Some(false) => FRAGMENT_OUTPUT_SUPERSET_NOT_DECLARED,
+        Some(true) => FRAGMENT_OUTPUT_SUPERSET_DECLARED,
+    };
+    FragmentOutputSupersetOverride {
+        previous: FRAGMENT_OUTPUT_SUPERSET_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// The superset fragment interface, read out of the device's own capability
+/// frame (2026-09-20, the third door behind census v46's
+/// `stage_buffer_footprint` bucket).
+///
+/// The fifteenth reading of the one-snapshot rule
+/// ([`declared_render_vertex_count_above_triangle`] is the fourteenth), and the
+/// one the class gate needs for the shape census v46's remaining LPF pipeline
+/// has: its fragment stage stores three colour locations while the draw attaches
+/// one. Vulkan defines what the provider does with the extra stores — a
+/// fragment output whose location has no attachment behind it is discarded — so
+/// the shape is executable; what the frame answers is whether *this* provider's
+/// registration gate admits it. A provider that does not declare the face
+/// refuses the registration by name (`render_stage_reflection_mismatch`), and a
+/// draw the class handed such a provider is a draw no rail answered — the census
+/// red line `draws_skipped_after_engine_refusal`.
+///
+/// `false` is the fail-closed answer, and it is what a frame written before the
+/// section existed decodes to: a decoder that predates the tag refuses the frame
+/// rather than reading a value, and one that carries the tag reads `false` out
+/// of a frame that ends before it. A device whose frame does not state the bit
+/// is a device that keeps the census's slug and its sentence for the shape.
+fn declared_render_fragment_output_superset() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match FRAGMENT_OUTPUT_SUPERSET_ANSWER.load(Ordering::Relaxed) {
+            FRAGMENT_OUTPUT_SUPERSET_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_fragment_output_superset =
+                    answer == FRAGMENT_OUTPUT_SUPERSET_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_fragment_output_superset(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
 /// The one-dimensional sampled window the device's own frame states
 /// (`research/docs/23` §119, census b10's `texture_shape` bucket).
 ///
@@ -7122,6 +7218,62 @@ fn pixel_coordinate_sampler_module(
         Some(stage.executes_pixel_coordinate_samplers())
     })()
     .unwrap_or(false);
+    modules.insert(inputs.fragment_air.to_vec(), answer);
+    Ok(answer)
+}
+
+/// Whether this draw's fragment module declares **more colour locations than
+/// the class's own contract attaches** (2026-09-20, the third door behind
+/// census v46's `stage_buffer_footprint` bucket).
+///
+/// The class states one colour format for every draw it admits
+/// ([`register_render_pipeline`]'s contract is `vec![pass.format]`), so "more
+/// than one reflected render target" is exactly the shape whose registration the
+/// provider's count rule refuses unless its snapshot declares the superset
+/// fragment interface. The walk is the translator's own reflection — the same
+/// fact the provider's registration reads — and it is cached per module the way
+/// [`pixel_coordinate_sampler_module`] is: the gate asks before the registration
+/// runs, and the guest draws with few modules many times.
+///
+/// A module that cannot be translated answers `true`: the class then keeps the
+/// shape on the engine under its own name rather than handing the provider a
+/// registration it has no account of
+/// ([`pixel_coordinate_sampler_module`] answers `false` for the same case, and
+/// for the same reason: its question is "does the module have the sibling",
+/// which an unreadable module does not).
+#[cfg(feature = "provider-render")]
+fn fragment_output_superset_module(
+    inputs: &RenderRailInputs<'_>,
+) -> Result<bool, ProviderRenderDecline> {
+    let provider_rail = rail().map_err(IntoRender::into_render)?;
+    let render_rail = render_rail();
+    let mut modules = render_rail
+        .fragment_output_superset_modules
+        .lock()
+        .map_err(|_| ProviderRenderDecline::PipelineCompile {
+            step: "fragment_output_superset_module",
+            detail: "the fragment module cache is poisoned".to_owned(),
+        })?;
+    if let Some(answer) = modules.get(inputs.fragment_air) {
+        return Ok(*answer);
+    }
+    let answer = (|| -> Option<bool> {
+        let entry = inputs.fragment_entry?;
+        let function = provider_rail
+            .device
+            .new_library_with_binary_air(inputs.fragment_air.to_vec())
+            .ok()?
+            .function(entry)
+            .ok()?;
+        let stage = TranslatedRenderStage::translate_with_policy(
+            RenderStage::Fragment,
+            &function,
+            provider_rail.provider.spirv_feature_policy(),
+        )
+        .ok()?;
+        Some(stage.reflection().render_targets.len() > 1)
+    })()
+    .unwrap_or(true);
     modules.insert(inputs.fragment_air.to_vec(), answer);
     Ok(answer)
 }
@@ -10331,6 +10483,17 @@ struct RenderRail {
     /// distinct fragment module because the guest builds few and draws with
     /// each of them many times.
     pixel_sampler_modules: Mutex<HashMap<Vec<u8>, bool>>,
+    /// Whether one fragment module stores more colour locations than the class's
+    /// own contract attaches, keyed by the module's own bytes (2026-09-20, the
+    /// third door behind census v46's `stage_buffer_footprint` bucket).
+    ///
+    /// The class gate has to answer "is this the module that stores more than
+    /// the pass attaches" before the registration runs, and the answer is a
+    /// property of the *translated* module: the walk is the translator's own
+    /// reflection (`TranslatedRenderStage::reflection().render_targets`), and it
+    /// is paid once per distinct fragment module because the guest builds few
+    /// and draws with each of them many times.
+    fragment_output_superset_modules: Mutex<HashMap<Vec<u8>, bool>>,
 }
 
 /// Cache key of one registered render pipeline: everything the registration
@@ -10882,6 +11045,28 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // The superset fragment interface (2026-09-20, the third door behind census
+    // v46's `stage_buffer_footprint` bucket): the fifteenth device answer this
+    // rail asks *before* the gate, and the only one whose candidate is a fact
+    // about the *module* rather than the request. This class states one colour
+    // format for every draw it admits, so a fragment module whose own reflection
+    // declares more colour locations than that is the shape census v46's
+    // remaining LPF pipeline has — and whether this rail may hand it to the
+    // provider is the provider's own registration rule, read out of the
+    // capability frame. A provider that declares the face registers the module
+    // and Vulkan discards the extra stores; one that does not refuses the
+    // registration by name, which is a draw no rail answered — the red line
+    // `draws_skipped_after_engine_refusal`. Everything else answers `true`
+    // without asking the frame at all, so no record reaches the provider any
+    // earlier than it did.
+    let render_fragment_output_superset = match fragment_output_superset_module(inputs) {
+        Ok(false) => true,
+        Ok(true) => match declared_render_fragment_output_superset() {
+            Ok(declared) => declared,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+        Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(
@@ -10899,6 +11084,7 @@ fn submit_render_inner(
         render_pixel_coordinate_sampler,
         render_pass_entry_snapshot,
         render_vertex_count_above_triangle,
+        render_fragment_output_superset,
     ) {
         Err(reason) => {
             reason.note();
@@ -13206,6 +13392,14 @@ fn narrow_class<'a>(
     // candidate test, exactly as the twelve answers beside it are, and `false`
     // keeps the census's sentence for the shape.
     render_vertex_count_above_triangle: bool,
+    // Whether this draw's fragment module may be handed to the provider
+    // (2026-09-20, the third door behind census v46's `stage_buffer_footprint`
+    // bucket): `true` when the module declares no more colour locations than
+    // this class's one attachment, and, for a module that does declare more,
+    // whether the provider executes the superset fragment interface — the
+    // fourteen answers above are read the same way, one value per question, and
+    // `false` keeps the MRT door's slug and sentence for the shape.
+    render_fragment_output_superset: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
@@ -14199,6 +14393,24 @@ fn narrow_class<'a>(
         ));
     }
     if !req.secondary_targets.is_empty() {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_mrt",
+            "MRT stays on the engine",
+        ));
+    }
+    // The same door, in the module's own words (2026-09-20, the third door
+    // behind census v46's `stage_buffer_footprint` bucket). The request above
+    // states extra colour *attachments*; this one states a fragment module that
+    // stores more colour locations than the single attachment this class
+    // carries. Vulkan discards a store whose location has no attachment behind
+    // it, so the shape executes here exactly when the provider's registration
+    // gate admits it — which is what the caller asked the provider's capability
+    // frame. A provider that does not declare the face refuses the registration
+    // by name (`render_stage_reflection_mismatch`), and handing it the draw
+    // would be a draw no rail answered, so the class answers with the door's own
+    // slug and sentence: this class carries one colour location, and a shape
+    // that needs more stays on the engine.
+    if !render_fragment_output_superset {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_mrt",
             "MRT stays on the engine",
