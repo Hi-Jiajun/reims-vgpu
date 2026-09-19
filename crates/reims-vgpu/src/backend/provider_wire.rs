@@ -174,11 +174,37 @@ pub fn compute_texture_support(
 pub struct RenderTextureSupport {
     /// Whether the provider declares it samples render-pass textures at all.
     pub supported: bool,
-    /// The most sampled textures one render pass may bind, as the same frame
-    /// declares it.
+    /// The most sampled textures one render *pass* may bind, as the same frame
+    /// declares it — the pass's list bound (`research/docs/23` §3.3, E-TC1).
     pub maximum: u32,
+    /// The most sampled textures **one stage** of a render pass may declare, or
+    /// `0` for the frame that carries no per-stage section (`research/docs/23`
+    /// §3.3, E-TC1).
+    ///
+    /// The two numbers are not a list and a sub-list of one rule: `maximum` is
+    /// the pass's own list bound — the pair's sum on the canonical side — while
+    /// this one is the ceiling the device states on one stage's own axis. A
+    /// frame that carries no section states no per-stage window, and the class
+    /// gate then keeps the pre-increment reading rather than half-admitting the
+    /// wider list.
+    pub per_stage: u32,
     /// The formats the same frame admits for a sampled render texture.
     pub formats: Vec<TextureFormat>,
+}
+
+impl RenderTextureSupport {
+    /// Whether the frame states a ceiling on one stage's own texture list,
+    /// mirroring `ProviderCapabilities::declares_render_texture_per_stage_ceiling`
+    /// on the decoded side (`research/docs/23` §3.3, E-TC1).
+    ///
+    /// The decoded number is what the class gate has to weigh, because a window
+    /// the frame cannot carry is a window no remote owner would ever see: an
+    /// owner-side snapshot that declared it while the wire dropped it is
+    /// exactly the failure [`capabilities_frame`] exists to catch, and the
+    /// missing section is not an error but the older, stricter reading.
+    pub fn declares_per_stage_ceiling(&self) -> bool {
+        self.per_stage != 0
+    }
 }
 
 /// Encode a capability answer, decode it again, and read the render-texture
@@ -208,6 +234,7 @@ pub fn render_texture_support(
     Ok(RenderTextureSupport {
         supported: decoded.supports_render_texture_sampling,
         maximum: decoded.max_render_textures,
+        per_stage: decoded.max_render_textures_per_stage,
         formats: decoded.supported_render_texture_formats,
     })
 }
