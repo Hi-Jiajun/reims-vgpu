@@ -86,6 +86,15 @@ pub struct StageBufferSupport {
     /// ceiling, and the class gate then keeps the stricter merged reading
     /// rather than half-admitting the pair.
     pub per_stage: u32,
+    /// Whether the same frame declares the stage-buffer **whole-binding** arm:
+    /// a declaration whose reach the translation could not state, executed
+    /// against the bind's own window (`research/docs/23` §3.3, E-SB3).
+    ///
+    /// `false` is the absent section, which is the reading every frame written
+    /// before E-SB3 gives, and the fail-closed one: the walk then keeps its own
+    /// by-name refusal for the shape rather than handing the provider a
+    /// declaration nothing measured.
+    pub binding_range: bool,
 }
 
 impl StageBufferSupport {
@@ -118,6 +127,7 @@ pub fn stage_buffer_support(
         supported: decoded.supports_render_stage_buffers,
         maximum: decoded.max_render_stage_buffers,
         per_stage: decoded.max_render_stage_buffers_per_stage,
+        binding_range: decoded.supports_render_stage_buffer_binding_range,
     })
 }
 
@@ -337,6 +347,38 @@ pub fn render_vertex_count_above_triangle(
     Ok(decoded.supports_render_vertex_count_above_triangle)
 }
 
+/// Whether the provider whose snapshot this is executes a fragment module that
+/// stores **more colour locations than the pass attaches** (2026-09-20, the
+/// third door behind census v46's `stage_buffer_footprint` bucket).
+///
+/// The fifteenth reading of the same one-snapshot rule
+/// ([`render_vertex_count_above_triangle`] is the fourteenth), and the one the
+/// class gate needs for the shape census v46's remaining LPF pipeline has: its
+/// fragment stage stores three colour locations while the draw attaches one.
+/// Vulkan defines what the provider does with the extra stores — a fragment
+/// output whose location has no attachment behind it is discarded — so the
+/// shape is executable; the only thing left to ask is whether *this* provider's
+/// registration gate admits it. A provider that does not declare the face
+/// refuses the registration by name (`render_stage_reflection_mismatch`), and a
+/// draw the class handed such a provider is a draw no rail answered — the census
+/// red line `draws_skipped_after_engine_refusal`.
+///
+/// `false` is the fail-closed reading, and it is what a frame written before
+/// the face existed decodes to: the bit is the escape family's own next tagged
+/// section (`0x00 0x0E`), so a decoder that predates the tag answers
+/// [`WireDecline`] rather than a value, and one that carries the tag reads
+/// `false` out of a frame that ends before it. A device that does not state the
+/// bit is a device that keeps the census's slug and sentence for the shape —
+/// which is exactly the native rail's answer, whose reviewed-module table
+/// selects a stage by the colour format list's exact shape.
+pub fn render_fragment_output_superset(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_fragment_output_superset)
+}
+
 /// The three facts one provider's frame states about its one-dimensional
 /// sampled window, one value each.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -410,6 +452,42 @@ pub fn stage_buffer_namespace_split(
 ) -> Result<bool, WireDecline> {
     let decoded = capabilities_frame(epoch, capabilities)?;
     Ok(decoded.supports_render_stage_buffer_namespace_split)
+}
+
+/// The whole-binding half of one provider capability snapshot, read back out of
+/// the response frame the provider would send (`research/docs/23` §3.3,
+/// E-SB3 / R48).
+///
+/// The same one-snapshot rule the five readings above keep, and the one this
+/// rail's stage-buffer walk needs: a `[[buffer(N)]]` argument whose *reach the
+/// translation could not state* — `StageBufferFootprint::Unstated`, the
+/// reflection's `has_unbounded_access` / no-range-at-all — is a shape the
+/// canonical contract answers in two different ways depending on the device.
+/// With the arm declared the contract states
+/// `FootprintProof::BindingRange` and the provider executes the bind's own
+/// window whole; without it the arm is refused by name
+/// (`render_stage_buffer_footprint_unsupported`) and the draw keeps the engine
+/// under the census's own bucket.
+///
+/// `true` is the provider's declaration that it executes the arm, and it is the
+/// device's own answer on the canonical side: the Vulkan rail publishes it
+/// exactly when the selected device reported `robustBufferAccess` and was
+/// created with it enabled, so an access past the binding is clamped (reads) or
+/// discarded (writes) instead of being unruly undefined behaviour — the same
+/// sentence the contract's own arm rests on.
+///
+/// `false` is the fail-closed reading, and it is what a frame written before
+/// the bit existed decodes to (`CAPABILITY_RENDER_STAGE_BUFFER_BINDING_RANGE_TAIL`
+/// is a presence tag: absent means the arm was never declared), so the class
+/// gate that reads this reading keeps its own refusal sentence and slug for the
+/// shape rather than handing the provider a declaration the frame never
+/// carried.
+pub fn stage_buffer_binding_range(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_stage_buffer_binding_range)
 }
 
 /// The gathered-extent half of one provider capability snapshot, read back out
