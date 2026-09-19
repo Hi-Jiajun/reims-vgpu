@@ -2434,6 +2434,15 @@ fn sampled_textures<'a>(
     // ([`sampled_bind_of_a_narrow_lane`]) — the gate below is pure and reads no
     // device answer of its own.
     render_texture_narrow_lanes: NarrowLanes,
+    // Whether this draw's provider executes the texel space **and** this
+    // draw's own fragment module has the explicit-LOD sibling such a sample
+    // needs (2026-09-19, census v43's `texture_state` axis). Both halves are
+    // read by [`submit_render`] before the gate — the provider's bit out of
+    // its capability frame, the module's answer out of the translation the
+    // rail's own registration derives its sibling with — so the gate below
+    // stays pure: the parameter is the whole answer, and `false` keeps the
+    // census's refusal sentence and slug for the shape, byte for byte.
+    render_pixel_coordinate_sampler: bool,
 ) -> Result<NarrowSampling<'a>, OutOfClass> {
     if req.color_input {
         return Err(OutOfClass::new(
@@ -2535,6 +2544,14 @@ fn sampled_textures<'a>(
     // them and canonicalised below (the contract's list is ascending and
     // unique).
     let mut runtime_samplers: Vec<NarrowRuntimeSampler> = Vec::new();
+    // Whether this draw states the texel space anywhere (2026-09-19, census
+    // v43's `texture_state` axis). Charged once per *admitted pass* at the
+    // return below, so the census reads the count of draws the texel space
+    // moved to the provider beside the `..._texture_state_coordinates` count of
+    // the draws it kept on the engine: the two together are the bucket's
+    // population, and the pair is what says the axis was answered rather than
+    // narrowed.
+    let mut pixel_coordinate_sampler = false;
     // The index the previous declaration stated (E-RS3, `research/docs/23`
     // §104): the canonical contract's two texture lists pair by the index each
     // entry *states* — entry `i` is whatever `[[texture(n)]]` argument it names,
@@ -2657,15 +2674,17 @@ fn sampled_textures<'a>(
                         ),
                     ));
                 };
-                let policy = request_sampler_policy(bound).map_err(|axis| {
-                    // The one reading this refusal cannot carry in its own
-                    // words: which axis read it (`note_sampler_state_refusal`).
-                    // Charged here, beside a sentence and a slug that do not
-                    // move.
-                    note_sampler_state_refusal(bound, axis);
-                    OutOfClass::owned(
-                        "render_provider_out_of_class_texture_state",
-                        format!(
+                let (policy, coordinates) =
+                    request_sampler_policy(bound, render_pixel_coordinate_sampler).map_err(
+                        |axis| {
+                            // The one reading this refusal cannot carry in its own
+                            // words: which axis read it (`note_sampler_state_refusal`).
+                            // Charged here, beside a sentence and a slug that do not
+                            // move.
+                            note_sampler_state_refusal(bound, axis);
+                            OutOfClass::owned(
+                                "render_provider_out_of_class_texture_state",
+                                format!(
                             "a draw whose runtime sampler at `[[sampler({index})]]` is outside \
                              the family the canonical rail creates stays on the engine: the \
                              canonical `VkSampler` is created from nearest or linear filtering \
@@ -2677,8 +2696,9 @@ fn sampled_textures<'a>(
                              coordinates, a comparison or anisotropy",
                             runtime.binding,
                         ),
-                    )
-                })?;
+                            )
+                        },
+                    )?;
                 // Canonical: the contract's sampler list is ascending by Metal
                 // index and unique, and two textures may read through one
                 // argument — the state is the same bind either way.
@@ -2686,8 +2706,18 @@ fn sampled_textures<'a>(
                     .iter_mut()
                     .find(|sampler| sampler.index == index)
                 {
-                    Some(existing) => existing.policy = policy,
-                    None => runtime_samplers.push(NarrowRuntimeSampler { index, policy }),
+                    Some(existing) => {
+                        existing.policy = policy;
+                        existing.coordinates = coordinates;
+                    }
+                    None => runtime_samplers.push(NarrowRuntimeSampler {
+                        index,
+                        policy,
+                        coordinates,
+                    }),
+                }
+                if coordinates.is_pixel() {
+                    pixel_coordinate_sampler = true;
                 }
                 NarrowSampler::Runtime { index }
             }
@@ -3195,16 +3225,17 @@ fn sampled_textures<'a>(
                     ),
                 ));
             };
-            let bound = request_sampler_policy(bound).map_err(|axis| {
-                // The static half of the same door reads the same six axes off
-                // the same function, and charges them the same way: the two
-                // sites share a slug and a sentence, so their readings have to
-                // be one set of counts (census v36 has never seen this half
-                // answer — the runtime half is the sentence that fires).
-                note_sampler_state_refusal(bound, axis);
-                OutOfClass::owned(
-                    "render_provider_out_of_class_texture_state",
-                    format!(
+            let (bound, bound_coordinates) =
+                request_sampler_policy(bound, render_pixel_coordinate_sampler).map_err(|axis| {
+                    // The static half of the same door reads the same six axes off
+                    // the same function, and charges them the same way: the two
+                    // sites share a slug and a sentence, so their readings have to
+                    // be one set of counts (census v36 has never seen this half
+                    // answer — the runtime half is the sentence that fires).
+                    note_sampler_state_refusal(bound, axis);
+                    OutOfClass::owned(
+                        "render_provider_out_of_class_texture_state",
+                        format!(
                         "a draw whose sampler at `[[texture({})]]`'s slot is outside the family \
                          the canonical rail creates stays on the engine: the bind states a state \
                          the declaration could not repeat (nearest or linear filtering under one \
@@ -3212,9 +3243,17 @@ fn sampled_textures<'a>(
                          coordinates, no comparison, no anisotropy)",
                         declaration.index,
                     ),
-                )
-            })?;
-            if bound != sampler {
+                    )
+                })?;
+            // The static half pairs the bind with the module's own AIR state
+            // (`research/docs/23` §3.3, v100), and that state is the normalized
+            // space: the module's AIR sampler is a `constexpr` one, and a
+            // pixel-coordinate bind is a state the module never named — the
+            // module's samples are the ones the AIR states
+            // (2026-09-19, census v43's `texture_state` axis).
+            if bound != sampler
+                || bound_coordinates != metal_api_core::provider::SamplerCoordinates::Normalized
+            {
                 return Err(OutOfClass::owned(
                     "render_provider_out_of_class_texture_state",
                     format!(
@@ -3367,6 +3406,9 @@ fn sampled_textures<'a>(
         {
             productions.push(Arc::clone(production));
         }
+    }
+    if pixel_coordinate_sampler {
+        crate::runtime::drain::note_store_route("render_provider_pixel_sampler");
     }
     Ok(NarrowSampling {
         textures,
@@ -3584,7 +3626,13 @@ fn note_sampler_state_refusal(
 /// one address mode on all three axes.
 fn request_sampler_policy(
     sampler: &crate::backend::vulkan::engine::SamplerResource,
-) -> Result<SamplerPolicy, SamplerStateAxis> {
+    // Whether this draw's provider executes the texel space **and** this
+    // draw's own fragment module has the explicit-LOD sibling such a sample
+    // needs (2026-09-19, census v43's `texture_state` axis). Both halves are
+    // read before the gate, so this parameter is the whole answer: `false`
+    // keeps the census's refusal, byte for byte.
+    pixel_coordinate_sampler: bool,
+) -> Result<(SamplerPolicy, metal_api_core::provider::SamplerCoordinates), SamplerStateAxis> {
     use crate::protocol::sampler::{
         MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO,
         MTL_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT,
@@ -3592,7 +3640,7 @@ fn request_sampler_policy(
         MTL_SAMPLER_MIN_MAG_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_LINEAR,
         MTL_SAMPLER_MIP_FILTER_NEAREST, MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
     };
-    use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+    use metal_api_core::provider::{SamplerAddressMode, SamplerCoordinates, SamplerFilter};
     // The five conditions below are read in the order this gate has always
     // read them, one `if` per axis so the refusal names the axis it read rather
     // than only the family. The states they answer, the order they are asked
@@ -3625,7 +3673,27 @@ fn request_sampler_policy(
         );
     }
     if sampler.unnormalized_coordinates {
-        return Err(SamplerStateAxis::Coordinates);
+        // The texel space (2026-09-19, census v43's `texture_state`): the
+        // class states it only where the provider executes it *and* the
+        // module has the explicit-LOD sibling such a sample needs, and only
+        // for the states an unnormalized `VkSampler` can carry — one filter
+        // for both halves, no mip filtering, and the two addressing modes
+        // that answer an out-of-range texel
+        // (`VUID-VkSamplerCreateInfo-unnormalizedCoordinates-01072` …
+        // `-01077`). Everything else keeps the census's refusal sentence and
+        // slug, byte for byte: the axis it names is the one that read it.
+        if !pixel_coordinate_sampler {
+            return Err(SamplerStateAxis::Coordinates);
+        }
+        if sampler.mip_filter != MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED
+            || !matches!(
+                sampler.address_mode_u,
+                MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE | MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO
+            )
+            || sampler.lod_min_f32() != 0.0
+        {
+            return Err(SamplerStateAxis::Coordinates);
+        }
     }
     if sampler.compare_function != crate::backend::vulkan::engine::SamplerCompareFunction::Never {
         return Err(SamplerStateAxis::Compare);
@@ -3662,7 +3730,14 @@ fn request_sampler_policy(
         MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO => SamplerAddressMode::ClampToZero,
         _ => return Err(SamplerStateAxis::Ordinal(SamplerOrdinal::Address)),
     };
-    Ok(SamplerPolicy { filter, address })
+    Ok((
+        SamplerPolicy { filter, address },
+        if sampler.unnormalized_coordinates {
+            SamplerCoordinates::Pixel
+        } else {
+            SamplerCoordinates::Normalized
+        },
+    ))
 }
 
 /// The blend state one request states as the canonical pass's own
@@ -6020,6 +6095,162 @@ pub fn override_kept_frame_landing(declared: Option<bool>) -> KeptFrameLandingOv
     KeptFrameLandingOverride {
         previous: KEPT_FRAME_LANDING_ANSWER.swap(answer, Ordering::Relaxed),
     }
+}
+
+/// Whether this provider executes a render pass whose runtime sampler states
+/// the **texel space** (2026-09-19, census v43's `texture_state` axis).
+///
+/// The eighth device answer this rail asks before the gate, and the one the
+/// census's last unfrozen render state needs. The guest binds a runtime
+/// `[[sampler(n)]]` whose `MTLSamplerDescriptor` says
+/// `normalizedCoordinates = NO`, so the coordinates its shader computed are in
+/// texels: the canonical rail executes them through an unnormalized
+/// `VkSampler` and the fragment module's explicit-LOD sibling, which is what
+/// the bit declares (E's `supports_render_pixel_coordinate_sampler`,
+/// `research/docs/23` §3.3).
+///
+/// The ask has two halves and both have to hold before the class states the
+/// space: this bit, and the *module*'s own answer
+/// ([`pixel_coordinate_sampler_module`]) — a fragment module whose samples
+/// carry a gradient, an offset or a `Proj`/`Dref`/gather form has no sibling,
+/// and the registration refuses the space for it by name. Asking both here is
+/// what keeps an admitted draw from meeting a provider refusal: the census's
+/// red line (`draws_skipped_after_engine_refusal`) is exactly that shape.
+/// Whether any runtime sampler this request binds states the **texel space**
+/// (2026-09-19, census v43's `texture_state` axis).
+///
+/// The candidate gate of the eighth device answer, and the same intersection
+/// the class walk tests: the request's own bound `MTLSamplerState`s, read for
+/// the one field the family never named before. A draw whose binds are all
+/// normalized — every pre-increment frame — never asks, so it keeps the
+/// admission path, and the provider traffic, that it had.
+fn sampler_binds_the_texel_space(req: &DrawRequest) -> bool {
+    req.samplers
+        .iter()
+        .any(|sampler| sampler.unnormalized_coordinates)
+}
+
+fn declared_render_pixel_coordinate_sampler() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written — the
+    // same rule the readings above keep.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match PIXEL_COORDINATE_SAMPLER_ANSWER.load(Ordering::Relaxed) {
+            PIXEL_COORDINATE_SAMPLER_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_pixel_coordinate_sampler =
+                    answer == PIXEL_COORDINATE_SAMPLER_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_pixel_coordinate_sampler(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
+/// The device's own answer for the texel-space capability (2026-09-19), and the
+/// states the test instrument below can put it in — the same three states, for
+/// the same reason, as [`KEPT_FRAME_LANDING_ANSWER`]'s.
+const PIXEL_COORDINATE_SAMPLER_DEVICE: u8 = 0;
+const PIXEL_COORDINATE_SAMPLER_NOT_DECLARED: u8 = 1;
+const PIXEL_COORDINATE_SAMPLER_DECLARED: u8 = 2;
+
+/// Whether the texel-space capability is read from the device's own frame
+/// ([`PIXEL_COORDINATE_SAMPLER_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static PIXEL_COORDINATE_SAMPLER_ANSWER: AtomicU8 = AtomicU8::new(PIXEL_COORDINATE_SAMPLER_DEVICE);
+
+/// A test's own answer for the texel-space capability, restored when it drops
+/// (2026-09-19).
+///
+/// The mirror of [`KeptFrameLandingOverride`], and a guard for the same reason:
+/// this changes a *decision* rather than an observation, so a test that
+/// unwound through a failed assertion must not leave the next shape in the same
+/// binary answering from a device that is not its own. The answer travels
+/// through the capability frame — written, encoded and decoded — so the arm a
+/// test sees is the arm an old frame gives.
+pub struct PixelCoordinateSamplerOverride {
+    previous: u8,
+}
+
+impl Drop for PixelCoordinateSamplerOverride {
+    fn drop(&mut self) {
+        PIXEL_COORDINATE_SAMPLER_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the texel-space capability as `declared` until the returned guard drops,
+/// or as the device's own answer for `None` (2026-09-19).
+pub fn override_pixel_coordinate_sampler(declared: Option<bool>) -> PixelCoordinateSamplerOverride {
+    let answer = match declared {
+        None => PIXEL_COORDINATE_SAMPLER_DEVICE,
+        Some(false) => PIXEL_COORDINATE_SAMPLER_NOT_DECLARED,
+        Some(true) => PIXEL_COORDINATE_SAMPLER_DECLARED,
+    };
+    PixelCoordinateSamplerOverride {
+        previous: PIXEL_COORDINATE_SAMPLER_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// Whether this draw's own fragment module can be executed with a
+/// pixel-coordinate sampler (2026-09-19, census v43's `texture_state` axis).
+///
+/// The module half of the ask, and the one the class gate cannot read out of
+/// the request: the registration derives the explicit-LOD sibling from the
+/// *translated* module ([`TranslatedRenderStage::executes_pixel_coordinate_samplers`]),
+/// and a module whose samples carry a gradient, an offset value or a
+/// `Proj`/`Dref`/gather form has none — E's registration then refuses the texel
+/// space for that pipeline by name
+/// (`render_pixel_sampler_variant_unavailable`), which is a *provider* refusal
+/// the class must not hand a draw to. Both halves are asked here, before the
+/// gate, exactly as the six device answers beside them are asked.
+///
+/// The answer is cached by the module's own bytes: the guest builds a handful
+/// of fragment modules per boot and draws with each of them tens of thousands
+/// of times, so the translation is paid once per module rather than once per
+/// draw. A module the translator refuses to translate at all answers `false`
+/// rather than a decline: this is a *candidate* question, and the same failure
+/// would be answered by the registration for a normalized draw, where it keeps
+/// its own slug and sentence.
+fn pixel_coordinate_sampler_module(
+    inputs: &RenderRailInputs<'_>,
+) -> Result<bool, ProviderRenderDecline> {
+    let provider_rail = rail().map_err(IntoRender::into_render)?;
+    let render_rail = render_rail();
+    let mut modules = render_rail.pixel_sampler_modules.lock().map_err(|_| {
+        ProviderRenderDecline::PipelineCompile {
+            step: "pixel_sampler_module",
+            detail: "the fragment module cache is poisoned".to_owned(),
+        }
+    })?;
+    if let Some(answer) = modules.get(inputs.fragment_air) {
+        return Ok(*answer);
+    }
+    let answer = (|| -> Option<bool> {
+        let entry = inputs.fragment_entry?;
+        let function = provider_rail
+            .device
+            .new_library_with_binary_air(inputs.fragment_air.to_vec())
+            .ok()?
+            .function(entry)
+            .ok()?;
+        let stage = TranslatedRenderStage::translate_with_policy(
+            RenderStage::Fragment,
+            &function,
+            provider_rail.provider.spirv_feature_policy(),
+        )
+        .ok()?;
+        Some(stage.executes_pixel_coordinate_samplers())
+    })()
+    .unwrap_or(false);
+    modules.insert(inputs.fragment_air.to_vec(), answer);
+    Ok(answer)
 }
 
 /// The highest vertex one indexed draw's own index bytes name, over the first
@@ -9162,6 +9393,18 @@ decline_display!(ProviderRenderDecline);
 struct RenderRail {
     declaring: Mutex<Option<CompiledComputePipeline>>,
     pipelines: Mutex<HashMap<RenderPipelineKey, CompiledComputePipeline>>,
+    /// Whether one fragment module can be executed with a pixel-coordinate
+    /// sampler, keyed by the module's own bytes (2026-09-19, census v43's
+    /// `texture_state` axis).
+    ///
+    /// The class gate has to answer "does this pipeline have the explicit-LOD
+    /// sibling the texel space executes" before the registration runs, and the
+    /// answer is a property of the *translated* module: the walk is E's own
+    /// ([`TranslatedRenderStage::executes_pixel_coordinate_samplers`], the same
+    /// rule the registration derives its module with), and it is paid once per
+    /// distinct fragment module because the guest builds few and draws with
+    /// each of them many times.
+    pixel_sampler_modules: Mutex<HashMap<Vec<u8>, bool>>,
 }
 
 /// Cache key of one registered render pipeline: everything the registration
@@ -9577,6 +9820,33 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // The texel space (2026-09-19, census v43's `texture_state` axis): the
+    // eighth answer this rail asks *before* the gate, and the only one with two
+    // halves. The request's own half is the candidate
+    // ([`sampler_binds_the_texel_space`], the same intersection the gate
+    // tests): a draw whose bound runtime samplers all state normalized
+    // coordinates never asks, and keeps the admission path it had. For a draw
+    // that does state the space, the provider's capability frame says whether
+    // it executes the space at all, and the *module*'s own translation says
+    // whether the fragment stage has the explicit-LOD sibling such a sample
+    // needs (`pixel_coordinate_sampler_module` — E's registration derives the
+    // sibling with the same walk, so the gate and the provider cannot answer
+    // the question differently). A provider that cannot be reached, or a module
+    // whose translation refuses, answers `false`: the class then keeps the
+    // census's slug and sentence for the shape, byte for byte, rather than
+    // handing the draw to a rail that would refuse it — the red line
+    // `draws_skipped_after_engine_refusal` is exactly that shape.
+    let render_pixel_coordinate_sampler = match sampler_binds_the_texel_space(req) {
+        false => false,
+        true => match declared_render_pixel_coordinate_sampler() {
+            Ok(false) => false,
+            Ok(true) => match pixel_coordinate_sampler_module(inputs) {
+                Ok(answer) => answer,
+                Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+            },
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // E-TX13: the fifth device answer this rail asks *before* the gate, on the
     // same terms as the four above. The rule it lifts is the guest-backed tail's
     // refusal: a record whose attachment is backed by the guest's own pages,
@@ -9628,6 +9898,7 @@ fn submit_render_inner(
         render_texture_narrow_lanes,
         attachment_landing_view,
         kept_frame_landing,
+        render_pixel_coordinate_sampler,
     ) {
         Err(reason) => {
             reason.note();
@@ -11258,6 +11529,11 @@ enum NarrowSampler {
 struct NarrowRuntimeSampler {
     index: u32,
     policy: SamplerPolicy,
+    /// The space the samples through this argument are stated in
+    /// (2026-09-19, census v43's `texture_state`): the texel space is a
+    /// statement only the provider's own bit and the module's explicit-LOD
+    /// sibling make executable, and the gate above is where both are read.
+    coordinates: metal_api_core::provider::SamplerCoordinates,
 }
 
 /// One admitted stage buffer: a `[[buffer(N)]]` argument a stage's own
@@ -11804,6 +12080,11 @@ fn narrow_class<'a>(
     render_texture_narrow_lanes: NarrowLanes,
     attachment_landing_view: bool,
     kept_frame_landing: bool,
+    // Whether this draw's provider executes the texel space **and** this
+    // draw's own fragment module has the explicit-LOD sibling such a sample
+    // needs (2026-09-19, census v43's `texture_state` axis); the caller reads
+    // both before the gate, exactly as it reads the six answers beside them.
+    render_pixel_coordinate_sampler: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
@@ -12851,6 +13132,7 @@ fn narrow_class<'a>(
         render_texture_gathered_extent,
         render_texture_gathered_extent_no_copy,
         render_texture_narrow_lanes,
+        render_pixel_coordinate_sampler,
     )?;
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
@@ -14156,7 +14438,17 @@ fn submit_narrow(
         samplers: pass
             .runtime_samplers
             .iter()
-            .map(|sampler| RenderSamplerBinding::new(sampler.index, sampler.policy))
+            // The coordinate space travels beside the policy
+            // (2026-09-19, census v43's `texture_state`): the pass is where
+            // Metal states it, and the provider's wire carries it as the
+            // runtime sampler block's own third activity.
+            .map(|sampler| {
+                RenderSamplerBinding::with_coordinates(
+                    sampler.index,
+                    sampler.policy,
+                    sampler.coordinates,
+                )
+            })
             .collect(),
         color_attachments: vec![RenderAttachment {
             view_id: attachment.view,
