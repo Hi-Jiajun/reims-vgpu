@@ -942,6 +942,21 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                                 {
                                     crate::backend::vulkan::engine::
                                         mark_resident_sampled_content_replaced(&identity);
+                                    // R26's other half, spelled where the frame
+                                    // the provider published is still in hand:
+                                    // merge it into the image under the same
+                                    // identity so the sampling ladder may serve
+                                    // one copy of the surface instead of
+                                    // choosing between the two rails' halves.
+                                    merge_provider_landing_into_resident(
+                                        c0.mapping_id,
+                                        &identity,
+                                        c0.width,
+                                        c0.height,
+                                        &bgra,
+                                        true,
+                                        "resident_store",
+                                    );
                                 }
                             }
                         }
@@ -14088,6 +14103,75 @@ pub(crate) fn note_kept_frame_landing_refusal(
     }
 }
 
+/// Merge one provider-landed frame back into the engine's own image under the
+/// same identity, counting what happened and never failing the caller.
+///
+/// The landing's account runs whether or not the merge lands: the guest's pages
+/// and the host cache hold the frame either way. What the merge buys is the
+/// sampling ladder's engine rung — an image holding both the layers this engine
+/// drew and the ones the provider landed — and a miss leaves R46's refusal
+/// standing, which is exactly the fallback the ladder had before this call
+/// existed. Every miss is counted by name so a rail the merge cannot serve is
+/// visible rather than silent.
+fn merge_provider_landing_into_resident(
+    mapping_id: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+    bgra: bool,
+    route: &str,
+) {
+    use crate::backend::vulkan::engine::{
+        LandedFrame, LandedFrameMerge, LandedFrameMergeMiss, LandedFrameOrder,
+    };
+    let frame = LandedFrame {
+        width,
+        height,
+        order: if bgra {
+            LandedFrameOrder::Bgra8
+        } else {
+            LandedFrameOrder::Rgba8
+        },
+        bytes,
+    };
+    let outcome = crate::backend::vulkan::engine::merge_landed_frame_into_resident(identity, frame);
+    let (name, merged_bytes) = match outcome {
+        LandedFrameMerge::Shared => {
+            crate::runtime::drain::note_store_route("resident_image_merged");
+            ("resident_image_merged_shared", 0)
+        }
+        LandedFrameMerge::Copied { bytes } => {
+            crate::runtime::drain::note_store_route("resident_image_merged");
+            crate::runtime::drain::note_store_route_n("resident_image_merged_bytes", bytes);
+            ("resident_image_merged_copied", bytes)
+        }
+        LandedFrameMerge::Missed(miss) => {
+            crate::runtime::drain::note_store_route("resident_image_merge_missed");
+            let route = match miss {
+                LandedFrameMergeMiss::NoResident => "resident_image_merge_missed_no_resident",
+                LandedFrameMergeMiss::NotReady => "resident_image_merge_missed_not_ready",
+                LandedFrameMergeMiss::Multisample => "resident_image_merge_missed_multisample",
+                LandedFrameMergeMiss::Geometry => "resident_image_merge_missed_geometry",
+                LandedFrameMergeMiss::Format => "resident_image_merge_missed_format",
+                LandedFrameMergeMiss::FrameBytes => "resident_image_merge_missed_frame_bytes",
+                LandedFrameMergeMiss::Upload => "resident_image_merge_missed_upload",
+            };
+            (route, 0)
+        }
+    };
+    crate::runtime::drain::note_store_route(name);
+    // One line per mapping, because the question this answers ("does the image
+    // the ladder serves hold this landing?") is a per-surface fact and a
+    // per-landing line would be the frame log this rail does not keep.
+    if crate::observe::first_sight("resident_image_merge", u64::from(mapping_id)) {
+        crate::observe::off(format!(
+            "resident_image_merge mid={mapping_id} {width}x{height} route={route} \
+             outcome={name} bytes={merged_bytes}"
+        ));
+    }
+}
+
 /// The account one provider-landed frame owes the device (B3).
 ///
 /// `StoreOp::Borrowed` (E-TX8) writes the pass's frame into the attachment
@@ -14145,6 +14229,20 @@ fn borrowed_landing_store<M: HostMemory + HostOps>(
     crate::runtime::drain::note_store_route("sampler_resident_replaced");
     if let Some(identity) = mapper_ref_texture_store_identity(state, req, true) {
         crate::backend::vulkan::engine::mark_resident_sampled_content_replaced(&identity);
+        // The other half of the same landing: with the frame in the guest's
+        // pages, the engine's image under this identity is the one copy that
+        // holds the layers this engine drew and neither half of the landing.
+        // Merging the landed rectangle into it lets the sampling ladder serve
+        // one image holding both; a miss leaves the refusal above standing.
+        merge_provider_landing_into_resident(
+            req.colors.first().map(|c0| c0.mapping_id).unwrap_or(0),
+            &identity,
+            c0.width,
+            c0.height,
+            bytes,
+            bgra,
+            "borrowed_landing",
+        );
     }
     if c0.mapping_id != 0 {
         let (mid, cw, ch, fmt) = (c0.mapping_id, c0.width, c0.height, c0.format);
@@ -15379,6 +15477,69 @@ mod vulkan_split_tests {
         assert!(!resident_rung_serves(true, false, true));
         assert!(!resident_rung_serves(false, false, false));
         assert!(!resident_rung_serves(true, true, true));
+        // The whole table, so a future arm cannot be added by guessing: an
+        // image nothing has vouched for is refused whatever the two witnesses
+        // say, because `content_ready` is the rung's own precondition and
+        // neither refusal is a substitute for it.
+        assert!(!resident_rung_serves(false, true, false));
+        assert!(!resident_rung_serves(false, false, true));
+        assert!(!resident_rung_serves(false, true, true));
+    }
+
+    /// The other half of the same gate: a merge that **did** land the frame
+    /// clears `sampled_content_replaced`, and the rung then serves the engine's
+    /// image again — the image that holds both the layers this engine drew and
+    /// the ones the provider landed. This is the transition the merge exists
+    /// for, spelled as the three inputs the gate reads.
+    #[test]
+    fn a_merged_landing_puts_the_engine_image_back_under_the_ladder() {
+        let replaced_before_merge = resident_rung_serves(true, true, false);
+        assert!(!replaced_before_merge, "the refusal stands until the merge");
+        let served_after_merge = resident_rung_serves(true, false, false);
+        assert!(
+            served_after_merge,
+            "a merge that landed the frame makes `sampled_content_replaced` false, \
+             and that is the only bit between these two readings"
+        );
+        // And a merge that did not land leaves the first reading exactly where
+        // it was: the flag is only cleared by a writer that wrote the image.
+        assert!(
+            !resident_rung_serves(true, true, false),
+            "a missed merge must leave every input where it started"
+        );
+    }
+
+    /// The seam helper's own accounting, and the fail-closed half of it: a
+    /// merge with no image under the identity is counted by name and leaves
+    /// every bit where the landing found it. The fallback is a reading on the
+    /// census, not a silence.
+    #[test]
+    fn a_merge_that_cannot_land_is_counted_and_leaves_the_refusal() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        use crate::runtime::drain::store_route_count;
+
+        let identity = TargetIdentity::Surface {
+            id: 990_303,
+            width: 8,
+            height: 4,
+            generation: 1,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        };
+        let bytes = vec![0x2bu8; 8 * 4 * 4];
+        let merged = store_route_count("resident_image_merged");
+        let missed = store_route_count("resident_image_merge_missed");
+        let absent = store_route_count("resident_image_merge_missed_no_resident");
+        merge_provider_landing_into_resident(7, &identity, 8, 4, &bytes, true, "test");
+        assert_eq!(
+            store_route_count("resident_image_merged") - merged,
+            0,
+            "nothing was merged, so nothing is counted as merged"
+        );
+        assert_eq!(store_route_count("resident_image_merge_missed") - missed, 1);
+        assert_eq!(
+            store_route_count("resident_image_merge_missed_no_resident") - absent,
+            1
+        );
     }
 
     /// The elision is exact equality, not "at least as new". A resident stamped
