@@ -6277,6 +6277,13 @@ fn note_wire_render_textures(trace: &ComputeTrace) {
                 format!("borrowed_lease={}", lease.get())
             }
             Some(TextureSource::TraceView) => "trace_view".to_owned(),
+            // The pass-entry snapshot arm (`research/docs/23` §118, E-TX15):
+            // the provider's new source names the pass's own colour attachment,
+            // so this diagnostic prints its own name. The class still refuses
+            // the shape by name below until the relay's follow-up reads the
+            // provider's `0x00 0x08` capability bit; what this arm states is the
+            // declaration the wire now carries.
+            Some(TextureSource::PassEntrySnapshot) => "pass_entry_snapshot".to_owned(),
             None => "view=absent".to_owned(),
         };
         crate::observe::line(format!(
