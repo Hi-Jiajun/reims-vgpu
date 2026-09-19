@@ -501,6 +501,25 @@ pub fn render_kept_frame_landing(
     Ok(decoded.supports_render_kept_frame_landing)
 }
 
+/// Whether this provider executes a render pass whose runtime sampler states
+/// the **texel space** (2026-09-19, census v43's `texture_state` axis).
+///
+/// The eighth device answer this rail asks before the class gate, read out of
+/// the capability frame rather than the in-process snapshot for the same reason
+/// every answer beside it is: a bit the owner→provider frame cannot carry is a
+/// bit no remote owner would ever see. The section is the tail's second
+/// family's `0x00 0x08 <bool>`, so a frame written before the axis reads as
+/// undeclared — and the class then keeps the census's refusal sentence and slug
+/// for the shape, byte for byte, which is what makes this read a widening of
+/// the class by exactly what the device states.
+pub fn render_pixel_coordinate_sampler(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_pixel_coordinate_sampler)
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///

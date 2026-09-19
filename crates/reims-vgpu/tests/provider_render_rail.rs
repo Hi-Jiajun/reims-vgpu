@@ -12034,6 +12034,167 @@ fn a_runtime_sampler_lands_the_texels_its_request_states_and_agrees_with_the_eng
     );
 }
 
+/// The texel space (2026-09-19, census v43's `texture_state` axis): a draw that
+/// binds a runtime `[[sampler(n)]]` whose `MTLSamplerDescriptor` says
+/// `normalizedCoordinates = NO` executes the coordinates its shader computed.
+///
+/// The fixture's one sample point is `(1.375, 0.875)` of the 8x4 surface, which
+/// in **texels** is inside the image: `floor(1.375) = 1` and
+/// `floor(0.875) = 0` for nearest — texel `(1, 0)` — and, for linear, the four
+/// taps `(0,0)`, `(1,0)`, `(0,1)`, `(1,1)` with weights `(5, 35, 3, 21)/64`
+/// (the translator's own `floor(u - 0.5)` / `frac(u - 0.5)` arithmetic, which
+/// is Vulkan's unnormalized filtering verbatim). The same coordinates read as
+/// *fractions* land texel `(7, 3)` and its blend instead — the two arms' frames
+/// differ, which is what makes the space a reading rather than a claim.
+///
+/// Three halves are falsifiable here: the provider lands the texels the texel
+/// coordinates name, the engine lands the same frame byte for byte (the sample
+/// point stays inside the image, where the engine's own conformed sampler
+/// differs from this rail's only in a mode neither read reaches), and every
+/// shape the arm cannot prove stays on the engine under the census's own slug
+/// and sentence.
+#[test]
+fn the_texel_space_moves_a_pixel_coordinate_sampler_to_the_provider() {
+    let _guard = engine_test_session();
+    let stages = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let texel = |x: usize, y: usize| -> [u8; 4] {
+        let texel = &texels[y * width as usize + x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let linear = mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR;
+    let clamp = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+
+    // The four taps the texel coordinate bounds, with the weights the
+    // unnormalized formulas state: `(5, 35, 3, 21)/64`.
+    let linear_want = {
+        let tap = |x: usize, y: usize| texel(x, y).map(u64::from);
+        let mut lanes = [0u8; 4];
+        for channel in 0..3 {
+            let [a, b, c, d] = [
+                tap(0, 0)[channel],
+                tap(1, 0)[channel],
+                tap(0, 1)[channel],
+                tap(1, 1)[channel],
+            ];
+            lanes[channel] =
+                u8::try_from((5 * a + 35 * b + 3 * c + 21 * d) / 64).expect("an 8-bit lane");
+        }
+        lanes[3] = 0xff;
+        lanes
+    };
+
+    let texel_space = |filter: u32| -> DrawRequest {
+        let mut req = widened_runtime_sampled_request(
+            &stages,
+            texels.clone(),
+            (width, height),
+            filter,
+            mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+            clamp,
+        );
+        req.samplers[0].unnormalized_coordinates = true;
+        req
+    };
+
+    for (what, filter, want) in [
+        ("texel space: nearest + clamp", nearest, texel(1, 0)),
+        ("texel space: linear + clamp", linear, linear_want),
+    ] {
+        let request = texel_space(filter);
+        let provider = provider_pixels(what, &stages, &request);
+        assert_uniform_frame(what, &provider, width, height, want);
+        let Some(engine) = engine_pixels(what, &stages, request) else {
+            return;
+        };
+        assert_uniform_frame(what, &engine, width, height, want);
+        assert_frames_equal(what, &provider, &engine);
+    }
+
+    // The space is a *statement*: the same bind read as fractions lands another
+    // texel, so the arm above cannot be the normalized one under another name.
+    let normalized = widened_runtime_sampled_request(
+        &stages,
+        texels.clone(),
+        (width, height),
+        nearest,
+        mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        clamp,
+    );
+    let normalized_frame = provider_pixels("normalized: nearest + clamp", &stages, &normalized);
+    assert_uniform_frame(
+        "normalized: nearest + clamp",
+        &normalized_frame,
+        width,
+        height,
+        texel(7, 3),
+    );
+    assert_frames_differ(
+        "the coordinate space moved the frame",
+        &normalized_frame,
+        &provider_pixels(
+            "texel space: nearest + clamp",
+            &stages,
+            &texel_space(nearest),
+        ),
+    );
+
+    // The three shapes the arm cannot prove, each under the census's own slug
+    // and sentence: a provider that does not declare the space, a module whose
+    // samples carry an offset (no explicit-LOD sibling), and a state an
+    // unnormalized `VkSampler` cannot carry (a mip filter).
+    let out_of_arm = |label: &str, stages: &Stages, filter: u32, mip: u32| {
+        let mut req = widened_runtime_sampled_request(
+            stages,
+            texels.clone(),
+            (width, height),
+            filter,
+            mip,
+            clamp,
+        );
+        req.samplers[0].unnormalized_coordinates = true;
+        let (slug, detail) = match provider_render::submit_render(
+            &inputs(stages, RenderChainRole::SoleOrTail),
+            &req,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape stays on the engine: {other:?}"),
+        };
+        eprintln!("door: {slug}\n  {detail}");
+        assert_eq!(slug, "render_provider_out_of_class_texture_state");
+    };
+    {
+        let _no_bit = provider_render::override_pixel_coordinate_sampler(Some(false));
+        out_of_arm(
+            "a provider that does not declare the texel space",
+            &stages,
+            nearest,
+            mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        );
+    }
+    let offset_stages = sampled_fragment_stages(
+        "render_frag_runtime_sampler_offset.air",
+        "reims_runtime_sampled_offset_frag",
+    );
+    out_of_arm(
+        "a module whose samples carry an offset",
+        &offset_stages,
+        nearest,
+        mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+    );
+    out_of_arm(
+        "a mip-filtering texel-space state",
+        &stages,
+        nearest,
+        mtl::MTL_SAMPLER_MIP_FILTER_NEAREST,
+    );
+}
+
 /// R12: the runtime-sampler shapes beside the admitted entry, each under its
 /// own name.
 ///
