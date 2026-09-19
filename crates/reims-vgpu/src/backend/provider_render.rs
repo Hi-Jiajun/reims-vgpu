@@ -2283,6 +2283,36 @@ fn sampled_bind_window_1d(window: OneDimensionWindow) -> String {
     )
 }
 
+/// The three-dimensional window the volume sentence names (2026-09-20, the `D3`
+/// sampled texture arm).
+///
+/// [`sampled_bind_window_1d`]'s sibling two axes over, and written out for the
+/// same reason: the sentence is the census's own key for this door, so the shape
+/// of the answer is a phrase rather than a list assembled at run time, and the
+/// *number* in it is the device's own answer rather than a constant — a
+/// provider whose `maxImageDimension3D` is narrower than a reviewed volume
+/// states the narrower number, and the refusal prints the window it read.
+///
+/// The window is stated **per axis** because that is the rule the reader holds
+/// the bind's three extents to ([`provider_wire::VolumeSupport::covers`]): the
+/// product is not the question either here or at the provider, so the phrase
+/// says "each of its three extents" rather than one texel count.
+fn sampled_bind_window_3d(window: provider_wire::VolumeSupport) -> String {
+    if window.r32f {
+        format!(
+            "`r32_float` texels (the one volume lane the provider's own frame lists) whose three \
+             extents are each at most {} texels (the provider's own three-dimensional window)",
+            window.window,
+        )
+    } else {
+        format!(
+            "no volume texel lane at all (the provider's own frame does not list `r32_float`) and \
+             a window of at most {} texels per axis (the provider's own three-dimensional window)",
+            window.window,
+        )
+    }
+}
+
 /// The census name one reflected dimension's `texture_shape` records are
 /// charged under (2026-09-19, C2's dimension probe).
 ///
@@ -2627,6 +2657,14 @@ fn sampled_textures<'a>(
     // neither lane and no width, which is the pre-increment device's whole
     // answer.
     render_texture_one_dimension_window: OneDimensionWindow,
+    // The device's own answer to the volume arm's window (2026-09-20, the `D3`
+    // sampled texture arm), read by [`submit_render`] out of the same frame
+    // exactly when the request names a sampled bind whose kind is the
+    // three-dimensional view ([`sampled_bind_of_a_volume`]) — the gate below is
+    // pure and reads no device answer of its own.
+    // `provider_wire::VolumeSupport::NONE` states neither lane nor window,
+    // which is the pre-increment device's whole answer.
+    render_texture_volume_window: provider_wire::VolumeSupport,
     // Whether this draw's provider executes the texel space **and** this
     // draw's own fragment module has the explicit-LOD sibling such a sample
     // needs (2026-09-19, census v43's `texture_state` axis). Both halves are
@@ -2966,6 +3004,25 @@ fn sampled_textures<'a>(
         ) && bound.is_some_and(|image| {
             image.kind == reims_vgpu_core::texture_shape::TextureKind::D1Array
         });
+        // The second widening this gate states (2026-09-20, the `D3` sampled
+        // texture arm): the reflection states `D3` **and** the draw binds a
+        // `D3` view. The same two readings and the same reason for stating them
+        // as one condition — a non-`D3` reflection beside the same bind is a
+        // view the module's coordinate has no third axis for, and the `D3`
+        // reflection beside any other kind is a view the three-axis sample does
+        // not address. The third axis travels as the bind's own `layers`, which
+        // is the field the seam's own volume arm fills from the texture
+        // descriptor's plane count (`runtime::draw::vulkan`), so "one volume"
+        // here is `{width, height, layers}` and nothing else. Every other
+        // dimension, every other kind and every other shape keeps the sentence
+        // and the slug the census counted, byte for byte.
+        let volume = matches!(
+            declaration.shape,
+            RenderTextureShape::Unsupported(RenderTextureShapeRefusal::Dimension(
+                metal2vulkan::meta::TextureDimension::D3
+            ))
+        ) && bound
+            .is_some_and(|image| image.kind == reims_vgpu_core::texture_shape::TextureKind::D3);
         if let RenderTextureShape::Unsupported(reason) = declaration.shape {
             // The dimension probe (2026-09-19, C2): the one shape answer whose
             // *value* the census could not read, together with the draw's own
@@ -2980,7 +3037,7 @@ fn sampled_textures<'a>(
                     bound.map(|image| image.kind),
                 ));
             }
-            if !one_dim {
+            if !one_dim && !volume {
                 return Err(OutOfClass::owned(
                     "render_provider_out_of_class_texture_shape",
                     format!(
@@ -3032,8 +3089,12 @@ fn sampled_textures<'a>(
         // `render_texture_format_unsupported`, so this class answers it here
         // rather than handing the provider a draw the engine would have run.
         let lane = match image.format {
-            ash::vk::Format::R8G8B8A8_UNORM if !one_dim => Some(TextureFormat::Rgba8Unorm),
-            ash::vk::Format::B8G8R8A8_UNORM if !one_dim => Some(TextureFormat::Bgra8Unorm),
+            ash::vk::Format::R8G8B8A8_UNORM if !one_dim && !volume => {
+                Some(TextureFormat::Rgba8Unorm)
+            }
+            ash::vk::Format::B8G8R8A8_UNORM if !one_dim && !volume => {
+                Some(TextureFormat::Bgra8Unorm)
+            }
             // The lanes E appended to `RENDER_SAMPLED`, each admitted only
             // while the device's own frame lists it: the answer is asked once
             // per request and travels as a value, so a frame that does not
@@ -3046,7 +3107,18 @@ fn sampled_textures<'a>(
             // A one-dimensional bind of any other format reaches no arm here
             // and keeps the bind door's refusal, exactly as a two-dimensional
             // bind of a one-dimensional lane would.
-            listed if !one_dim => render_texture_sampled_lanes.admits(listed),
+            //
+            // The volume arm (2026-09-20, the `D3` sampled texture arm) reads
+            // the lane the *same* frame's format list carries one axis over:
+            // the census's volumes are single-component floats, which the
+            // two-dimensional window's own list states only where the contract
+            // appended `r32_float` for the sampled arm — and that lane is the
+            // one this arm weighs, so a volume bind of any other format keeps
+            // the bind door's refusal rather than being uploaded under a
+            // four-byte order whose texel the module's own sample does not
+            // read.
+            listed if !one_dim && !volume => render_texture_sampled_lanes.admits(listed),
+            listed if volume => render_texture_volume_window.admits(listed),
             listed => render_texture_one_dimension_window.admits(listed),
         };
         // The plan the bind's *texel format* contributes, when the class folds
@@ -3057,19 +3129,28 @@ fn sampled_textures<'a>(
         // float LUT has no channel plan to fold, and the widened name a fold
         // would produce (`rgba8_unorm`) is not a lane this arm uploads, so the
         // one-dimensional binds state no plan at all.
-        let fold = if one_dim {
+        let fold = if one_dim || volume {
             None
         } else {
             folded_channel_plan(image)
         };
         let bindable = image.array_element == 0
             && image.descriptor_count == 1
-            && image.layers == 1
             // The kind the reflected shape names: the 2D window's one kind, or
-            // the arrayed one-dimensional kind the widening above admitted.
+            // the arrayed one-dimensional kind the first widening above
+            // admitted, or the three-dimensional kind the second one does. The
+            // *layer* count is read per arm: a surface and a one-dimensional
+            // bind state one slice, while a volume's third extent **is** the
+            // count the seam filled `layers` with, so a volume of depth one is
+            // still the same shape as a volume of depth four.
             && match image.kind {
-                reims_vgpu_core::texture_shape::TextureKind::D2 => !one_dim,
-                reims_vgpu_core::texture_shape::TextureKind::D1Array => one_dim,
+                reims_vgpu_core::texture_shape::TextureKind::D2 => {
+                    !one_dim && !volume && image.layers == 1
+                }
+                reims_vgpu_core::texture_shape::TextureKind::D1Array => {
+                    one_dim && image.layers == 1
+                }
+                reims_vgpu_core::texture_shape::TextureKind::D3 => volume && image.layers != 0,
                 _ => false,
             }
             && !image.multisampled
@@ -3089,6 +3170,20 @@ fn sampled_textures<'a>(
             && (!one_dim
                 || (image.height == 1
                     && render_texture_one_dimension_window.covers(image.width)))
+            // The volume's own three-axis rule (2026-09-20, the `D3` sampled
+            // texture arm): every extent the view states has to be inside the
+            // window the device's frame declares, one comparison per axis
+            // exactly as `maxImageDimension3D` reads — a bind whose product is
+            // small but whose depth is over the window is not a volume this
+            // provider would create, and the draw keeps this door's refusal
+            // rather than leaving for an image the device was never asked
+            // about.
+            && (!volume
+                || render_texture_volume_window.covers([
+                    image.width,
+                    image.height,
+                    image.layers,
+                ]))
             && (crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle)
                 || fold.is_some());
         let Some(lane) = lane.filter(|_| bindable) else {
@@ -3109,13 +3204,14 @@ fn sampled_textures<'a>(
             if !crate::protocol::pixel_format::swizzle_is_identity(&image.swizzle) {
                 crate::runtime::drain::note_store_route(swizzled_bind_route(image));
             }
-            // The sentence is the census's key, so the two arms are two
-            // sentences rather than one sentence with a hole in it: the 2D
+            // The sentence is the census's key, so the three arms are three
+            // sentences rather than one sentence with holes in it: the 2D
             // window's is the one this door has stated since E-TX1, byte for
-            // byte, and the one-dimensional arm's is its own (2026-09-19,
-            // census b10's `texture_shape` bucket) — the shape it names did not
-            // reach this door before the widening, so no counted record moves
-            // from one key to the other.
+            // byte, the one-dimensional arm's is its own (2026-09-19, census
+            // b10's `texture_shape` bucket), and the volume arm's is the third
+            // (2026-09-20, the `D3` sampled texture arm) — each shape did not
+            // reach this door before its own widening, so no counted record
+            // moves from one key to another.
             let detail = if one_dim {
                 format!(
                     "a draw that binds its own one-dimensional texture at `[[texture({})]]` stays \
@@ -3129,6 +3225,28 @@ fn sampled_textures<'a>(
                     sampled_bind_window_1d(render_texture_one_dimension_window),
                     image.width,
                     image.height,
+                    image.format,
+                    image.kind,
+                    image.layers,
+                    image.descriptor_count,
+                    image.array_element,
+                    image.multisampled,
+                )
+            } else if volume {
+                format!(
+                    "a draw that binds its own three-dimensional texture at `[[texture({})]]` \
+                     stays on the engine: the canonical pass states one single-sample `D3` view \
+                     whose third extent is the bind's own layer count, with one descriptor and an \
+                     identity channel mapping, {}, and the bind is {}x{}x{} {:?} (kind {:?}, \
+                     layers {}, descriptors {}, element {}, multisampled {}) — an extent outside \
+                     that window is refused by the provider by name \
+                     (`render_texture_format_unsupported`) rather than uploaded under another \
+                     format",
+                    declaration.index,
+                    sampled_bind_window_3d(render_texture_volume_window),
+                    image.width,
+                    image.height,
+                    image.layers,
                     image.format,
                     image.kind,
                     image.layers,
@@ -3185,23 +3303,44 @@ fn sampled_textures<'a>(
                 // bytes are the one-byte texels the plan is folded into, and
                 // the four-byte copy the declaration states is assembled after
                 // this check, not carried by the request.
+                // The volume arm's third factor (2026-09-20, the `D3` sampled
+                // texture arm): the engine states a three-dimensional view's
+                // third extent as the bind's own `layers`, so the tightly
+                // packed extent a volume's source states is `width * height *
+                // layers` texels — and the factor is exactly `1` for every bind
+                // the shape door was already open to, which is what keeps the
+                // two-dimensional sentence below the one it has been.
+                let axes = if volume { u64::from(image.layers) } else { 1 };
                 let expected = u64::from(image.width)
                     .checked_mul(u64::from(image.height))
+                    .and_then(|texels| texels.checked_mul(axes))
                     .and_then(|texels| texels.checked_mul(lane.bytes_per_texel()));
                 if expected != u64::try_from(bytes.len()).ok() {
+                    // The shape this sentence names: a volume's own three
+                    // extents and its own noun (2026-09-20, the `D3` sampled
+                    // texture arm), the surface's two for every other bind —
+                    // so the sentence the census has counted since E-TX1 reads
+                    // exactly as it did.
+                    let (extent, noun) = if volume {
+                        (
+                            format!("{}x{}x{}", image.width, image.height, image.layers),
+                            "volume",
+                        )
+                    } else {
+                        (format!("{}x{}", image.width, image.height), "surface")
+                    };
                     return Err(OutOfClass::owned(
                         "render_provider_out_of_class_texture_bind",
                         format!(
-                            "a draw whose `[[texture({})]]` view carries {} byte(s) for a {}x{} \
-                             {:?} surface stays on the engine: the canonical view's byte source \
+                            "a draw whose `[[texture({})]]` view carries {} byte(s) for a {extent} \
+                             {:?} {noun} stays on the engine: the canonical view's byte source \
                              has to be the whole tightly packed extent ({} byte(s))",
                             declaration.index,
                             bytes.len(),
-                            image.width,
-                            image.height,
                             image.format,
                             u64::from(image.width)
                                 * u64::from(image.height)
+                                * axes
                                 * lane.bytes_per_texel(),
                         ),
                     ));
@@ -3643,6 +3782,11 @@ fn sampled_textures<'a>(
             height: u64::from(image.height),
             format,
             kind: image.kind,
+            // The third extent the bind states, and `1` for every kind whose
+            // third axis is an array layer the class does not state (the
+            // contract's own length rule multiplies `depth * array_length`, so
+            // the two spellings of "one slice" have to stay apart).
+            depth: if volume { u64::from(image.layers) } else { 1 },
             sampler,
             source,
         });
@@ -6579,6 +6723,65 @@ pub fn override_render_texture_one_dimension_window(
     }
 }
 
+/// The device's own answer for the three-dimensional sampled window
+/// (2026-09-20, the `D3` sampled texture arm), and the states the test
+/// instrument below can put it in.
+const VOLUME_WINDOW_DEVICE: u8 = 0;
+const VOLUME_WINDOW_NOT_DECLARED: u8 = 1;
+const VOLUME_WINDOW_DECLARED: u8 = 2;
+
+/// Whether the three-dimensional window is read from the device's own frame
+/// ([`VOLUME_WINDOW_DEVICE`], what production runs) or from an answer a test
+/// stated.
+static VOLUME_WINDOW_ANSWER: AtomicU8 = AtomicU8::new(VOLUME_WINDOW_DEVICE);
+
+/// A test's own answer for the three-dimensional window, restored when it
+/// drops.
+///
+/// The same guard shape as [`RenderTextureOneDimensionWindowOverride`] and for
+/// the same two reasons — the rail reads the window out of the provider's
+/// capability frame, and a test that has to see the fail-closed arm cannot make
+/// an admitted device stop stating it; a decision rather than an observation,
+/// so an unwound assertion must not leave the next shape answering from a
+/// device that is not its own. The *instrument is separate* from the
+/// one-dimensional window's because the two windows are two capabilities: this
+/// one replaces the snapshot's format list *and* the tail's `0x00 0x0D` section
+/// together, exactly as the frame states them, and a device that carries one of
+/// the two windows and not the other is a combination one instrument could not
+/// spell.
+pub struct RenderTextureVolumeWindowOverride {
+    previous: u8,
+}
+
+impl Drop for RenderTextureVolumeWindowOverride {
+    fn drop(&mut self) {
+        VOLUME_WINDOW_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the three-dimensional window as `declared` until the returned guard
+/// drops, or as the device's own answer for `None` (2026-09-20).
+///
+/// `Some(true)` states the lane and the *contract's* review ceiling — the
+/// largest window any provider may declare, which is the only way a test can
+/// exercise the three-axis rule the real device's own `maxImageDimension3D`
+/// merely bounds. `Some(false)` states the **pre-increment** device: the lane
+/// absent from the list and a zero window, which is exactly the frame every
+/// census boot so far carried and exactly what the shape's fail-closed arm has
+/// to read.
+pub fn override_render_texture_dimension_3d_window(
+    declared: Option<bool>,
+) -> RenderTextureVolumeWindowOverride {
+    let answer = match declared {
+        None => VOLUME_WINDOW_DEVICE,
+        Some(false) => VOLUME_WINDOW_NOT_DECLARED,
+        Some(true) => VOLUME_WINDOW_DECLARED,
+    };
+    RenderTextureVolumeWindowOverride {
+        previous: VOLUME_WINDOW_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The device's own answer for the layout-free count above the milestone's
 /// three vertices, and the states the test instrument below can put it in.
 const VERTEX_COUNT_ABOVE_TRIANGLE_DEVICE: u8 = 0;
@@ -6831,6 +7034,63 @@ fn declared_render_texture_one_dimension_window(
         r16f: support.r16f,
         ceiling: support.window,
     })
+}
+
+/// The three-dimensional sampled window the device's own frame states
+/// (2026-09-20, the `D3` sampled texture arm).
+///
+/// The sixteenth reading of the one-snapshot rule
+/// ([`declared_render_texture_one_dimension_window`] is the thirteenth, and the
+/// three E-side readings between them are the vertex count, the fragment
+/// interface and the fragment-output superset), and it is the same rule one
+/// spatial axis further: the frame's format list is what says whether the
+/// provider creates a `TYPE_3D` view for `r32_float` texels, and the capability
+/// tail's `0x00 0x0D` section is what says how large each of the volume's three
+/// extents may be. Both travel in one frame and both are read here, because the
+/// shape needs both facts at once.
+///
+/// `false`/`0` is the fail-closed answer, and it is what a frame written before
+/// the arm existed decodes to: the lane is absent from an older list, and the
+/// section is absent from an older tail (a decoder that predates the tag
+/// refuses the frame rather than reading a value, and one that carries the tag
+/// reads `0` out of a frame that ends before it). A device whose frame states
+/// neither half is a device that keeps those binds on the engine under the
+/// class's own name.
+fn declared_render_texture_dimension_3d_window(
+) -> Result<provider_wire::VolumeSupport, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match VOLUME_WINDOW_ANSWER.load(Ordering::Relaxed) {
+            VOLUME_WINDOW_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                let state_the_window = answer == VOLUME_WINDOW_DECLARED;
+                let lane = TextureFormat::R32Float;
+                declared
+                    .supported_render_texture_formats
+                    .retain(|format| state_the_window || *format != lane);
+                if state_the_window && !declared.supported_render_texture_formats.contains(&lane) {
+                    declared.supported_render_texture_formats.push(lane);
+                }
+                declared.max_render_texture_dimension_3d = if state_the_window {
+                    metal_api_core::provider::MAX_RENDER_TEXTURE_DIMENSION_3D
+                } else {
+                    0
+                };
+                declared
+            }
+        }
+    };
+    provider_wire::render_texture_dimension_3d_window(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
 }
 
 /// The attachment-landing-view half of the same device answer (E-TX13).
@@ -7887,6 +8147,38 @@ fn sampled_bind_of_a_one_dimension_lut(
                 .iter()
                 .find(|image| image.binding == declaration.binding)?;
             (image.kind == reims_vgpu_core::texture_shape::TextureKind::D1Array)
+                .then_some(declaration.index)
+        })
+}
+
+/// Whether this request names a three-dimensional sampled bind — the class
+/// condition whose device answer is the window above (2026-09-20, the `D3`
+/// sampled texture arm): the Metal index of the first declaration whose bind is
+/// the three-dimensional view the widening admits.
+///
+/// The sibling of [`sampled_bind_of_a_one_dimension_lut`] and for the same
+/// reason: this is the shape test that lets the class ask the *device's* own
+/// answer before the pure gate runs, so a request whose binds are all
+/// two-dimensional reaches the rail's provider no earlier than it did. It
+/// decides nothing about the shape — the gate weighs the bind's lane and its
+/// three extents against the device's answer and keeps `..._texture_bind` when
+/// either is outside the window.
+///
+/// The test is on the bind's own `TextureKind` rather than on the declaration's
+/// dimension, exactly as the one-dimensional candidate's is: a `D2` view beside
+/// a `D3` reflection reaches this candidate too, and the gate answers it under
+/// `..._texture_shape` (the reflection's own refusal, which the kind does not
+/// join) exactly as it answers any other shape the class does not execute.
+fn sampled_bind_of_a_volume(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Option<u32> {
+    inputs
+        .fragment_texture_declarations
+        .iter()
+        .find_map(|declaration| {
+            let image = req
+                .sampled_images
+                .iter()
+                .find(|image| image.binding == declaration.binding)?;
+            (image.kind == reims_vgpu_core::texture_shape::TextureKind::D3)
                 .then_some(declaration.index)
         })
 }
@@ -11098,6 +11390,27 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // The three-dimensional sampled window is the same rule one axis further
+    // (2026-09-20, the `D3` sampled texture arm): E's widening appended
+    // `r32_float`'s volume arm to the contract's `RENDER_SAMPLED` list and
+    // published the per-axis extent its device admits in the capability tail's
+    // own `0x00 0x0D` section, so both halves are read out of one frame exactly
+    // when the request names a sampled bind of the three-dimensional kind
+    // ([`sampled_bind_of_a_volume`]). A request whose binds are all
+    // two-dimensional never asks, and the gate it reaches is the one this rail
+    // shipped: `VolumeSupport::NONE` states neither lane nor window, so those
+    // binds keep the refusal they had, by name, at the same point in the same
+    // order.
+    let render_texture_volume_window = match sampled_bind_of_a_volume(inputs, req) {
+        None => provider_wire::VolumeSupport::NONE,
+        Some(_) => match declared_render_texture_dimension_3d_window() {
+            Ok(declared) => declared,
+            // The same fail-closed rule as the answers above: a provider that
+            // cannot answer is not a provider this rail may widen the class
+            // for.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The texel space (2026-09-19, census v43's `texture_state` axis): the
     // eighth answer this rail asks *before* the gate, and the only one with two
     // halves. The request's own half is the candidate
@@ -11245,6 +11558,7 @@ fn submit_render_inner(
         render_vertex_interface_superset,
         render_texture_sampled_lanes,
         render_texture_one_dimension_window,
+        render_texture_volume_window,
         attachment_landing_view,
         kept_frame_landing,
         render_pixel_coordinate_sampler,
@@ -12873,12 +13187,20 @@ struct NarrowTexture<'a> {
     format: TextureFormat,
     /// The kind of view the admitted bind states (2026-09-19, census b10's
     /// `texture_shape` bucket): the plain 2D view every pre-increment lane
-    /// binds, or the arrayed one-dimensional kind the LUT widening admitted.
+    /// binds, the arrayed one-dimensional kind the LUT widening admitted, or
+    /// the three-dimensional kind the volume widening does (2026-09-20).
     /// It is the *bind's* own fact rather than a second reading of the
     /// reflection, and it is what the pass's contract states for the provider's
     /// view: E holds the view's `texture_type` to the declaration's, and the
     /// declaration to the module's own array axis, so the three cannot drift.
     kind: reims_vgpu_core::texture_shape::TextureKind,
+    /// The bind's third extent, which is a *depth* for the one kind that has
+    /// one: a volume states it as the contract's `depth` and one array layer
+    /// ([`TextureView::expected_bytes`] multiplies it in), while every other
+    /// admitted kind has the one layer this field states and the depth it has
+    /// always been — so the byte count the declaration checks, the bytes the
+    /// source carries and the view the pass states are one number.
+    depth: u64,
     /// The sampler form the declaration states, or the sampler-free fetched
     /// arm (R15).
     sampler: NarrowSampler,
@@ -13354,19 +13676,23 @@ impl NarrowPass<'_> {
 }
 
 /// The contract texture type one admitted bind's own kind states (2026-09-19,
-/// census b10's `texture_shape` bucket).
+/// census b10's `texture_shape` bucket; the volume arm added 2026-09-20).
 ///
 /// One decoder rather than a `match` at each of the three declarations above:
-/// the two admitted kinds are the two arms the class gate has, and the pass's
-/// view states the same answer through the same function, so a declaration and
-/// its view cannot disagree about the axis the module's sample coordinate is
-/// written against.
+/// the three admitted kinds are the three arms the class gate has — the plain
+/// surface, the arrayed one-dimensional LUT and the three-dimensional volume —
+/// and the pass's view states the same answer through the same function, so a
+/// declaration and its view cannot disagree about the axis the module's sample
+/// coordinate is written against. The volume's own third extent is *not* here:
+/// it travels as the view's layer count beside this type, exactly as the seam
+/// states it.
 fn view_texture_type(kind: reims_vgpu_core::texture_shape::TextureKind) -> TextureType {
     match kind {
         reims_vgpu_core::texture_shape::TextureKind::D2 => TextureType::D2,
         reims_vgpu_core::texture_shape::TextureKind::D1Array => TextureType::D1Array,
+        reims_vgpu_core::texture_shape::TextureKind::D3 => TextureType::D3,
         other => {
-            unreachable!("an admitted sampled texture is a D2 or D1Array view, not {other:?}")
+            unreachable!("an admitted sampled texture is a D2, D1Array or D3 view, not {other:?}")
         }
     }
 }
@@ -13543,6 +13869,12 @@ fn narrow_class<'a>(
     // out of the same capability frame and under its own candidate test,
     // exactly as the answers beside it are.
     render_texture_one_dimension_window: OneDimensionWindow,
+    // The device's own answer to the volume arm's window (2026-09-20, the `D3`
+    // sampled texture arm); the caller reads it before the gate out of the same
+    // capability frame and under its own candidate test, exactly as the answer
+    // beside it is. `provider_wire::VolumeSupport::NONE` states neither lane nor
+    // window, which is the pre-increment device's whole answer.
+    render_texture_volume_window: provider_wire::VolumeSupport,
     attachment_landing_view: bool,
     kept_frame_landing: bool,
     // Whether this draw's provider executes the texel space **and** this
@@ -14640,6 +14972,7 @@ fn narrow_class<'a>(
         render_texture_gathered_extent_no_copy,
         render_texture_sampled_lanes,
         render_texture_one_dimension_window,
+        render_texture_volume_window,
         render_pixel_coordinate_sampler,
         // E-TX15's arm, with the two facts the declaration has to restate: the
         // attachment's own texel order, and whether its load arm keeps the
@@ -15909,17 +16242,22 @@ fn submit_narrow(
             allocation_id,
             // The kind the admitted bind stated (2026-09-19, census b10's
             // `texture_shape` bucket): the plain 2D view every pre-increment
-            // lane binds, or the arrayed one-dimensional view the LUT widening
-            // admits. E holds the view's type to the declaration's, and the
-            // declaration to the module's own array axis, so a view stated any
-            // other way could not leave this rail: the two admitted kinds are
-            // the two arms the class gate has (`provider_render.rs`,
+            // lane binds, the arrayed one-dimensional view the LUT widening
+            // admits, or the three-dimensional view the volume widening does
+            // (2026-09-20). E holds the view's type to the declaration's, and
+            // the declaration to the module's own array axis, so a view stated
+            // any other way could not leave this rail: the three admitted kinds
+            // are the three arms the class gate has (`provider_render.rs`,
             // `sampled_textures`).
             texture_type: view_texture_type(texture.kind),
             format: texture.format,
             width: texture.width,
             height: texture.height,
-            depth: 1,
+            // The volume's third extent, carried by the declaration as the
+            // contract's own depth (`TextureView::expected_bytes` multiplies it
+            // in), and one array layer beside it exactly as the other two
+            // admitted kinds state.
+            depth: texture.depth,
             array_length: 1,
             sample_count: 1,
             // The access the declaration states (R15): a fetched texture's

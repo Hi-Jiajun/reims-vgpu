@@ -12591,6 +12591,388 @@ fn the_one_dimensional_lut_is_read_from_the_frame_and_keeps_the_old_window_by_na
     );
 }
 
+/// The three-dimensional LPF shape (2026-09-20, the `D3` sampled texture arm):
+/// the reviewed vertex stage beside a fragment stage whose `[[texture(0)]]` is
+/// declared `texture3d<float, sample>` and sampled at four texel centres of its
+/// own `4 x 4 x 2` volume — two of them in the volume's second slice.
+///
+/// The declarations are the *production* walk over the fixture's own
+/// translation, exactly as [`one_dim_lut_stages`]' are, so what the gate is
+/// asked about is what the translator of the same AIR reports.
+fn volume_sample_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_sampled_3d_volume.air",
+        "reims_volume_sample_frag",
+    )
+}
+
+/// The `4 x 4 x 2` volume's own texels, four bytes each at `r32_float`: every
+/// one of the four the fixture samples carries its own value, and the rest is
+/// the zero the upload still has to carry (`width * height * layers` texels
+/// rather than the two-dimensional product beside them).
+///
+/// The green lane's texel is `2.5` in the primary volume — whose own encoding
+/// is `00 00 20 40`, the falsifier every other lane's fixture states one width
+/// over — and a plain `0.2` in the moved one, so the moved frame's green byte
+/// is `0x33` rather than the conversion's `0xff`.
+///
+/// [`GREEN_TEXEL`] is that texel's index in the volume's own f32 array — slice
+/// 1's `(2, 0)`, which is the reading the volume's third axis and a two-slice
+/// upload share only by accident. The index is the volume's own layout, row
+/// major within a slice and slices after one another, which is the order the
+/// upload and the view's depth both state.
+const VOLUME_WIDTH: usize = 4;
+const VOLUME_HEIGHT: usize = 4;
+const VOLUME_DEPTH: usize = 2;
+
+const fn volume_texel(x: usize, y: usize, z: usize) -> usize {
+    (z * VOLUME_HEIGHT + y) * VOLUME_WIDTH + x
+}
+
+const GREEN_TEXEL: usize = volume_texel(2, 0, 1);
+
+fn volume_bytes(moved: bool) -> Vec<u8> {
+    let mut values = [0.0f32; VOLUME_WIDTH * VOLUME_HEIGHT * VOLUME_DEPTH];
+    {
+        let mut set = |x: usize, y: usize, z: usize, value: f32| {
+            values[volume_texel(x, y, z)] = value;
+        };
+        // red: slice 0's own (0, 0); green: slice 1's (2, 0) — a pair that only
+        // agrees with the volume's own third axis, never with a rail that
+        // uploaded one slice or read z as a layer index. blue: slice 0's (0, 2);
+        // alpha: slice 1's (2, 2).
+        set(0, 0, 0, 0.25);
+        set(2, 0, 1, if moved { 0.2 } else { 2.5 });
+        set(0, 2, 0, 0.75);
+        set(2, 2, 1, 0.875);
+    }
+    values
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect()
+}
+
+/// The attachment-covering draw with one **three-dimensional** volume bound
+/// (2026-09-20, the `D3` sampled texture arm): the reviewed position stream, the
+/// fragment stage's own declaration, the AIR static sampler the module carries,
+/// and the bind at the volume's own three extents — the third one travelling as
+/// the bind's `layers`, exactly as the production seam fills it from the
+/// texture descriptor's plane count (`runtime::draw::vulkan`'s volume arm).
+///
+/// The volume's extent is its own `4 x 4 x 2` inside a pass the reviewed window
+/// draws at, so the shape crosses the class's extent rule and the device's
+/// gather bit is read for it just as it is for any other source of another
+/// extent.
+fn sampled_volume_request(
+    stages: &Stages,
+    bytes: Vec<u8>,
+    volume: (u32, u32, u32),
+    format: ash::vk::Format,
+) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    let declaration = stages.fragment_texture_declarations[0];
+    req.sampled_images.push(SampledImageResource {
+        binding: declaration.binding,
+        array_element: 0,
+        descriptor_count: 1,
+        width: volume.0,
+        height: volume.1,
+        layers: volume.2,
+        kind: reims_vgpu_core::texture_shape::TextureKind::D3,
+        multisampled: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
+        byte_origin: Default::default(),
+        format,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    req.samplers
+        .push(sampled_sampler_resource(declaration.sampler_binding));
+    req
+}
+
+/// The three-dimensional volume (2026-09-20, the `D3` sampled texture arm): the
+/// answer comes out of the *frame* on the same terms the lane beside it widens
+/// on, a `D3` bind of a `4 x 4 x 2` single-component float volume reaches the
+/// canonical provider when the frame carries `r32_float` and a window covering
+/// each of its three extents, both rails land the volume's own texels byte for
+/// byte, and the pre-increment device — the frame every census boot so far
+/// carried — keeps the refusal the census counted, door, slug and sentence.
+#[test]
+fn the_volume_is_read_from_the_frame_and_keeps_the_old_window_by_name() {
+    let _guard = engine_test_session();
+    let stages = volume_sample_stages();
+    let (width, height) = extent();
+    // The bind's own statement, as the production seam builds it: the volume's
+    // three extents, the three-dimensional kind, one descriptor, four bytes a
+    // texel — and the third extent in `layers`, which is where the seam's
+    // volume arm puts it.
+    let volume = (4u32, 4u32, 2u32);
+    let frame_for = |moved: bool| {
+        sampled_volume_request(
+            &stages,
+            volume_bytes(moved),
+            volume,
+            ash::vk::Format::R32_SFLOAT,
+        )
+    };
+    // The frame the two rails have to land: slice 0's `0.25` (red) and `0.75`
+    // (blue) beside slice 1's `2.5` (green) and `0.875` (alpha), each clamped by
+    // the attachment's own conversion.
+    let wanted: [u8; 4] = [0x40, 0xff, 0xbf, 0xdf];
+    assert_eq!(
+        [
+            to_unorm8(0.25),
+            to_unorm8(2.5),
+            to_unorm8(0.75),
+            to_unorm8(0.875)
+        ],
+        wanted,
+        "the expectation is the sampled values' own conversion"
+    );
+
+    // The device's own frame states both halves of the answer, read exactly as
+    // the class reads them: one membership question for the volume's lane over
+    // the render-sampler section's format list, and the tail's per-axis window
+    // beside it.
+    let executor =
+        metal_api_vulkan::VulkanExecutor::new().expect("the acceptance environment has a device");
+    let provider = metal_api_vulkan::VulkanComputeProvider::with_executor(executor)
+        .expect("the canonical provider builds");
+    let epoch = provider.device_epoch();
+    let declared =
+        provider_wire::render_texture_dimension_3d_window(epoch, &provider.capabilities())
+            .expect("the capability frame round-trips");
+    assert!(
+        declared.r32f,
+        "the acceptance environment's provider lists the volume's own float lane \
+         (E's 2026-09-20 arm): {declared:?}"
+    );
+    assert!(
+        declared.covers([volume.0, volume.1, volume.2]),
+        "and a window covering each of the fixture's three extents: {declared:?}"
+    );
+
+    // The admitted arm: the bind the census's LPF pipeline states reaches the
+    // provider, and the frame is the volume's own floats' conversion.
+    let delivered = provider_render::provider_submissions();
+    let frame = provider_pixels("volume sampled", &stages, &frame_for(false));
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "a bind the frame lists the lane for, with a window covering all three extents, reaches \
+         the canonical provider"
+    );
+    assert_uniform_frame("volume (provider)", &frame, width, height, wanted);
+    // The reading is exact rather than near: the two rails agree on this
+    // conversion, and the falsifier is a whole byte wide (`2.5`'s own leading
+    // byte is `0x00` against the frame's `0xff`).
+    for (index, texel) in frame.chunks_exact(4).enumerate() {
+        assert_eq!(
+            [texel[0], texel[1], texel[2], texel[3]],
+            wanted,
+            "volume (provider): texel {index} is {}",
+            texel
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
+    assert_ne!(
+        frame[1],
+        volume_bytes(false)[GREEN_TEXEL * 4],
+        "the green lane is the float's converted value, not the texel's first byte"
+    );
+
+    // The engine's own frame for the same request: the rail that ran these
+    // draws before the widening has to land the same bytes, which is what makes
+    // "the class admits the shape" a claim about the two rails and not about
+    // one of them twice.
+    if let Some(engine) = engine_pixels("volume", &stages, frame_for(false)) {
+        assert_eq!(
+            frame.len(),
+            engine.len(),
+            "the two rails land one attachment extent"
+        );
+        assert_eq!(
+            frame, engine,
+            "the provider's frame and the engine's frame are one frame"
+        );
+    }
+
+    // Another volume moves the sampled texel in the *second* slice, so the
+    // reading is the upload — and the third axis — rather than the run.
+    let moved = provider_pixels("volume moved", &stages, &frame_for(true));
+    assert_eq!(
+        moved[0], wanted[0],
+        "the red lane reads slice 0's own texel in both volumes"
+    );
+    assert_ne!(
+        moved[1], wanted[1],
+        "but the green lane follows slice 1's own texel in the moved volume"
+    );
+    if let Some(engine) = engine_pixels("volume moved", &stages, frame_for(true)) {
+        assert_eq!(
+            moved, engine,
+            "the two rails agree about the moved volume too"
+        );
+    }
+
+    // The fail-closed arm: the pre-increment device — every census boot so far
+    // — states no volume lane and no window. The *shape* is still the shape the
+    // reflection and the bind state (that pair is what the class admits), so the
+    // refusal names the door the device's answer belongs to: the *bind* door,
+    // under the volume sentence, at the same point in the same order every
+    // other lane the frame does not list is refused at. Nothing reaches the
+    // provider either way.
+    // The pre-increment frame itself, built here the way the census's own boots
+    // carried it: `r32_float` absent from the format list and the tail's window
+    // section left out (`0`), read back through the same wire.
+    let mut refused = provider.capabilities();
+    refused
+        .supported_render_texture_formats
+        .retain(|format| *format != metal_api_core::provider::TextureFormat::R32Float);
+    refused.max_render_texture_dimension_3d = 0;
+    let silent = provider_wire::render_texture_dimension_3d_window(epoch, &refused)
+        .expect("the shorter frame still round-trips");
+    assert!(
+        !silent.r32f && silent.window == 0,
+        "a frame that drops the window reads as the refusal: {silent:?}"
+    );
+    // One door, one sentence: inside the pre-increment device the *admitted*
+    // extent and an extent past any window are two reads of one sentence, which
+    // is what "the extent moved, the shape did not" means here. The instrument
+    // is unwound before the device's own answer is asked again.
+    let (fail_closed, over_under_the_same_device, delivered) = {
+        let _undeclared = provider_render::override_render_texture_dimension_3d_window(Some(false));
+        let delivered = provider_render::provider_submissions();
+        let detail = |req: &DrawRequest, label: &str| match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            req,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_texture_bind",
+                    "{label}: the door the device's own window weighs at"
+                );
+                reason.detail().to_owned()
+            }
+            other => panic!("{label}: a three-dimensional bind stays on the engine: {other:?}"),
+        };
+        let fail_closed = detail(&frame_for(false), "the volume bind");
+        // One texel past any window: a bind no provider could have created, so
+        // the *extent* alone is refused here — and the sentence it is refused
+        // with is the one above.
+        let over = (declared.window as u32 + 1, 4u32, 2u32);
+        let over_bytes = vec![0u8; over.0 as usize * over.1 as usize * over.2 as usize * 4];
+        let over_under_the_same_device = detail(
+            &sampled_volume_request(&stages, over_bytes, over, ash::vk::Format::R32_SFLOAT),
+            "the over-window bind",
+        );
+        (fail_closed, over_under_the_same_device, delivered)
+    };
+    assert!(
+        fail_closed.contains("its own three-dimensional texture"),
+        "the sentence names the shape this door is about: {fail_closed}"
+    );
+    assert!(
+        fail_closed.contains("no volume texel lane at all"),
+        "and the lane the frame states (here: none): {fail_closed}"
+    );
+    assert!(
+        fail_closed.contains("at most 0 texels"),
+        "and the window it states (here: none): {fail_closed}"
+    );
+    // The bind's own extent is the one thing the two sentences may print
+    // differently — it is the *bind's* fact, not the door's sentence — so the
+    // comparison holds the over-window sentence to the admitted one outside
+    // that number.
+    assert_eq!(
+        over_under_the_same_device.replace("2049x4x2", "4x4x2"),
+        fail_closed,
+        "the sentence is the door's own and does not move with the bind's extent"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a window the device's frame does not state stays on the engine without the provider \
+         seeing it"
+    );
+
+    // The over-window arm proper, against the device's own answer: the widest
+    // volume this provable device admits is the frame's own number, so a bind
+    // one texel past it keeps the same door and states the window it read beside
+    // the extent it refused.
+    let over = (declared.window as u32 + 1, 4u32, 2u32);
+    let over_bytes = vec![0u8; over.0 as usize * over.1 as usize * over.2 as usize * 4];
+    let over_detail = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &sampled_volume_request(&stages, over_bytes, over, ash::vk::Format::R32_SFLOAT),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_bind",
+                "an extent outside the window keeps the bind door's own name"
+            );
+            reason.detail().to_owned()
+        }
+        other => panic!("a volume wider than the device's window stays on the engine: {other:?}"),
+    };
+    assert!(
+        over_detail.contains(&format!("at most {} texels", declared.window)),
+        "and states the window it read: {over_detail}"
+    );
+    assert!(
+        over_detail.contains(&format!("{}x{}x{}", over.0, over.1, over.2)),
+        "beside the extent it refused: {over_detail}"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "and this one never reaches the provider either"
+    );
+
+    // The dimension-mismatch arm: a `D3` reflection beside a `D2` bind is the
+    // shape the class answered *before* the widening, and it keeps that answer
+    // byte for byte — the two halves of the arm are one condition, so a bind the
+    // reflection does not pair with never reaches the volume sentence.
+    let mut mismatched = frame_for(false);
+    mismatched.sampled_images[0].kind = reims_vgpu_core::texture_shape::TextureKind::D2;
+    mismatched.sampled_images[0].layers = 1;
+    match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &mismatched)
+    {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_shape",
+                "the reflection's own door, not the bind's"
+            );
+            let expected = "a fragment stage whose `[[texture(0)]]` is a texture whose dimension \
+                            is not D2 (the reflection states `D3`) stays on the engine: the \
+                            canonical render sampler uploads and samples one single-sample, \
+                            non-arrayed, read-only 2D surface with a float component, and the \
+                            provider refuses every other reflected shape by name; the draw binds \
+                            a D2 view at that argument";
+            assert_eq!(
+                reason.detail(),
+                expected,
+                "the pre-increment sentence, byte for byte"
+            );
+        }
+        other => panic!("a `D3` reflection beside a `D2` bind stays on the engine: {other:?}"),
+    }
+    eprintln!(
+        "2026-09-20 volume: the device's own frame states `r32_float` and a window of {} texels \
+         per axis ({declared:?}); the same snapshot without them reads {silent:?} and its bind \
+         keeps the shape admitted by its reflection and its kind, refused at the bind door under \
+         `render_provider_out_of_class_texture_bind`, while a `D2` bind beside the same \
+         reflection keeps `render_provider_out_of_class_texture_shape` and the reflection's own \
+         sentence",
+        declared.window,
+    );
+}
+
 /// R10: the sampled-texture shapes beside the admitted entry, each under its
 /// own name.
 ///
