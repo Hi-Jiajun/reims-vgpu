@@ -11691,7 +11691,7 @@ fn the_eight_byte_lane_is_read_from_the_frame_and_keeps_the_old_window_by_name()
         &request(texels.clone()),
     );
     assert!(
-        provider_render::provider_submissions() >= delivered + 1,
+        provider_render::provider_submissions() > delivered,
         "a bind the frame lists the lane for reaches the canonical provider"
     );
     assert_uniform_frame(
