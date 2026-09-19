@@ -1042,6 +1042,7 @@ impl ResourcePools {
                 generation: new.generation,
                 content_ready: guest_backed,
                 content_epoch: None,
+                sampled_content_replaced: false,
                 access: if guest_backed {
                     ResidentAccess::GuestBacking
                 } else {
@@ -2043,6 +2044,11 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
+            // The draw this call reports wrote this image, so whatever frame a
+            // sampler might have been refused over before it is gone: the
+            // pixels are now this draw's, which is the newest thing the surface
+            // has.
+            slot.sampled_content_replaced = false;
         }
         self.set_registry_access(identity, access);
         self.set_sole_copy(identity, !guest_backed);
@@ -2318,9 +2324,41 @@ impl ResourcePools {
         match self.registry.get_mut(identity) {
             Some(slot) if slot.content_ready => {
                 slot.content_epoch = Some(epoch);
+                // The stamp is what says the pixels left the image for the
+                // mapping's pages, and a frame that has been copied out is the
+                // surface's own again.
+                slot.sampled_content_replaced = false;
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Record that a frame this image does not hold has replaced the surface's
+    /// content, so no sampler may be served this image until a draw or a store
+    /// makes it current again.
+    ///
+    /// Set at the seams where the canonical provider's answer lands in the
+    /// guest's pages and the host cache and **not** in the engine's image for
+    /// the same identity — the one fact the two other witnesses on this rung
+    /// are silent about: `content_ready` stays true because the image is still
+    /// a complete frame (of an older surface), and the guest-write witness only
+    /// speaks about the guest's own CPU stores. Serving the image there is how
+    /// a compositor gets every engine-drawn layer and none of a provider-drawn
+    /// one.
+    ///
+    /// Returns whether a slot was found; a rail with no slot has no copy to
+    /// refuse, and the ladder below reads the pages anyway.
+    pub(crate) fn registry_mark_sampled_content_replaced(
+        &mut self,
+        identity: &TargetIdentity,
+    ) -> bool {
+        match self.registry.get_mut(identity) {
+            Some(slot) => {
+                slot.sampled_content_replaced = true;
+                true
+            }
+            None => false,
         }
     }
 
@@ -2992,6 +3030,7 @@ pub(super) mod pin_count_tests {
             generation: 1,
             content_ready,
             content_epoch: None,
+            sampled_content_replaced: false,
             // What `registry_mark_ready` actually records, read from the same
             // constant it reads, so this fixture cannot drift into describing a
             // resident no pass produces.

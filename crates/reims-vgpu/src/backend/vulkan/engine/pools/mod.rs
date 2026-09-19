@@ -2218,6 +2218,24 @@ pub(crate) struct ResidentTargetSlot {
     /// epoch 0 ("nothing published since attach") is a legal *mapping* value
     /// and a bare `0 == 0` would match an image that was never stamped at all.
     pub content_epoch: Option<u32>,
+    /// A frame this image does not hold replaced the surface's content.
+    ///
+    /// [`Self::content_epoch`] answers the **LOAD** elision's question — "do
+    /// the mapping's pages agree with this image" — and a draw into the slot
+    /// clears it while leaving the image *current*, because that draw is what
+    /// wrote the pixels. The sampler asks the other question ("are these pixels
+    /// the surface's content") and for that one a cleared stamp is not a
+    /// refusal. What refuses is this flag: it is set by the seams where a rail
+    /// other than this engine published the surface's frame into the guest's
+    /// own pages and the host cache and never into this image, so the image now
+    /// holds a frame the surface has moved past.
+    ///
+    /// Cleared by the two writers that make the image current again — any draw
+    /// into the slot (`registry_mark_ready*`) and any store that vouches for it
+    /// (`registry_stamp_content_epoch`) — and never touched by a reclaim or a
+    /// retire, so a slot that goes away takes the question with it rather than
+    /// leaving a stale answer behind.
+    pub sampled_content_replaced: bool,
     /// What last touched this image, and where that left it. See
     /// [`ResidentAccess`] for why these are one field and not two.
     pub access: ResidentAccess,
@@ -4377,6 +4395,7 @@ mod resident_reuse_tests {
             generation,
             content_ready: false,
             content_epoch: None,
+            sampled_content_replaced: false,
             access: ResidentAccess::Untouched,
             format: translate::pixel::ResidentFormat::of(format),
             pin_count: 0,

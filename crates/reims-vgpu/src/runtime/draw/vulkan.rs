@@ -926,6 +926,23 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                                 crate::runtime::drain::note_store_route(
                                     "mapper_ref_texture_resident_stamp_skipped",
                                 );
+                                // The other seam with the same omission, and the
+                                // same repair: the frame just written into the
+                                // mapping's pages is the provider's, while the
+                                // image under this identity is the one the
+                                // engine last drew. R26 keeps the stamp off it
+                                // for the LOAD elision's sake; the sampling
+                                // ladder reads `content_ready` alone, so the
+                                // replacement is stated here in its own right.
+                                crate::runtime::drain::note_store_route(
+                                    "sampler_resident_replaced",
+                                );
+                                if let Some(identity) =
+                                    mapper_ref_texture_store_identity(state, req, writeback_guest)
+                                {
+                                    crate::backend::vulkan::engine::
+                                        mark_resident_sampled_content_replaced(&identity);
+                                }
                             }
                         }
                         crate::observe::when_verbose(|| {
@@ -1915,10 +1932,36 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // refusal below: nothing was replaced and there is nothing to
                 // merge, so borrowing `_refused` would report a repaint that did
                 // not happen and run a merge for it.
-                if resident_ready && !guest_replaced && !may_bind_resident {
+                // The third thing a resident can be, and the one neither of the
+                // other two witnesses covers: an image this device holds, is
+                // `content_ready` about, and has *no* relation to the surface's
+                // current pixels — because the frame the surface now holds was
+                // published by the canonical provider into the guest's pages and
+                // the host cache, and never into this image. Serving it is what
+                // shows every engine-drawn layer and none of a provider-drawn
+                // one, and neither `content_ready` nor the guest-write verdict
+                // below can see it: the image really is a complete frame, and
+                // the guest really did not write the pages itself.
+                let resident_replaced = resident_ready
+                    && crate::backend::vulkan::engine::resident_sampled_content_replaced(
+                        &resident_id,
+                    );
+                if resident_replaced {
+                    crate::runtime::drain::note_store_route("t11rung_resident_replaced");
+                    if crate::observe::first_sight("sampled_resident_replaced", u64::from(mid)) {
+                        crate::observe::off(format!(
+                            "sampled_resident_replaced mid={mid} {w}x{h} \
+                             (a frame this image does not hold replaced the surface; \
+                             reading its pages instead)"
+                        ));
+                    }
+                }
+                let resident_serves =
+                    resident_rung_serves(resident_ready, resident_replaced, guest_replaced);
+                if resident_serves && !may_bind_resident {
                     note_mapper_ref_texture_sample_rung("t11rung_resident_swizzled", guest_write);
-                } else if resident_ready {
-                    if !guest_replaced {
+                } else if resident_ready && !resident_replaced {
+                    if resident_serves {
                         note_mapper_ref_texture_sample_rung("t11rung_resident", guest_write);
                         let format = resident_id.resident_format();
                         return Some((
@@ -9134,9 +9177,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                             state, mid, m.width, m.height,
                                         );
                                     format!(
-                                        " resident={:?} mapping_epoch={}",
+                                        " resident={:?} replaced={} mapping_epoch={}",
                                         crate::backend::vulkan::engine::resident_content_state(
                                             &identity
+                                        ),
+                                        u8::from(
+                                            crate::backend::vulkan::engine::
+                                                resident_sampled_content_replaced(&identity)
                                         ),
                                         m.surface_content_epoch,
                                     )
@@ -13248,6 +13295,29 @@ fn mapper_ref_texture_resident_is_current(
     mapping_epoch.is_some() && mapping_epoch == resident_epoch
 }
 
+/// Whether the sampling ladder may serve this rail's own copy of a mapping.
+///
+/// Two witnesses decide it and they are not the same question.
+/// `sampled_content_replaced` is this rail's statement that the frame the
+/// surface now holds was published by another rail into the guest's pages and
+/// never into the image — the image is a complete frame of an *older* surface,
+/// so `content_ready` is true and stays true. `guest_replaced` is the guest's
+/// own CPU stores inside the sampled window, which the image cannot know about
+/// and which the merge below repairs rather than refuses.
+///
+/// Named and pure because the failure mode of conflating them is silent and
+/// one-sided: a rail that consults only `content_ready` serves every
+/// engine-drawn layer and none of a provider-drawn one, which is exactly the
+/// login window a user reported as missing its controls until the first click
+/// repainted the surface through the engine.
+fn resident_rung_serves(
+    resident_ready: bool,
+    sampled_content_replaced: bool,
+    guest_replaced: bool,
+) -> bool {
+    resident_ready && !sampled_content_replaced && !guest_replaced
+}
+
 /// Decide whether a mapper-ref-texture LOAD can use its retained target.
 ///
 /// A guest allocation is the serialized texture's own storage, not a cached
@@ -14060,6 +14130,17 @@ fn borrowed_landing_store<M: HostMemory + HostOps>(
         return EncodeStatus::Ok;
     };
     crate::runtime::drain::note_store_route("mapper_ref_texture_resident_stamp_skipped");
+    // The engine's image under this identity holds the frame the *engine* last
+    // drew; what lands below is the provider's frame, in the guest's pages and
+    // the host cache. The sampling ladder binds that image in preference to
+    // everything below it and consults `content_ready` alone, so the omission
+    // has to be stated where it happens or the compositor keeps sampling the
+    // older surface — this rail's own `t11rung_resident` served every frame of
+    // it.
+    crate::runtime::drain::note_store_route("sampler_resident_replaced");
+    if let Some(identity) = mapper_ref_texture_store_identity(state, req, true) {
+        crate::backend::vulkan::engine::mark_resident_sampled_content_replaced(&identity);
+    }
     if c0.mapping_id != 0 {
         let (mid, cw, ch, fmt) = (c0.mapping_id, c0.width, c0.height, c0.format);
         // E-TX13: the arm whose window was cut *without* paying the surface's
@@ -15274,6 +15355,27 @@ mod vulkan_split_tests {
         assert!(!mapper_ref_texture_resident_is_current(Some(0), None));
     }
 
+    /// The sampling ladder's one host-side copy, one input at a time.
+    ///
+    /// The two refusals are not interchangeable, which is why the gate takes
+    /// both: a resident the *guest* wrote over is corrected below by merging
+    /// the image's half into the pages, while one a *provider landing* replaced
+    /// has no half to merge — the pages already hold the newer frame, and the
+    /// ladder must read exactly those. A gate that folded them would either
+    /// merge a frame into itself or keep serving the older image, and the
+    /// second is the reported defect.
+    #[test]
+    fn a_resident_a_provider_replaced_is_not_served_however_clean_the_guest_is() {
+        assert!(resident_rung_serves(true, false, false));
+        assert!(
+            !resident_rung_serves(true, true, false),
+            "a copy a provider landing replaced is served under no guest verdict"
+        );
+        assert!(!resident_rung_serves(true, false, true));
+        assert!(!resident_rung_serves(false, false, false));
+        assert!(!resident_rung_serves(true, true, true));
+    }
+
     /// The elision is exact equality, not "at least as new". A resident stamped
     /// at an older epoch has been overtaken by some writer — a blit, a compute
     /// writeback, a guest CPU write, a sibling geometry's publish — and must
@@ -15309,6 +15411,7 @@ mod vulkan_split_tests {
         use crate::runtime::drain::store_route_count;
         const SKIPPED: &str = "mapper_ref_texture_resident_stamp_skipped";
         const LANDED: &str = "render_provider_borrowed_landing_mapper";
+        const REPLACED: &str = "sampler_resident_replaced";
 
         let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
@@ -15319,6 +15422,7 @@ mod vulkan_split_tests {
             (before.surface_content_epoch, before.content_generation);
         let skipped_before = store_route_count(SKIPPED);
         let landed_before = store_route_count(LANDED);
+        let replaced_before = store_route_count(REPLACED);
 
         let colors = vec![ColorRtRequest {
             mapping_id: mapping,
@@ -15365,6 +15469,16 @@ mod vulkan_split_tests {
             store_route_count(LANDED) - landed_before,
             1,
             "the mapper arm of the landing is what this completion accounts for"
+        );
+        // And the half that is not about the pages at all. A stamp left off is
+        // a refusal the *LOAD* elision reads; the sampling ladder consults
+        // `content_ready`, which this landing leaves true, so the same omission
+        // has to be stated against the sampler or the compositor keeps reading
+        // the image the engine last drew.
+        assert_eq!(
+            store_route_count(REPLACED) - replaced_before,
+            1,
+            "the landing must state the sampling side's own copy as replaced"
         );
     }
 
