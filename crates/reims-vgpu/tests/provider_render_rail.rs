@@ -17441,7 +17441,13 @@ fn the_stage_buffer_door_names_every_fact_between_a_declaration_and_the_provider
     // The reach is not a proof the contract can state: unbounded, or stating
     // no byte range at all.
     let stages = with_fragment(vec![declaration(StageBufferFootprint::Unstated)]);
-    let (slug, detail) = answer("unbounded reach", &stages, &[bind]);
+    // The whole-binding arm is the device's own answer (R48, E-SB3), so the
+    // door this test pins is the one an older frame opens: the read is answered
+    // from a snapshot whose frame carries no such section.
+    let (slug, detail) = {
+        let _without_the_arm = provider_render::override_stage_buffer_binding_range(Some(false));
+        answer("unbounded reach", &stages, &[bind])
+    };
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_footprint");
     assert!(
@@ -18105,6 +18111,242 @@ fn a_folded_pair_leaves_for_the_provider_when_the_device_declares_the_split() {
         engine.len(),
         provider.len(),
         "and that frame is the shape the declared arm compared against"
+    );
+}
+
+/// R48 (E-SB3): a `[[buffer(0)]]` argument whose **reach the translation cannot
+/// state** — this fixture reads its colour from the word the buffer's *own
+/// first word* names — leaves for the provider when the device declares the
+/// whole-binding arm, and keeps the census's own answer, sentence and route when
+/// it does not.
+///
+/// The device this suite runs on declares the arm: its Vulkan snapshot
+/// publishes the bit exactly when the selected device reported
+/// `robustBufferAccess` and was created with it enabled, which is the reading
+/// the contract's `FootprintProof::BindingRange` rests on, and the wire reading
+/// below proves the declaration reaches this rail's gate through the frame. So
+/// the declared arm holds no override — what the class reads is the device's
+/// own answer — and the undeclared arm is the frame an older provider writes,
+/// held through the same instrument the folded pair uses.
+///
+/// Four readings come out of it: the declared arm reaches the provider and
+/// lands the word its own bind names; moving the *table* word moves the frame,
+/// and moving the *index* word moves which word is read, so both halves of the
+/// bind are falsifiable; the provider's frame is the engine's own frame for the
+/// same request, byte for byte; and the undeclared arm still answers the
+/// census's slug and sentence, charging its bucket, with nothing submitted.
+#[test]
+fn a_whole_binding_stage_buffer_leaves_for_the_provider_when_the_device_declares_the_arm() {
+    let _guard = engine_test_session();
+    let mut stages = Stages {
+        air: (
+            fixture("render_vtx_vertex_id_quad.air"),
+            fixture("render_frag_buffer_range.air"),
+        ),
+        vertex_entry: "reims_vertex_id_quad",
+        fragment_entry: "reims_buffer_range_frag",
+        // The vertex stage names its vertices `0..3` from `vertex_id` and reads
+        // no buffer, so the fragment half's `[[buffer(0)]]` keeps its own
+        // index and nothing folds.
+        vertex_attribute_locations: Vec::new(),
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
+        texture_interface_refusals: Vec::new(),
+    };
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
+    assert_eq!(
+        stages.fragment_stage_buffer_declarations,
+        vec![StageBufferDeclaration {
+            index: 0,
+            access: StageBufferAccess::Read,
+            footprint: StageBufferFootprint::Unstated,
+        }],
+        "the fixture's translation states no reach for its one `[[buffer(0)]]`"
+    );
+    assert!(
+        stages.vertex_stage_buffer_declarations.is_empty(),
+        "the vertex half declares no buffer at all"
+    );
+
+    // The device's own answer, read the way the class gate reads it: out of
+    // the response frame the provider would send.
+    let probe = VulkanComputeProvider::with_executor(
+        VulkanExecutor::new().expect("the acceptance environment has a Vulkan device"),
+    )
+    .expect("the canonical provider builds");
+    let declared =
+        provider_wire::stage_buffer_binding_range(probe.device_epoch(), &probe.capabilities())
+            .expect("the capability answer encodes and decodes");
+    eprintln!("wire capability answer: whole-binding arm declared={declared}");
+    assert!(
+        declared,
+        "the acceptance device declares the whole-binding arm"
+    );
+
+    // The bind: its first word is the index the stage reads (the integer the
+    // module masks, not a float), and the words behind it are the payload — the
+    // four-byte words the fragment bitcasts into its red channel.
+    let bind = |index: i32, table: &[f32]| {
+        let mut bytes = index.to_ne_bytes().to_vec();
+        for word in table {
+            bytes.extend_from_slice(&word.to_ne_bytes());
+        }
+        BufferContent::Bytes(std::sync::Arc::new(bytes))
+    };
+    let request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes.clear();
+        // A clear the class admits and the draw does not cover, so a texel the
+        // triangle misses reads differently from one it drew black.
+        req.color_attachment = Some(attachment_with_clear(
+            MTL_FORMAT_RGBA8_UNORM,
+            [64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0],
+        ));
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    let frame = |label: &str, content: &BufferContent| {
+        let binds = [staged_bind(RenderPipelineStage::Fragment, 0, content)];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(content),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a whole-binding stage buffer is in class on a device that declares the \
+                 arm: {other:?}"
+            ),
+        }
+    };
+
+    // The vertex half the rail executes covers the attachment's lower-left
+    // triangle, so the texel the fragment's own word paints is read off the
+    // frame rather than assumed: the first texel that is not the clear colour.
+    let clear = [64, 128, 191, 255];
+    let painted = |label: &str, frame: &[u8]| -> [u8; 4] {
+        let texel = frame
+            .chunks_exact(4)
+            .find(|texel| *texel != clear)
+            .unwrap_or_else(|| panic!("{label}: the draw covers no texel at all"));
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+
+    // The declared arm. The buffer's first word is the integer `1` — the index
+    // the module masks — and the word behind it is `0.25`, so the fragment's
+    // red channel is that word's own bits through the attachment's
+    // quantisation.
+    let delivered = provider_render::provider_submissions();
+    let bucket_before = route_count("render_provider_out_of_class_stage_buffer_footprint");
+    let quarter = bind(1, &[0.0, 0.25, 0.0, 0.0]);
+    let provider = frame("whole-binding arm, quarter red", &quarter);
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the draw reaches the canonical provider rather than the engine"
+    );
+    assert_texel_count("whole-binding arm", &provider);
+    eprintln!(
+        "whole-binding arm: painted texel {:?} from the word the bind's own index names, {} bytes",
+        painted("whole-binding arm", &provider),
+        provider.len(),
+    );
+    assert_eq!(
+        painted("whole-binding arm", &provider),
+        [64, 0, 0, 255],
+        "the fragment lands the word the bind's own first word names"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_footprint"),
+        bucket_before,
+        "an admitted whole-binding draw charges no footprint bucket"
+    );
+
+    // The *table* word decides the colour: the same index, a different payload.
+    let full = bind(1, &[0.0, 1.0, 0.0, 0.0]);
+    let bright = frame("whole-binding arm, full red", &full);
+    assert_eq!(
+        painted("whole-binding arm, full red", &bright),
+        [255, 0, 0, 255],
+        "the payload word is what the frame carries"
+    );
+    assert_frames_differ(
+        "the bind's own payload word decides the colour",
+        &provider,
+        &bright,
+    );
+
+    // The *index* word decides which word is read: the same table, and the only
+    // byte that moved is the request's own first word — the entry it names is
+    // black rather than red.
+    let moved = bind(2, &[0.0, 1.0, 0.0, 0.0]);
+    let selected = frame("whole-binding arm, index two", &moved);
+    eprintln!(
+        "whole-binding arm, index two: painted texel {:?}",
+        painted("whole-binding arm, index two", &selected)
+    );
+    assert_eq!(
+        painted("whole-binding arm, index two", &selected),
+        [0, 0, 0, 255],
+        "the index word selects the entry the module reads"
+    );
+    assert_frames_differ(
+        "the index word decides which word paints the texel",
+        &bright,
+        &selected,
+    );
+
+    // Both rails land the same frame for the same request: the engine reads the
+    // same bytes through the same bounds, which is what "the arm adds no fact
+    // the platform does not carry" means on a device that carries it.
+    let Some(engine) = engine_pixels("whole-binding arm", &stages, request(&quarter)) else {
+        return;
+    };
+    assert_frames_equal("whole-binding arm", &provider, &engine);
+    eprintln!("whole-binding arm: the provider's frame is the engine's, byte for byte");
+
+    // The undeclared arm: the same request, a provider whose frame carries no
+    // such section — which is what every frame written before E-SB3 decodes as.
+    // The draw keeps the census's own answer, sentence, route and engine.
+    let _undeclared = provider_render::override_stage_buffer_binding_range(Some(false));
+    let bucket_before = route_count("render_provider_out_of_class_stage_buffer_footprint");
+    let delivered = provider_render::provider_submissions();
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &quarter)];
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(&quarter),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("whole-binding arm, undeclared device: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_footprint",
+                "the undeclared device keeps the census's slug: {reason}"
+            );
+            let detail = reason.detail();
+            assert!(
+                detail.contains("[[buffer(0)]]")
+                    && detail.contains("unbounded")
+                    && detail.contains("bound nothing states"),
+                "the census's sentence, unchanged: {detail}"
+            );
+        }
+        other => panic!("an undeclared provider keeps the shape on the engine: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_footprint"),
+        bucket_before + 1,
+        "and charges the footprint slug exactly once"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "with nothing submitted: the answer is the class's, not a decline taken back from the \
+         provider"
     );
 }
 
@@ -21698,7 +21940,15 @@ fn an_affine_stage_buffer_footprint_is_bounded_by_the_draw() {
             other => panic!("{label}: an unevaluable affine proof stays on the engine: {other:?}"),
         }
     };
-    let (slug, detail) = refuses("unbounded reach", StageBufferFootprint::Unstated);
+    // The whole-binding arm is the *device's* own answer (R48, E-SB3), and
+    // this device declares it: what this test pins is the census's refusal for
+    // a reach nothing states, which is the answer a frame without the arm's
+    // section gives — so the read is answered from such a snapshot, written,
+    // encoded and decoded through the same frame.
+    let (slug, detail) = {
+        let _without_the_arm = provider_render::override_stage_buffer_binding_range(Some(false));
+        refuses("unbounded reach", StageBufferFootprint::Unstated)
+    };
     eprintln!("affine refusal, unbounded: slug={slug} detail={detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_footprint");
     assert!(
@@ -21914,7 +22164,12 @@ fn a_non_indexed_affine_stage_buffer_footprint_is_bounded_by_the_draw() {
             other => panic!("{label}: an unevaluable affine proof stays on the engine: {other:?}"),
         }
     };
-    let (slug, detail) = refuses("unbounded reach", StageBufferFootprint::Unstated);
+    // As above: the arm is the device's, so the census's refusal is read from a
+    // frame that carries no such section (R48, E-SB3).
+    let (slug, detail) = {
+        let _without_the_arm = provider_render::override_stage_buffer_binding_range(Some(false));
+        refuses("unbounded reach", StageBufferFootprint::Unstated)
+    };
     eprintln!("non-indexed affine refusal, unbounded: slug={slug} detail={detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_footprint");
     assert!(
