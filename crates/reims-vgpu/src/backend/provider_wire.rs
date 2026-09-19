@@ -392,6 +392,94 @@ pub struct OneDimensionSupport {
     pub window: u64,
 }
 
+/// The three-dimensional sampled window and the lane it carries, read out of
+/// the same capability frame (2026-09-20, the `D3` sampled texture arm).
+///
+/// [`render_texture_one_dimension_window`]'s sibling two axes over, and the
+/// fifteenth reading of the same one-snapshot rule: the frame states two facts
+/// about the arm — whether its section's format list carries `r32_float` (the
+/// lane the census's volumes are), and how large a volume the snapshot admits
+/// per axis (`max_render_texture_dimension_3d`, the tail's own `0x00 0x0D`
+/// section) — and they are one answer rather than two questions, because a lane
+/// without a window names no volume and a window without a lane names no texels.
+///
+/// The window is **per axis**, not a texel count: Vulkan's
+/// `maxImageDimension3D` bounds a `TYPE_3D` image's width, height *and* depth,
+/// so a caller holds each of the bind's three extents to it rather than their
+/// product — which is the one way this reading differs from the
+/// one-dimensional window's own.
+///
+/// `false`/`0` is the fail-closed reading of each half, and it is what a frame
+/// written before the arm existed decodes to: the lane is absent from an older
+/// list, and the section itself is absent from an older tail — the tag is the
+/// escape family's own, so a decoder that predates it answers [`WireDecline`]
+/// rather than a value, and a decoder that carries the tag reads `0` out of a
+/// frame that ends before it. A device that states either half as its default
+/// is a device that keeps its own refusal by name for the shape.
+pub fn render_texture_dimension_3d_window(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<VolumeSupport, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(VolumeSupport {
+        r32f: decoded
+            .supported_render_texture_formats
+            .contains(&TextureFormat::R32Float),
+        window: decoded.max_render_texture_dimension_3d,
+    })
+}
+
+/// The two facts one provider's frame states about its three-dimensional
+/// sampled window, one value each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VolumeSupport {
+    /// Whether the frame's format list carries `r32_float`.
+    pub r32f: bool,
+    /// The largest extent the frame admits on **each** of a volume's three
+    /// axes; `0` for a frame that does not carry the section at all.
+    pub window: u64,
+}
+
+impl VolumeSupport {
+    /// The answer a device that states neither the lane nor the window gives,
+    /// which is also what every request whose binds name no volume reads: the
+    /// class gate then answers exactly as it did before this increment.
+    pub const NONE: Self = Self {
+        r32f: false,
+        window: 0,
+    };
+
+    /// The contract format this device's answer states for one bind's own
+    /// Vulkan view of a volume lane, or `None` when the frame does not list it.
+    ///
+    /// `r32_float` alone, for the reason the one-dimensional window names its
+    /// own two lanes and no others: a volume whose texel is another format is a
+    /// shape this arm does not state, and the census's own volumes are
+    /// single-component floats (`texture3d<float, sample>`). The three-axis
+    /// window beside the lane is a limit rather than a second format, which is
+    /// why a lane the frame lists is still refused by the same door when the
+    /// bind's extents fall outside it.
+    pub const fn admits(self, format: ash::vk::Format) -> Option<TextureFormat> {
+        match format {
+            ash::vk::Format::R32_SFLOAT if self.r32f => Some(TextureFormat::R32Float),
+            _ => None,
+        }
+    }
+
+    /// Whether this window covers one volume's own three extents.
+    ///
+    /// One comparison per axis, exactly as the provider's own
+    /// `maxImageDimension3D` rule reads: a volume is inside the window when
+    /// each of its extents is, and the product is not the question — a device
+    /// that admits `2048` texels per axis admits `2048 x 2048 x 2048` as far as
+    /// this rule is concerned, and its own `maxResourceSize` is a different
+    /// question the sampled arm never asks.
+    pub const fn covers(self, extents: [u32; 3]) -> bool {
+        let [width, height, depth] = extents;
+        width as u64 <= self.window && height as u64 <= self.window && depth as u64 <= self.window
+    }
+}
+
 /// The runtime-sampler half of the same render-sampler section (R36).
 ///
 /// The fifth reading of the one-snapshot rule ([`stage_buffer_support`],
