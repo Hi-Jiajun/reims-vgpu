@@ -11757,6 +11757,351 @@ fn the_eight_byte_lane_is_read_from_the_frame_and_keeps_the_old_window_by_name()
     );
 }
 
+/// The one-dimensional LUT shape (2026-09-19, census b10's `texture_shape`
+/// bucket): the reviewed vertex stage beside a fragment stage whose
+/// `[[texture(0)]]` is declared `texture1d_array<float, sample>` and sampled at
+/// two texel centres of its own single row.
+///
+/// The declarations are the *production* walk over the fixture's own
+/// translation, exactly as [`sampled_stages`]' are, so what the gate is asked
+/// about is what the translator of the same AIR reports.
+fn one_dim_lut_stages() -> Stages {
+    sampled_fragment_stages("render_frag_sampled_1d_array.air", "reims_one_dim_lut_frag")
+}
+
+/// The eight texels of the fixture's row, at each lane's own texel width: red
+/// reads texel 0 (`0.25`) and green texel 4 (`2.5`, whose own encoding is
+/// `00 00 20 40` — the falsifier every other lane's fixture states one width
+/// over).
+fn one_dim_lut_bytes(format: ash::vk::Format, moved: bool) -> Vec<u8> {
+    let values: [f32; 8] = [
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        // The green lane's own texel: `2.5` in the primary LUT (whose leading
+        // byte `0x00` is the falsifier) and a plain `0.2` in the moved one, so
+        // the moved frame's green byte is `0x33` rather than the clamp's
+        // `0xff`.
+        if moved { 0.2 } else { 2.5 },
+        -0.5,
+        0.6,
+        0.0,
+    ];
+    assert!(
+        matches!(
+            format,
+            ash::vk::Format::R32_SFLOAT | ash::vk::Format::R16_SFLOAT
+        ),
+        "{format:?} is not a one-dimensional float lane"
+    );
+    match format {
+        ash::vk::Format::R32_SFLOAT => values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect(),
+        _ => values
+            .iter()
+            .flat_map(|value| half_bits(*value).to_le_bytes())
+            .collect(),
+    }
+}
+
+/// The IEEE 754 binary16 encoding of one of the fixture's values, by the same
+/// arithmetic the frame expectation assumes, with the conversion round trip
+/// asserted (a half carries fewer significant bits than an `f32`, so the byte
+/// the value converts to is what has to agree, not the value itself).
+fn half_bits(value: f32) -> u16 {
+    let half = half_from_f32(value);
+    assert_eq!(
+        to_unorm8(f32_from_half(half)),
+        to_unorm8(value),
+        "the fixture's values have to convert to the byte their own expectation states"
+    );
+    half
+}
+
+/// The binary16 encoding of `value` (round to nearest, ties to even).
+fn half_from_f32(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    if bits & 0x7fff_ffff == 0 {
+        return sign;
+    }
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x7f_ffff;
+    assert!(exponent > 0, "the fixture encodes no subnormal halves");
+    assert!(exponent < 0x1f, "the fixture's values fit in binary16");
+    let rounded = mantissa + 0x0fff + u32::from(mantissa & 0x1fff > 0x1000);
+    let (exponent, mantissa) = if rounded >= 0x80_0000 {
+        (exponent + 1, 0)
+    } else {
+        (exponent, rounded)
+    };
+    sign | ((exponent as u16) << 10) | ((mantissa >> 13) as u16)
+}
+
+/// The `f32` a binary16 encoding names, by the same arithmetic
+/// [`half_from_f32`] inverts.
+fn f32_from_half(half: u16) -> f32 {
+    let sign = if half & 0x8000 != 0 { -1.0_f32 } else { 1.0 };
+    let exponent = ((half >> 10) & 0x1f) as i32;
+    let mantissa = f32::from(half & 0x3ff);
+    if exponent == 0 {
+        return sign * mantissa * 2.0_f32.powi(-24);
+    }
+    sign * (1.0 + mantissa / 1024.0) * 2.0_f32.powi(exponent - 15)
+}
+
+/// The API's own float-to-unorm conversion of a sampled value; none of the
+/// fixture's values lands on a tie.
+fn to_unorm8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// The attachment-covering draw with one **one-dimensional** LUT bound
+/// (2026-09-19, census b10's `texture_shape` bucket): the reviewed position
+/// stream, the fragment stage's own declaration, the AIR static sampler the
+/// module carries, and the bind at the lane's own texel width.
+///
+/// The LUT's extent is its own single row — 8x1 in a pass the reviewed window
+/// draws at — which is the census's shape exactly (a `16384x1` colour-transfer
+/// table in a 1920x1080 pass) one scale down. That arm crosses the class's
+/// extent rule, so the device's gather bit is read for it just as it is for any
+/// other source of another extent.
+fn sampled_one_dim_request(
+    stages: &Stages,
+    bytes: Vec<u8>,
+    lut: (u32, u32),
+    format: ash::vk::Format,
+) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    let declaration = stages.fragment_texture_declarations[0];
+    req.sampled_images.push(SampledImageResource {
+        binding: declaration.binding,
+        array_element: 0,
+        descriptor_count: 1,
+        width: lut.0,
+        height: lut.1,
+        layers: 1,
+        kind: reims_vgpu_core::texture_shape::TextureKind::D1Array,
+        multisampled: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
+        byte_origin: Default::default(),
+        format,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    req.samplers
+        .push(sampled_sampler_resource(declaration.sampler_binding));
+    req
+}
+
+/// The one-dimensional LUT (2026-09-19, census b10's `texture_shape` bucket):
+/// the answer comes out of the *frame* on the same terms the lane widens beside
+/// it, a `D1Array` bind of a single-row float LUT reaches the canonical
+/// provider when the frame carries the lane and a window wide enough for the
+/// row, both rails land the LUT's own texels byte for byte, and the
+/// pre-increment device — the frame every census boot so far carried — keeps the
+/// refusal sentence the census counted, byte for byte.
+#[test]
+fn the_one_dimensional_lut_is_read_from_the_frame_and_keeps_the_old_window_by_name() {
+    let _guard = engine_test_session();
+    let stages = one_dim_lut_stages();
+    let (width, height) = extent();
+    // The bind's own statement, as the production seam builds it: the LUT's
+    // single row, the arrayed one-dimensional kind, one slice, one descriptor,
+    // four bytes a texel.
+    let lut = (8u32, 1u32);
+    let frame_for = |moved: bool| {
+        sampled_one_dim_request(
+            &stages,
+            one_dim_lut_bytes(ash::vk::Format::R32_SFLOAT, moved),
+            lut,
+            ash::vk::Format::R32_SFLOAT,
+        )
+    };
+    // The frame the two rails have to land: texel 0's `0.25` and texel 4's
+    // `2.5` (clamped by the attachment's own conversion), with the fragment's
+    // blue and alpha constants beside them.
+    let wanted: [u8; 4] = [0x40, 0xff, 0x00, 0xff];
+    assert_eq!(
+        [
+            to_unorm8(0.25),
+            to_unorm8(2.5),
+            to_unorm8(0.0),
+            to_unorm8(1.0)
+        ],
+        wanted,
+        "the expectation is the sampled values' own conversion"
+    );
+
+    // The device's own frame states both halves of the answer, read exactly as
+    // the class reads them: one membership question per lane over the
+    // render-sampler section's format list, and the tail's one-dimensional
+    // window beside them.
+    let executor =
+        metal_api_vulkan::VulkanExecutor::new().expect("the acceptance environment has a device");
+    let provider = metal_api_vulkan::VulkanComputeProvider::with_executor(executor)
+        .expect("the canonical provider builds");
+    let epoch = provider.device_epoch();
+    let declared =
+        provider_wire::render_texture_one_dimension_window(epoch, &provider.capabilities())
+            .expect("the capability frame round-trips");
+    assert!(
+        declared.r32f && declared.r16f,
+        "the acceptance environment's provider lists both one-dimensional float lanes \
+         (E's 2026-09-19 widening): {declared:?}"
+    );
+    assert!(
+        declared.window >= u64::from(lut.0),
+        "and a window wide enough for the fixture's row: {declared:?}"
+    );
+
+    // The admitted arm: the same bind the census's 215 records state reaches
+    // the provider, and the frame is the LUT's own floats' conversion.
+    let delivered = provider_render::provider_submissions();
+    let frame = provider_pixels("one-dim lut sampled", &stages, &frame_for(false));
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "a bind the frame lists the lane and a wide-enough window for reaches the canonical \
+         provider"
+    );
+    assert_uniform_frame("one-dim lut (provider)", &frame, width, height, wanted);
+    // The reading is exact rather than near: the two rails agree on this
+    // conversion, and the falsifier is a whole byte wide (`2.5`'s own leading
+    // byte is `0x00` against the frame's `0xff`).
+    for (index, texel) in frame.chunks_exact(4).enumerate() {
+        assert_eq!(
+            [texel[0], texel[1], texel[2], texel[3]],
+            wanted,
+            "one-dim lut (provider): texel {index} is {}",
+            texel
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
+    assert_ne!(
+        frame[1],
+        one_dim_lut_bytes(ash::vk::Format::R32_SFLOAT, false)[16],
+        "the green lane is the float's converted value, not the texel's first byte"
+    );
+
+    // The engine's own frame for the same request: the rail that ran these
+    // draws before the widening has to land the same bytes, which is what makes
+    // "the class admits the shape" a claim about the two rails and not about
+    // one of them twice.
+    if let Some(engine) = engine_pixels("one-dim lut", &stages, frame_for(false)) {
+        assert_eq!(
+            frame.len(),
+            engine.len(),
+            "the two rails land one attachment extent"
+        );
+        assert_eq!(
+            frame, engine,
+            "the provider's frame and the engine's frame are one frame"
+        );
+    }
+
+    // Another LUT moves the sampled texel, so the reading is the upload and not
+    // the run.
+    let moved = provider_pixels("one-dim lut moved", &stages, &frame_for(true));
+    assert_eq!(
+        moved[0], wanted[0],
+        "the red lane reads texel 0 in both LUTs"
+    );
+    assert_ne!(
+        moved[1], wanted[1],
+        "but the green lane follows texel 4 in the moved LUT"
+    );
+    if let Some(engine) = engine_pixels("one-dim lut moved", &stages, frame_for(true)) {
+        assert_eq!(moved, engine, "the two rails agree about the moved LUT too");
+    }
+
+    // The two lanes the census states are the two the same fixture runs over:
+    // the bind's texel width is its own fact, and the frame is the same one.
+    let half = sampled_one_dim_request(
+        &stages,
+        one_dim_lut_bytes(ash::vk::Format::R16_SFLOAT, false),
+        lut,
+        ash::vk::Format::R16_SFLOAT,
+    );
+    let half_frame = provider_pixels("one-dim lut (r16_float)", &stages, &half);
+    assert_eq!(
+        half_frame, frame,
+        "the half-float lane lands the same frame: the LUT's values are the same numbers"
+    );
+
+    // The fail-closed arm: the pre-increment device — every census boot so far
+    // — states neither lane and no window. The *shape* is still the shape the
+    // reflection and the bind state (that pair is what the class admits), so the
+    // refusal names the door the device's answer belongs to: the *bind* door,
+    // under the one-dimensional sentence, at the same point in the same order
+    // every other lane the frame does not list is refused at. Nothing reaches
+    // the provider either way.
+    let _undeclared = provider_render::override_render_texture_one_dimension_window(Some(false));
+    // The pre-increment frame itself, built here the way the census's own
+    // boots carried it: the two codes absent from the format list and the
+    // tail's window section left out (`0`), read back through the same wire.
+    let mut refused = provider.capabilities();
+    refused.supported_render_texture_formats.retain(|format| {
+        !matches!(
+            format,
+            metal_api_core::provider::TextureFormat::R32Float
+                | metal_api_core::provider::TextureFormat::R16Float
+        )
+    });
+    refused.max_render_texture_dimension_1d = 0;
+    let silent = provider_wire::render_texture_one_dimension_window(epoch, &refused)
+        .expect("the shorter frame still round-trips");
+    assert!(
+        !silent.r32f && !silent.r16f && silent.window == 0,
+        "a frame that drops the window reads as the refusal: {silent:?}"
+    );
+    let delivered = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &frame_for(false),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_bind",
+                "the door the device's own window weighs at"
+            );
+            let detail = reason.detail();
+            assert!(
+                detail.contains("one single-row LUT"),
+                "the sentence names the shape this door is about: {detail}"
+            );
+            assert!(
+                detail.contains("no one-dimensional texel lane at all"),
+                "and the window the frame states (here: neither lane): {detail}"
+            );
+            assert!(
+                detail.contains("at most 0 texels"),
+                "and the width it states (here: none): {detail}"
+            );
+            eprintln!("one-dim door (undeclared device): {}", reason.slug());
+        }
+        other => panic!("a one-dimensional bind stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a window the device's frame does not state stays on the engine without the provider \
+         seeing it"
+    );
+    eprintln!(
+        "2026-09-19 one-dimensional LUT: the device's own frame states both lanes and a window \
+         of {} texels ({declared:?}); the same snapshot without them reads {silent:?} and its \
+         bind keeps the shape admitted by its reflection and its kind, refused at the bind door \
+         under `render_provider_out_of_class_texture_bind`",
+        declared.window,
+    );
+}
+
 /// R10: the sampled-texture shapes beside the admitted entry, each under its
 /// own name.
 ///

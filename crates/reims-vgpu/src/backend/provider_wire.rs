@@ -269,6 +269,58 @@ pub fn render_texture_rgba16f_lane(
         .contains(&TextureFormat::Rgba16Float))
 }
 
+/// The one-dimensional sampled window and the two lanes it carries, read out of
+/// the same capability frame (`research/docs/23` §119, census b10's
+/// `texture_shape` bucket).
+///
+/// The twelfth reading of the same one-snapshot rule ([`stage_buffer_support`],
+/// [`compute_texture_support`], [`render_texture_support`],
+/// [`render_texture_narrow_lanes`], [`render_texture_rgba16f_lane`], …), and the
+/// one the one-dimensional arm needs: the frame states three facts about it —
+/// whether its section's format list carries `r32_float`, whether it carries
+/// `r16_float`, and how wide a single-row LUT the snapshot admits
+/// (`max_render_texture_dimension_1d`, the tail's own `0x00 0x0A` section) — and
+/// they are one answer rather than three questions: a lane without a window
+/// names no width, and a window without a lane names no texels.
+///
+/// `false`/`0` is the fail-closed reading of each half, and it is what a frame
+/// written before the arm existed decodes to: the two format codes are absent
+/// from an older list (and a decoder that met one refuses the frame by unknown
+/// code rather than reading another format), and the section itself is absent
+/// from an older tail — the tag is the escape family's next one, so a decoder
+/// that predates it answers [`WireDecline`] rather than a value, and a decoder
+/// that carries the tag reads `0` out of a frame that ends before it. A device
+/// that states none of the three is a device that keeps its own refusal by name
+/// for the shape.
+pub fn render_texture_one_dimension_window(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<OneDimensionSupport, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(OneDimensionSupport {
+        r32f: decoded
+            .supported_render_texture_formats
+            .contains(&TextureFormat::R32Float),
+        r16f: decoded
+            .supported_render_texture_formats
+            .contains(&TextureFormat::R16Float),
+        window: decoded.max_render_texture_dimension_1d,
+    })
+}
+
+/// The three facts one provider's frame states about its one-dimensional
+/// sampled window, one value each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OneDimensionSupport {
+    /// Whether the frame's format list carries `r32_float`.
+    pub r32f: bool,
+    /// Whether the same list carries `r16_float`.
+    pub r16f: bool,
+    /// The widest single-row LUT the frame admits, in texels of that row; `0`
+    /// for a frame that does not carry the section at all.
+    pub window: u64,
+}
+
 /// The runtime-sampler half of the same render-sampler section (R36).
 ///
 /// The fifth reading of the one-snapshot rule ([`stage_buffer_support`],
