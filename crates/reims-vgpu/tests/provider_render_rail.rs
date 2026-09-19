@@ -193,6 +193,18 @@ fn vec4_stages() -> Stages {
     stages("reims_indexed_tri_vec4.air", "reims_vec4_vertex", &[0])
 }
 
+/// The scalar twin of the reviewed shape (2026-09-20, census v46's
+/// `vertex_format` bucket): the same `float2` position at location 0, plus a
+/// *scalar* `float` at location 1 whose value divides it — the member shape the
+/// canonical contract's appended `float32x1` lane pairs with.
+fn scalar_stages() -> Stages {
+    stages(
+        "reims_indexed_tri_scalar.air",
+        "reims_scalar_vertex",
+        &[0, 1],
+    )
+}
+
 /// The four-stream shape — the widest interface the canonical contract can
 /// state (`max_vertex_buffers`): position at location 0 and three offsets after
 /// it, all read by the vertex stage.
@@ -1037,6 +1049,64 @@ fn small_request_with_vertex_storage(storage: u32, stride: u32, bytes: Vec<u8>) 
     request.width = ASYMMETRIC_WIDTH;
     request.height = ASYMMETRIC_HEIGHT;
     request
+}
+
+/// The reviewed request shape with a *second* attribute at location 1
+/// (2026-09-20, census v46's `vertex_format` bucket): the `float2` position the
+/// caller states (a record of `stride` bytes, `offset` zero), beside one
+/// attribute whose storage the caller states. The scalar lane is the shape that
+/// needs it — the storage it widens is a scalar, so it cannot be spelled by
+/// reinterpreting the position stream's own declaration.
+fn request_with_trailing_storage(
+    position: &[u8],
+    storage: u32,
+    stride: u32,
+    bytes: Vec<u8>,
+) -> DrawRequest {
+    let specs = [StreamSpec {
+        location: 0,
+        offset: 0,
+        stride: 8,
+        bytes: position.to_vec(),
+    }];
+    let mut request = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &specs);
+    request.vertex_attributes.push(VertexAttributeResource {
+        location: 1,
+        binding: 1,
+        format: VertexAttributeFormat::parse(storage).expect("a protocol vertex format"),
+        offset: 0,
+        stride,
+        step_function: VertexStepFunction::PerVertex,
+        step_rate: 1,
+        content: BufferContent::Bytes(std::sync::Arc::new(bytes)),
+    });
+    request
+}
+
+/// [`request_with_trailing_storage`] over the y-asymmetric positions, at the 8x4
+/// attachment the y-convention helpers read: the shape whose frame can be held
+/// against Metal's own mapping texel by texel, and whose coverage leaves both
+/// populations present (the reviewed full-screen triangle covers the whole
+/// attachment, which that comparison refuses by construction).
+fn asymmetric_request_with_trailing_storage(
+    storage: u32,
+    stride: u32,
+    bytes: Vec<u8>,
+) -> DrawRequest {
+    let mut request =
+        request_with_trailing_storage(&f32x2(&ASYMMETRIC_VERTICES), storage, stride, bytes);
+    request.width = ASYMMETRIC_WIDTH;
+    request.height = ASYMMETRIC_HEIGHT;
+    request
+}
+
+/// Scalar `float32` records: one little-endian float per vertex.
+fn f32x1(records: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() * 4);
+    for value in records {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+    out
 }
 
 /// `MTLVertexFormat::Float2`.
@@ -9558,6 +9628,141 @@ fn the_four_component_normalized_storages_land_the_same_bytes_on_both_rails() {
         "unorm8x4 / unorm16x4 landed the same bytes on both rails; moving the fourth component \
          alone moved the frame"
     );
+}
+
+/// The scalar `float32` vertex lane, drawn for real (2026-09-20, census v46's
+/// `vertex_format` bucket).
+///
+/// The canonical contract appended `float32x1` because the census's remaining
+/// `vertex_format` refusals declare `MTL_VERTEX_FORMAT_FLOAT` and nothing else
+/// — the window's own equality (`vertex_format_float` = the bucket, 8 = 8 and
+/// 16 = 16) is what makes that the single axis. `reims_indexed_tri_scalar.air`
+/// reads that storage as a scalar member and divides its position by it, so the
+/// reading is threefold:
+///
+/// * `w = 1` draws the y-asymmetric triangle as it stands, and the canonical
+///   provider and the self-contained engine land it byte for byte — against the
+///   Metal mapping derived from neither rail's viewport;
+/// * `w = 1.5` shrinks the same vertices: a request that moved *only* the
+///   scalar, which a rail that dropped the fetch cannot land;
+/// * the lane is still counted under `vertex_format_float`, the name R-VF1's
+///   readout gave it, so the widening does not move the census's key.
+#[test]
+fn the_scalar_float_lane_lands_the_same_bytes_on_both_rails() {
+    use reims_vgpu_core::vertex_format as mtl;
+
+    let _guard = engine_test_session();
+    let stages = scalar_stages();
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+
+    let route_before = count("vertex_format_float");
+    let reviewed = asymmetric_request_with_trailing_storage(
+        mtl::MTL_VERTEX_FORMAT_FLOAT,
+        4,
+        f32x1(&[1.0, 1.0, 1.0]),
+    );
+    let reviewed_frame = provider_pixels("float32x1", &stages, &reviewed);
+    assert_eq!(
+        count("vertex_format_float"),
+        route_before + 1,
+        "the scalar lane keeps the route name the census counted before the widening"
+    );
+    assert_frame_is_the_metal_mapping("float32x1", &reviewed_frame, ASYMMETRIC_VERTICES);
+    let Some(engine_reviewed) = engine_pixels("float32x1", &stages, reviewed) else {
+        return;
+    };
+    assert_frames_equal(
+        "float32x1 (engine against provider)",
+        &engine_reviewed,
+        &reviewed_frame,
+    );
+
+    // The divisor is the only thing that moved. `1.5` keeps every pixel centre
+    // off the shrunk triangle's edges (the asymmetric triangle's own edges miss
+    // them, and 1/1.5 lands the vertical at -2/3 and the hypotenuse on
+    // y = -x/2 + 1/3, neither of which a centre shares).
+    let shrunk = asymmetric_request_with_trailing_storage(
+        mtl::MTL_VERTEX_FORMAT_FLOAT,
+        4,
+        f32x1(&[1.5, 1.5, 1.5]),
+    );
+    let shrunk_frame = provider_pixels("float32x1, divisor moved", &stages, &shrunk);
+    assert_frames_differ("float32x1, divisor moved", &shrunk_frame, &reviewed_frame);
+    assert_frame_is_the_metal_mapping(
+        "float32x1, divisor moved",
+        &shrunk_frame,
+        [(-1.0 / 1.5, 0.0), (1.0 / 1.5, 0.0), (-1.0 / 1.5, 1.0 / 1.5)],
+    );
+    let Some(engine_shrunk) = engine_pixels("float32x1, divisor moved", &stages, shrunk) else {
+        return;
+    };
+    assert_frames_equal(
+        "float32x1, divisor moved (engine against provider)",
+        &engine_shrunk,
+        &shrunk_frame,
+    );
+    eprintln!(
+        "float32x1 landed the same bytes on both rails; moving the divisor alone moved the frame"
+    );
+}
+
+/// The widening names exactly one storage. The neighbouring *scalar* storages —
+/// `half` is a scalar too, two bytes of a different width, and
+/// `uchar_normalized` a scalar of a different storage — stay on the engine
+/// under the format gate's own slug, and the refusal's sentence states the
+/// widened set the floor is read against (2026-09-20, census v46's
+/// `vertex_format` bucket).
+#[test]
+fn the_scalar_storages_the_contract_does_not_name_stay_on_the_engine_by_name() {
+    use reims_vgpu_core::vertex_format as mtl;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let count = |route: &str| reims_vgpu::runtime::drain::store_route_count_for_test(route);
+
+    for (storage, route) in [
+        (mtl::MTL_VERTEX_FORMAT_HALF, "vertex_format_half"),
+        (
+            mtl::MTL_VERTEX_FORMAT_U_CHAR_NORMALIZED,
+            "vertex_format_uchar_normalized",
+        ),
+    ] {
+        let mut refused = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        refused.vertex_attributes[0].format =
+            VertexAttributeFormat::parse(storage).expect("a protocol vertex format");
+        let before = count(route);
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &refused,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                eprintln!(
+                    "storage {}: slug={} detail={}",
+                    storage,
+                    reason.slug(),
+                    reason.detail()
+                );
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_vertex_format",
+                    "a scalar storage the contract does not name keeps the gate's own name"
+                );
+                assert!(
+                    reason.detail().contains("Float32x1"),
+                    "the refusal's sentence names the widened set: {reason}"
+                );
+            }
+            other => panic!(
+                "the scalar storage {storage} the contract does not name stays on the engine: \
+                 {other:?}"
+            ),
+        }
+        assert_eq!(
+            count(route),
+            before + 1,
+            "the refused scalar storage is counted by name in the same population"
+        );
+    }
 }
 
 /// The normalized storages in the census's own reading (R14): the routes move
