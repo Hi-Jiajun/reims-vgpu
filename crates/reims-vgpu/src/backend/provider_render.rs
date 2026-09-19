@@ -596,6 +596,18 @@
 //!   `render_provider_out_of_class_index_alignment`, and a device without
 //!   host-pointer import answers `render_provider_out_of_class_index_import`.
 //!
+//! R47 makes the index view the bytes an affine stage-buffer proof is evaluated
+//! over ([`stage_buffer_affine_counts`]): staged bytes are read where they
+//! already are, and a window-backed index bind's bytes are read out of the
+//! registration that names them ([`read_index_window`]) — the range the borrowed
+//! lease resolves to and the R18 copy arm states — and then stated as the
+//! trace's own ([`StreamSource::Copied`], the fourth arm), because a snapshot
+//! admission cannot resolve a lease and would refuse the declaration by name.
+//! The count this class proves and the count the provider proves are then one
+//! arithmetic over one frozen range. An index view with no source this rail can
+//! state keeps the draw on the engine under the index stream's own name, and a
+//! count the bytes in hand do not state keeps it under the footprint's.
+//!
 //! R32 puts the attachment's own load seed in the same channel. The two shapes
 //! that carry one are the two the request's seed door resolves: the surface's
 //! own guest pages, stated as the contract's ordered run list
@@ -765,8 +777,11 @@
 //! stream the module *does* read is the gap this class has always had for the
 //! shapes it has always carried, and this increment does not move it — closing
 //! it would answer shapes the widening never touches. The number needs the index
-//! *values*, so the gate runs on the staged index arm alone: a zero-copy index
-//! window (`R11`) is guest RAM this process has not read.
+//! *values*, so this gate runs on the staged index arm alone: the window arm's
+//! bytes are read by the affine footprint proof (R47,
+//! [`stage_buffer_affine_counts`]) and are not read a second time here, because
+//! a surplus-stream refusal is a *class* refusal and widening it would move
+//! shapes this increment does not touch.
 //!
 //! # Error mapping
 //!
@@ -4622,7 +4637,8 @@ impl SampledGatherExit {
     }
 }
 
-/// Where one admitted stream's bytes come from (`R9q`, `R11`).
+/// Where one admitted stream's bytes come from, arm by arm (`R9q`, `R11`,
+/// `R47`).
 ///
 /// The same two arms one stage buffer has ([`NarrowStageBuffer`]), on the same
 /// rule: a stream the request already holds as staged bytes travels as
@@ -4638,12 +4654,25 @@ impl SampledGatherExit {
 /// an index buffer through the same zero-copy resolution
 /// (`crate::runtime::bound_buffers::BoundBuffer`), so the two are the same kind
 /// of bind and differ only in which shape's sentence answers a gather this rail
-/// cannot state.
+/// cannot state — and because R47's copy is the same kind of view as the staged
+/// arm above: bytes this rail holds, stated as the trace's own.
 enum StreamSource<'a> {
     /// The owner's staged copy: `BufferContent::Bytes`.
     Staged(&'a [u8]),
     /// The registered guest RAM window the bind's bytes were cut from.
     Window(StageBufferWindow),
+    /// The bytes this class read out of that window's registration and states as
+    /// the trace's own (`R47`).
+    ///
+    /// The third arm, and the index stream's alone: an affine stage-buffer
+    /// footprint is proved over the draw's own index values, and a *snapshot*
+    /// admits a trace before any registry exists — so the arm a provider's own
+    /// rail would resolve (the lease) is one the wire may not carry under that
+    /// declaration (`render_stage_buffer_footprint_unsupported`, E's
+    /// `admit_render_passes`). The bytes are the ones the window names, read by
+    /// [`read_index_window`] at the gate that proved the footprint, so the trace
+    /// and the proof state one frozen range.
+    Copied(Vec<u8>),
 }
 
 impl StreamSource<'_> {
@@ -4656,6 +4685,21 @@ impl StreamSource<'_> {
         match self {
             Self::Staged(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             Self::Window(window) => window.bytes_len,
+            Self::Copied(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// The bytes this arm states as the trace's own, when it states any.
+    ///
+    /// The request's staged copy and R47's copy out of a window's registration
+    /// are both views over the trace's own allocation; a window that still
+    /// travels as the owner's lease has none of its own — its bytes stay in the
+    /// registration and cross as that lease.
+    fn trace_owned(&self) -> Option<&[u8]> {
+        match self {
+            Self::Staged(bytes) => Some(bytes),
+            Self::Copied(bytes) => Some(bytes.as_slice()),
+            Self::Window(_) => None,
         }
     }
 }
@@ -4712,16 +4756,62 @@ fn vertex_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, Out
 /// `render_provider_out_of_class_index_staging`, the bucket every index gather
 /// answered with before this increment.
 fn index_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, OutOfClass> {
-    stream_source(content).ok_or_else(|| {
-        OutOfClass::new(
+    stream_source(content).ok_or_else(index_staging_refusal)
+}
+
+/// The index stream's own refusal for a gather no one registered window covers
+/// (`R11`).
+///
+/// One spelling for the two readers that ask the question: the index stream's
+/// own arm ([`index_stream_source`]) and the affine footprint's read of the same
+/// bytes ([`stage_buffer_affine_counts`]).
+fn index_staging_refusal() -> OutOfClass {
+    OutOfClass::new(
+        "render_provider_out_of_class_index_staging",
+        "an index stream the GPU gathers from guest RAM stays on the engine when the gather is \
+         not one registered window: this class mints a stream's bytes through the owner rail — \
+         the staged copy the request holds, or the registered window a zero-copy bind was cut \
+         from — and a gather that is neither has no source this rail can state",
+    )
+}
+
+/// The bytes one index window names, read out of the registration that holds
+/// them (`R47`).
+///
+/// The same reader [`window_arm`] copies a stream's bytes with, under the index
+/// stream's own label: `host_va + head` for `bytes_len` bytes, which is the
+/// range the borrowed lease resolves to and the range the R18 copy arm states.
+/// The extra read is counted where it happens — one route per read and one byte
+/// total beside it — so a boot can say how much of the index traffic an affine
+/// proof moved onto the trace-owned arm.
+///
+/// `Err` is the index stream's own bucket with the owner rail's refusal quoted:
+/// a window whose bytes this rail cannot read has no source to state, and a
+/// footprint proved over a count nobody can read is exactly what the canonical
+/// contract refuses by name.
+fn read_index_window(window: StageBufferWindow) -> Result<Vec<u8>, OutOfClass> {
+    match provider_owner::window_bytes(owner_window(index_stream_owner_binding(), window)) {
+        Ok(bytes) => {
+            crate::runtime::drain::note_store_route("render_provider_index_window_owned");
+            crate::runtime::drain::note_store_route_n(
+                "render_provider_index_window_owned_bytes",
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            );
+            Ok(bytes)
+        }
+        Err(decline) => Err(OutOfClass::owned(
             "render_provider_out_of_class_index_staging",
-            "an index stream the GPU gathers from guest RAM stays on the engine when the \
-             gather is not one registered window: this class mints a stream's bytes through \
-             the owner rail — the staged copy the request holds, or the registered window a \
-             zero-copy bind was cut from — and a gather that is neither has no source this \
-             rail can state",
-        )
-    })
+            format!(
+                "an index stream the GPU gathers from guest RAM stays on the engine when the \
+                 registered window its zero-copy bind was cut from cannot be read out of the \
+                 registration that names it: this class mints an index stream's bytes through \
+                 the owner rail — the staged copy the request holds, or the registered window \
+                 the bind was cut from — and an affine stage buffer's footprint is proved over \
+                 those very bytes (`{}`)",
+                decline.slug(),
+            ),
+        )),
+    }
 }
 
 /// The stage-buffer gate: the v2 census's 99.3% door, answered by what each
@@ -5754,10 +5844,11 @@ pub fn override_kept_frame_landing(declared: Option<bool>) -> KeptFrameLandingOv
 ///
 /// One reader for the two proofs that need it: the class's own span gate
 /// (`render_provider_out_of_class_vertex_span`) and the affine stage-buffer
-/// bound beside it ([`stage_buffer_affine_counts`]). Both read the *staged*
-/// arm's bytes, because the number is a value and not a length — a zero-copy
-/// index window is guest RAM this process has not read, and a caller that cannot
-/// read it gets `None` rather than a bound nothing states.
+/// bound beside it ([`stage_buffer_affine_counts`]). The number is a value read
+/// out of the bytes the caller has in hand, so `None` is a refusal and never a
+/// bound: the span gate hands it the arms whose bytes this rail holds
+/// ([`StreamSource::trace_owned`]), and the affine proof hands it the very bytes
+/// it read for the footprint ([`stage_buffer_affine_counts`]).
 #[inline]
 fn highest_index(
     bytes: &[u8],
@@ -5798,10 +5889,17 @@ fn highest_index(
 ///
 /// - the **indexed** arm counts the vertices the draw names,
 ///   `base_vertex + highest index + 1`, over the same index bytes the pass
-///   binds. `None` is a draw whose index bytes do not travel with the trace (a
-///   lease-backed window or a gather, `R11`), which is a proof this rail cannot
-///   evaluate here: the stage-buffer gate keeps such a draw on the engine by
-///   name rather than inventing a bound over bytes this derivation cannot read.
+///   binds, on **both** sources that can state them (`R11`): the staged bytes
+///   the trace carries verbatim, and the one registered window a zero-copy
+///   index bind was cut from ([`read_index_window`]) — whose bytes are the
+///   range the borrowed lease resolves to and the copy arm states, and which
+///   the trace then states as its own, so the arithmetic below is one
+///   arithmetic over one frozen range and not a second reading of a second
+///   copy. `Ok(None)` is a draw whose own bytes do not state the count at all:
+///   index bytes that stop short of the indices the draw fetches, or a
+///   `baseVertex` whose sum with the highest index leaves `u64`. The
+///   stage-buffer gate keeps such a draw on the engine by name rather than
+///   inventing a bound over bytes this derivation cannot read.
 /// - the **non-indexed** arm has no index bytes to read at all (R9j's second
 ///   half): the draw names its vertices `0..vertices`, so the count is the
 ///   request's own `vertex_count` — the same number `narrow_class` states as
@@ -5817,24 +5915,69 @@ fn highest_index(
 /// count) — the number the frame states (`instance_count: 1`), so the count
 /// this gate proves the bind against and the one the contract reads back are
 /// the same number.
-fn stage_buffer_affine_counts(req: &DrawRequest) -> Option<[u64; 2]> {
+///
+/// `Err` is the third answer, and it is about the index *view* rather than the
+/// number: a gather no one registered window covers, or a window whose bytes
+/// the owner rail will not hand back, is a shape with no source this rail can
+/// state ([`index_staging_refusal`]) — answered by name, because a proof
+/// bounded on a guess is exactly what the contract refuses.
+///
+/// # Why the window's bytes travel with the trace (`R47`)
+///
+/// Reading them is not enough. A trace is admitted by a *snapshot* before any
+/// registry exists (`metal-api-core`'s `admit_render_passes` →
+/// `RenderPipelineContract::validate_against(pass, None)`), and that admission
+/// refuses an affine footprint over an index view the trace does not carry by
+/// name (`render_stage_buffer_footprint_unsupported`: "the first stage-buffer
+/// increment does not evaluate" it). So the bytes this function reads out of a
+/// window are handed to the index arm, which states them as the trace's own
+/// ([`StreamSource::Copied`]) — the same arm the staged path already travels as,
+/// with the same bytes. Nothing the guest writes after this read can move the
+/// count the provider checks, which is what makes the two rails' arithmetic one
+/// arithmetic rather than two readings of one window taken at two moments.
+///
+/// `index_bytes` is the caller's cache for one gate evaluation: the arm is a
+/// property of the draw's index *view*, so a second affine declaration over the
+/// same view reads these bytes again rather than looking at guest memory again.
+fn stage_buffer_affine_counts(
+    req: &DrawRequest,
+    index_bytes: &mut Option<Vec<u8>>,
+) -> Result<Option<[u64; 2]>, OutOfClass> {
     let instances = u64::from(req.instance_count.unwrap_or(1));
     // The non-indexed arm: the draw's own vertex count is axis 0, and it is a
     // number the request carries rather than one this rail has to read out of
     // bytes.
     let Some(index) = req.indexed.as_ref() else {
-        return Some([u64::from(req.vertex_count), instances]);
+        return Ok(Some([u64::from(req.vertex_count), instances]));
     };
-    let bytes = staged_bytes(&index.content)?;
+    // The index view's own bytes, arm by arm (R11): staged bytes are the
+    // request's own allocation, and a zero-copy bind's window is read out of
+    // the registration that names it — once per gate evaluation, cached in
+    // `index_bytes`. A view this rail cannot read is refused here, by the index
+    // stream's own name, rather than bounded on a number nobody stated.
+    let bytes: &[u8] = match &index.content {
+        BufferContent::Bytes(bytes) => bytes.as_slice(),
+        BufferContent::GuestRuns(source) => {
+            if index_bytes.is_none() {
+                let window = gather_window(source).ok_or_else(index_staging_refusal)?;
+                *index_bytes = Some(read_index_window(window)?);
+            }
+            index_bytes
+                .as_deref()
+                .expect("the window's bytes were read into the cache just above")
+        }
+    };
     // The same reader the class's own span gate uses, so the highest index an
     // affine proof is evaluated over and the highest index that gate weighs a
     // stream's capacity against cannot be two different numbers.
-    let highest = highest_index(bytes, index.index_type, index.index_count)?;
+    let Some(highest) = highest_index(bytes, index.index_type, index.index_count) else {
+        return Ok(None);
+    };
     let vertices = u64::try_from(index.vertex_offset)
-        .ok()?
-        .checked_add(highest)?
-        .checked_add(1)?;
-    Some([vertices, instances])
+        .ok()
+        .and_then(|base| base.checked_add(highest))
+        .and_then(|vertices| vertices.checked_add(1));
+    Ok(vertices.map(|vertices| [vertices, instances]))
 }
 
 /// The byte extent one affine proof reaches over a draw's own invocation counts
@@ -6304,6 +6447,21 @@ fn stage_buffer_count_failure(
     }
 }
 
+/// What the stage-buffer gate states: the pair's own declarations, beside the
+/// index bytes an affine proof had to read for them (`R47`).
+#[derive(Default)]
+struct NarrowStageBuffers<'a> {
+    /// The declarations the pass states, in the contract's canonical order.
+    buffers: Vec<NarrowStageBuffer<'a>>,
+    /// The draw's own index bytes, when a declaration's affine footprint read
+    /// them out of a zero-copy window. The index stream then travels as the
+    /// trace's own bytes ([`StreamSource::Copied`]) rather than as the lease a
+    /// snapshot cannot resolve. `None` for the staged index arm, whose bytes the
+    /// trace already carries, for a pair whose proofs read no index axis, and
+    /// for the non-indexed arm.
+    index_bytes: Option<Vec<u8>>,
+}
+
 fn stage_buffer_gate<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &DrawRequest,
@@ -6311,7 +6469,7 @@ fn stage_buffer_gate<'a>(
     vertex_streams: usize,
     stage_buffer_namespace_split: bool,
     stage_buffer_per_stage_ceiling: Option<usize>,
-) -> Result<Vec<NarrowStageBuffer<'a>>, OutOfClass> {
+) -> Result<NarrowStageBuffers<'a>, OutOfClass> {
     // The one statement this request's two stages make (R9m): `declared` is
     // what the contract, the pass's own views and the wire frame are built
     // from, and `unstated` is the class's own account of what the statement
@@ -6354,7 +6512,7 @@ fn stage_buffer_gate<'a>(
     // declared nor bound, exactly as the binds of an argument no stage declares
     // already did.
     if statement.declared.is_empty() {
-        return Ok(Vec::new());
+        return Ok(NarrowStageBuffers::default());
     }
     // The stated half is built in the contract's own canonical order — vertex
     // bindings first by index, then fragment bindings — rather than the
@@ -6373,6 +6531,13 @@ fn stage_buffer_gate<'a>(
         ));
     }
     let mut out: Vec<NarrowStageBuffer<'a>> = Vec::with_capacity(ordered.len());
+    // The index bytes an affine proof reads, at most once per gate evaluation
+    // (R47): the arm is a property of the draw's index view, so a second affine
+    // declaration over the same view reads the same bytes rather than looking at
+    // guest memory a second time. What the gate read here is what the index arm
+    // states as the trace's own (`StreamSource::Copied`) — one read, one range,
+    // one arithmetic.
+    let mut index_bytes: Option<Vec<u8>> = None;
     for (stage, declaration, access) in ordered {
         // One slot, one declaration: a reflection that names the same stage
         // buffer twice describes two interfaces for one index, which the
@@ -6496,17 +6661,24 @@ fn stage_buffer_gate<'a>(
                 *max_bytes,
             ),
             StageBufferFootprint::Affine { accesses } => {
-                let Some(counts) = stage_buffer_affine_counts(req) else {
+                // A refusal of the index *view* itself (a gather no one
+                // registered window covers, a window whose bytes the owner rail
+                // will not hand back) is the index stream's own answer and
+                // travels under its own name: `?` and not a footprint sentence,
+                // because the fact that stopped this draw is not the proof's
+                // arithmetic.
+                let Some(counts) = stage_buffer_affine_counts(req, &mut index_bytes)? else {
                     return Err(OutOfClass::owned(
                         "render_provider_out_of_class_stage_buffer_footprint",
                         format!(
                             "a draw whose {} stage declares a [[buffer({})]] argument with an \
                              affine footprint stays on the engine when the draw's own invocation \
-                             counts are not readable from the bytes the trace carries: the \
+                             counts cannot be stated over the index bytes the trace carries — \
+                             bytes that stop short of the indices this draw fetches, or a \
+                             `baseVertex` the indexed count leaves the `u64` range with: the \
                              canonical contract bounds the proof over the trace's own index bytes \
                              and refuses a count nothing states (`buffer_footprint_axis_invalid` \
-                             / `StageBufferFootprintProofUnsupported`), so a lease-backed or \
-                             gathered index view is a shape this rail cannot state",
+                             / `StageBufferFootprintProofUnsupported`)",
                             stage.name(),
                             declaration.index,
                         ),
@@ -6692,7 +6864,10 @@ fn stage_buffer_gate<'a>(
             window,
         });
     }
-    Ok(out)
+    Ok(NarrowStageBuffers {
+        buffers: out,
+        index_bytes,
+    })
 }
 
 /// The allocation the colour attachment's declaring view lives in.
@@ -6974,6 +7149,10 @@ fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor
         match &stream.source {
             // A staged stream already travels as the trace's own bytes.
             StreamSource::Staged(_) => {}
+            // R47's trace-owned arm is the index stream's alone; stated here as
+            // the trace's own bytes, which is what the arm means wherever it
+            // appears.
+            StreamSource::Copied(bytes) => own(view, bytes.clone()),
             StreamSource::Window(window) => {
                 let bytes = provider_owner::window_bytes(owner_window(
                     vertex_stream_owner_binding(binding),
@@ -6989,11 +7168,18 @@ fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor
     // the arm needs no rule of its own here.
     if let (Some(indices), Some(stream)) = (descriptor.indices.as_mut(), pass.index_stream.as_ref())
     {
-        if let StreamSource::Window(window) = &stream.source {
-            let bytes =
-                provider_owner::window_bytes(owner_window(index_stream_owner_binding(), *window))
-                    .ok()?;
-            own(&mut indices.view, bytes);
+        match &stream.source {
+            // R47: the bytes the gate read are already the trace's own.
+            StreamSource::Copied(bytes) => own(&mut indices.view, bytes.clone()),
+            StreamSource::Window(window) => {
+                let bytes = provider_owner::window_bytes(owner_window(
+                    index_stream_owner_binding(),
+                    *window,
+                ))
+                .ok()?;
+                own(&mut indices.view, bytes);
+            }
+            StreamSource::Staged(_) => {}
         }
     }
     for (index, buffer) in pass.stage_buffers.iter().enumerate() {
@@ -11010,7 +11196,7 @@ impl NarrowPass<'_> {
             .enumerate()
             .filter_map(|(binding, stream)| match &stream.source {
                 StreamSource::Window(window) => Some((binding, *window)),
-                StreamSource::Staged(_) => None,
+                StreamSource::Staged(_) | StreamSource::Copied(_) => None,
             })
     }
 
@@ -11026,7 +11212,7 @@ impl NarrowPass<'_> {
     fn index_window(&self) -> Option<StageBufferWindow> {
         match &self.index_stream.as_ref()?.source {
             StreamSource::Window(window) => Some(*window),
-            StreamSource::Staged(_) => None,
+            StreamSource::Staged(_) | StreamSource::Copied(_) => None,
         }
     }
 
@@ -12262,7 +12448,15 @@ fn narrow_class<'a>(
     // which is the layout this request will be registered with — rather than
     // its attribute list, because an attribute list is one entry per location
     // and a layout is one entry per stream (`research/docs/26` §31).
-    let stage_buffers = stage_buffer_gate(
+    // R47: the gate hands back the index bytes its affine proofs read, when the
+    // draw's index view was a zero-copy window. The index arm below states those
+    // bytes as the trace's own, which is the only arm a *snapshot* admission can
+    // evaluate an affine footprint over — and the same bytes the proof was
+    // weighed against, so the two cannot be two readings of one window.
+    let NarrowStageBuffers {
+        buffers: stage_buffers,
+        index_bytes: index_window_bytes,
+    } = stage_buffer_gate(
         inputs,
         req,
         req.storage_buffers.len(),
@@ -12381,7 +12575,7 @@ fn narrow_class<'a>(
     // contract reads as `0..vertices` — and what it owes instead of those doors
     // is the span proof [`nonindexed_vertex_span`] states, answered below
     // because it is a statement about the vertex streams.
-    let (draw_count, index_stream, staged_highest_index) = match req.indexed.as_ref() {
+    let (draw_count, index_stream, index_highest) = match req.indexed.as_ref() {
         Some(index) => {
             if index.index_count == 0 {
                 return Err(OutOfClass::new(
@@ -12406,32 +12600,43 @@ fn narrow_class<'a>(
             // index bind the draw path had already imported, and a gather this
             // rail cannot state as one window keeps the engine under the same
             // slug as before.
-            let index_source = index_stream_source(&index.content)?;
+            //
+            // R47 adds the third arm, and only where an affine footprint read
+            // the window for its own proof: those bytes travel as the trace's
+            // own (`StreamSource::Copied`), because a snapshot cannot resolve a
+            // lease and the declaration would be refused by name there
+            // (`render_stage_buffer_footprint_unsupported`). Every other
+            // window-backed index bind keeps the lease arm it had.
+            let index_source = match index_window_bytes {
+                Some(bytes) => StreamSource::Copied(bytes),
+                None => index_stream_source(&index.content)?,
+            };
             if index_source.len() == 0 {
                 return Err(OutOfClass::new(
                     "render_provider_out_of_class_index_empty",
                     "an empty index stream stays on the engine",
                 ));
             }
-            // The highest vertex this draw's *staged* index bytes name, read
-            // once here because the surplus-stream span proof below needs it and
-            // this arm is where the bytes are in scope: a zero-copy index window
-            // (`R11`) is guest RAM this process has not read (`None`), exactly as
-            // [`stage_buffer_affine_counts`] states for the proof it derives from
-            // the same bytes.
-            let staged_highest = match &index_source {
-                StreamSource::Staged(bytes) => {
-                    highest_index(bytes, index.index_type, index.index_count)
-                }
-                _ => None,
-            };
+            // The highest vertex this draw's own index bytes name, read once
+            // here because the surplus-stream span proof below needs it and this
+            // arm is where the bytes are in scope. The staged arm has always
+            // answered it; R47's trace-owned arm answers it too, because those
+            // are the same bytes an affine footprint was just proved over — and
+            // admission weighs the surplus streams against exactly this number,
+            // so the shape the widening admits cannot be one admission refuses.
+            // A window that still travels as a lease (`R11`) is guest RAM this
+            // arm has not read (`None`), which is the pre-R47 boundary the
+            // surplus-stream proof keeps.
+            let index_highest = index_source
+                .trace_owned()
+                .and_then(|bytes| highest_index(bytes, index.index_type, index.index_count));
             (
                 index.index_count,
                 Some(NarrowIndexStream {
                     format: index_format,
                     source: index_source,
                 }),
-                staged_highest,
+                index_highest,
             )
         }
         None => (req.vertex_count, None, None),
@@ -12584,12 +12789,14 @@ fn narrow_class<'a>(
     // What the widening owes is only that its own declarations cannot be the
     // reason a draw the class took is thrown away.
     //
-    // The number needs the index *values*, so it is available for the staged
-    // index arm alone: a zero-copy index window (`R11`) is guest RAM this process
-    // has not read, exactly as [`stage_buffer_affine_counts`] states for the proof
-    // it derives from the same bytes. The read itself happens in the indexed arm
-    // above, where those bytes are in scope.
-    if let Some(highest) = staged_highest_index {
+    // The number needs the index *values*, so it is available for the arms whose
+    // bytes this rail holds: the staged index stream, and R47's trace-owned arm —
+    // the bytes an affine footprint read out of a zero-copy index window, which
+    // are the same bytes admission weighs these streams against. A window that
+    // still travels as the owner's lease (`R11`) is guest RAM this process has
+    // not read, which is the pre-R47 boundary this proof keeps: reading it here
+    // would answer shapes this increment does not widen.
+    if let Some(highest) = index_highest {
         for stream in &vertex_streams {
             let ignored = stream.attributes.iter().all(|attribute| {
                 !inputs
@@ -12865,15 +13072,6 @@ fn f32_to_half_bits(value: f32) -> u16 {
         half += 1;
     }
     sign | half
-}
-
-/// The CPU-staged bytes of one render input, or `None` when the content is the
-/// zero-copy gather form.
-fn staged_bytes(content: &BufferContent) -> Option<&[u8]> {
-    match content {
-        BufferContent::Bytes(bytes) => Some(bytes.as_slice()),
-        BufferContent::GuestRuns(_) => None,
-    }
 }
 
 /// The contract's vertex format for one reims attribute format.
@@ -13186,17 +13384,23 @@ fn submit_narrow(
         // the same bytes whatever the binding numbers are called — which is why
         // the canonical block is the request's own fetch tables and can be
         // shorter than the attribute list (`research/docs/26` §31).
+        // The two sources the trace states as its own hold their bytes
+        // differently — the request's staged copy borrows it, R47's copy out of
+        // a window's registration is this rail's own — and both state the same
+        // view: the bytes over the trace's own allocation.
+        let trace_owned_view = |bytes: &[u8]| BufferView {
+            view_id: ViewId::new(next_view),
+            metal_binding: u32::try_from(binding).unwrap_or(u32::MAX),
+            allocation_id: input_allocation(next_view),
+            offset: 0,
+            length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            access: BufferAccess::Read,
+            attribute_stride: None,
+            source: BufferSource::OwnedBytes(bytes.to_vec()),
+        };
         let view = match &stream.source {
-            StreamSource::Staged(bytes) => BufferView {
-                view_id: ViewId::new(next_view),
-                metal_binding: u32::try_from(binding).unwrap_or(u32::MAX),
-                allocation_id: input_allocation(next_view),
-                offset: 0,
-                length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                access: BufferAccess::Read,
-                attribute_stride: None,
-                source: BufferSource::OwnedBytes(bytes.to_vec()),
-            },
+            StreamSource::Staged(bytes) => trace_owned_view(bytes),
+            StreamSource::Copied(bytes) => trace_owned_view(bytes),
             // R9q: the stream's bytes are the owner's own mapping, imported
             // for this submission under the label the plan cut for this
             // stream. The view is the pair the owner's reservation covers —
@@ -13258,14 +13462,24 @@ fn submit_narrow(
             // with the view offset and length the owner's own reservation
             // covers. The same channel switch the vertex stream above keeps,
             // for the same reason.
-            let (index_allocation, index_offset, index_length, index_source) = match &stream.source
-            {
-                StreamSource::Staged(bytes) => (
+            let trace_owned_index = |bytes: &[u8]| {
+                (
                     input_allocation(index_slot),
                     0,
                     u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                     BufferSource::OwnedBytes(bytes.to_vec()),
-                ),
+                )
+            };
+            let (index_allocation, index_offset, index_length, index_source) = match &stream.source
+            {
+                // The two arms the trace states as its own, in one place: the
+                // request's staged bytes, and (R47) the bytes the gate read out
+                // of the window for an affine proof — the arm a snapshot can
+                // evaluate that proof over. No lease is minted for the second
+                // (`NarrowPass::index_window` answers `None` for it), so the
+                // plan and the view agree about what crosses the wire.
+                StreamSource::Staged(bytes) => trace_owned_index(bytes),
+                StreamSource::Copied(bytes) => trace_owned_index(bytes),
                 StreamSource::Window(_) => {
                     let owner = leases
                         .as_ref()
@@ -14337,7 +14551,7 @@ fn input_allocations(
     let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1 + pass.textures.len());
     let mut next_view = FIRST_INPUT_VIEW;
     for stream in &pass.vertex_streams {
-        if let StreamSource::Staged(bytes) = &stream.source {
+        if let Some(bytes) = stream.source.trace_owned() {
             out.push((
                 input_allocation(next_view),
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -14350,7 +14564,7 @@ fn input_allocations(
     // a non-indexed draw, which declares no index view, contributes no
     // allocation to this list.
     if let Some(stream) = &pass.index_stream {
-        if let StreamSource::Staged(bytes) = &stream.source {
+        if let Some(bytes) = stream.source.trace_owned() {
             out.push((
                 input_allocation(next_view),
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -15684,6 +15898,14 @@ mod stage_buffer_affine_count_tests {
         }
     }
 
+    /// One request's counts, with the gate's own cache stated here: the arms
+    /// these tests drive need no window read, so the cache stays empty and a
+    /// gather the seam cannot window is refused on the way.
+    fn counts(req: &DrawRequest) -> Result<Option<[u64; 2]>, OutOfClass> {
+        let mut index_bytes = None;
+        stage_buffer_affine_counts(req, &mut index_bytes)
+    }
+
     #[test]
     fn the_counts_are_the_contracts_own_numbers_on_both_arms() {
         // The non-indexed arm: the draw's own count, and the vertex count is
@@ -15692,8 +15914,8 @@ mod stage_buffer_affine_count_tests {
             let mut req = request();
             req.vertex_count = vertices;
             assert_eq!(
-                stage_buffer_affine_counts(&req),
-                Some([u64::from(vertices), 1]),
+                counts(&req),
+                Ok(Some([u64::from(vertices), 1])),
                 "a non-indexed draw names its vertices `0..{vertices}`"
             );
         }
@@ -15702,12 +15924,12 @@ mod stage_buffer_affine_count_tests {
         // the arithmetic states what the contract would read for the others.
         let mut four = request();
         four.instance_count = Some(4);
-        assert_eq!(stage_buffer_affine_counts(&four), Some([3, 4]));
+        assert_eq!(counts(&four), Ok(Some([3, 4])));
         let mut unstated = request();
         unstated.instance_count = None;
         assert_eq!(
-            stage_buffer_affine_counts(&unstated),
-            Some([3, 1]),
+            counts(&unstated),
+            Ok(Some([3, 1])),
             "an instance count the request does not state reads as the one instance the frame \
              itself declares"
         );
@@ -15717,22 +15939,47 @@ mod stage_buffer_affine_count_tests {
         // count, which is the other arm's number.
         let mut stride = indexed(index_bytes(&[0, 5, 2]), 3, 0);
         stride.vertex_count = 9;
-        assert_eq!(stage_buffer_affine_counts(&stride), Some([6, 1]));
+        assert_eq!(counts(&stride), Ok(Some([6, 1])));
         assert_eq!(
-            stage_buffer_affine_counts(&indexed(index_bytes(&[0, 5, 2]), 3, 2)),
-            Some([8, 1]),
+            counts(&indexed(index_bytes(&[0, 5, 2]), 3, 2)),
+            Ok(Some([8, 1])),
             "`base_vertex` is part of the indexed count"
         );
         assert_eq!(
-            stage_buffer_affine_counts(&indexed(index_bytes(&[7, 7, 7]), 3, 0)),
-            Some([8, 1]),
+            counts(&indexed(index_bytes(&[7, 7, 7]), 3, 0)),
+            Ok(Some([8, 1])),
             "the highest index the count reaches is the one the bytes name"
         );
 
-        // The arms whose bytes do not travel answer `None` — the shape the gate
-        // keeps on the engine by name rather than bounding on a guess. This is
-        // the indexed arm's own boundary and not a statement about the other
-        // one, whose count needs no bytes at all.
+        // A count the bytes in hand do not state answers `Ok(None)` — the shape
+        // the stage-buffer gate keeps on the engine under its footprint name
+        // rather than bounding on a guess. This is the indexed arm's own
+        // boundary and not a statement about the other one, whose count needs no
+        // bytes at all.
+        assert_eq!(
+            counts(&indexed(index_bytes(&[0, 1]), 3, 0)),
+            Ok(None),
+            "bytes that stop short of the indices the draw fetches state no count"
+        );
+        assert_eq!(
+            counts(&indexed(index_bytes(&[0, 1, 2]), 3, -1)),
+            Ok(None),
+            "a `baseVertex` the indexed count leaves `u64` with states no count either"
+        );
+    }
+
+    /// R47: the index view this proof reads is the one the index stream itself
+    /// is stated from, and a view that is no source at all is refused **by
+    /// name** — never bounded on a guess.
+    ///
+    /// The two refusals are the two facts behind `index_staging`: a gather no
+    /// one registered window covers (`pages` absent, the synthetic and
+    /// unimported reading), and a window whose import the owner rail does not
+    /// hold. Both answer the index stream's own bucket, which is also what the
+    /// same draw answers when no affine declaration asks for these bytes at
+    /// all — one shape, one name.
+    #[test]
+    fn an_index_view_with_no_source_is_refused_under_the_index_streams_own_name() {
         let gathered = BufferContent::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(vec![
                 GuestRun::whole(0x1000, 12).expect("a fixture run covers its own span")
@@ -15743,15 +15990,13 @@ mod stage_buffer_affine_count_tests {
             pages: None,
             direct_image: None,
         });
-        assert_eq!(
-            stage_buffer_affine_counts(&indexed(gathered, 3, 0)),
-            None,
-            "a gathered index view is guest RAM this derivation has not read"
-        );
-        assert_eq!(
-            stage_buffer_affine_counts(&indexed(index_bytes(&[0, 1]), 3, 0)),
-            None,
-            "and so is a window that stops short of the indices the draw fetches"
+        let error = counts(&indexed(gathered, 3, 0))
+            .expect_err("a gather no registered window covers has no source");
+        assert_eq!(error.slug(), "render_provider_out_of_class_index_staging");
+        assert!(
+            error.detail().contains("not one registered window"),
+            "the sentence is the index stream's own: {}",
+            error.detail()
         );
     }
 
