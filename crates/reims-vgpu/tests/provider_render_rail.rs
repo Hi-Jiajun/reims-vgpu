@@ -29543,3 +29543,257 @@ fn the_two_static_textures_that_pair_one_to_one_land_their_own_texels_and_agree_
         stages.fragment_texture_declarations.len(),
     );
 }
+
+/// The sampled-sampler-reuse stages (R50, census v48's fifth door): one
+/// fragment stage whose *four* sampled textures read through two AIR
+/// `constexpr samplers` — `[[texture(0)]]`, `[[texture(1)]]` and
+/// `[[texture(3)]]` through the module's Nearest + Repeat state,
+/// `[[texture(2)]]` through the Linear + ClampToEdge one.
+///
+/// The census's `pipe=58` fragment stage is this shape thirteen textures wide:
+/// its thirteen sampled textures read through four sampler descriptors, only
+/// two of them the module's own AIR states, and the fourth door's sentence names
+/// `[[texture(11)]]` — the first texture past the position a one-state-per-
+/// texture rule reaches.
+fn sampler_reuse_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_sampler_reuse.air",
+        "reims_sampler_reuse_frag",
+    )
+}
+
+/// The reuse shape's request (R50): one `rgba8_unorm` texture per declaration,
+/// and one sampler bind per *distinct* device slot the declarations name — the
+/// three declarations that read through the module's repeated AIR state share
+/// one slot, so the request states one state for it, exactly as the draw of the
+/// census's own shape binds one sampler per reused state.
+fn sampler_reuse_request(
+    stages: &Stages,
+    texels: &[Vec<Vec<u8>>],
+    extent: (u32, u32),
+) -> DrawRequest {
+    use reims_vgpu::protocol::sampler as mtl;
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    assert_eq!(
+        stages.fragment_texture_declarations.len(),
+        texels.len(),
+        "the request states one texture per declaration"
+    );
+    for (declaration, texels) in stages
+        .fragment_texture_declarations
+        .iter()
+        .zip(texels.iter())
+    {
+        req.sampled_images.push(image_resource(
+            declaration.binding,
+            texels.clone(),
+            extent,
+        ));
+    }
+    for declaration in stages.fragment_texture_declarations.iter() {
+        if req
+            .samplers
+            .iter()
+            .any(|sampler| sampler.binding == declaration.sampler_binding)
+        {
+            continue;
+        }
+        let RenderSamplerState::Policy(policy) = declaration.sampler else {
+            panic!(
+                "every declaration of this fixture reads through the module's own AIR state: \
+                 {:?}",
+                declaration.sampler
+            );
+        };
+        let filter = match policy.filter {
+            SamplerFilter::Nearest
+            | SamplerFilter::NearestMipNearest
+            | SamplerFilter::NearestMipLinear => mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+            SamplerFilter::Linear
+            | SamplerFilter::LinearMipNearest
+            | SamplerFilter::LinearMipLinear => mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR,
+        };
+        let address = match policy.address {
+            SamplerAddressMode::Repeat => mtl::MTL_SAMPLER_ADDRESS_MODE_REPEAT,
+            SamplerAddressMode::ClampToEdge => mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            other => panic!("the fixture states no such address mode: {other:?}"),
+        };
+        req.samplers.push(family_sampler_resource(
+            declaration.sampler_binding,
+            filter,
+            address,
+        ));
+    }
+    req
+}
+
+/// R50: the state one texture is declared through is the one the module's own
+/// sample site names — not the one the texture's position in the reflection's
+/// list reaches.
+///
+/// Four readings, each falsifiable on its own:
+///
+/// * the four declarations, by hand: three of them name one device slot and the
+///   fourth the other, in the order the module's sites name them;
+/// * the family's own list of AIR static samplers, over the module's sites;
+/// * the frame: `u = 1.375` is one half column past the surface, where the
+///   repeated state reads texel `(3, 3)` and the clamped one texel `(7, 3)`, so
+///   the four channels are `30 30 70 30`;
+/// * the negative control: moving the *clamped* texture's texel `(3, 3)` — the
+///   texel the repeated state reads — must not move the frame at all, which is
+///   what says that texture does not read through the repeated state.
+#[test]
+fn the_reused_air_sampler_is_declared_for_every_texture_that_reads_through_it() {
+    let _guard = engine_test_session();
+    let stages = sampler_reuse_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let repeat = RenderSamplerState::Policy(SamplerPolicy {
+        filter: SamplerFilter::Nearest,
+        address: SamplerAddressMode::Repeat,
+    });
+    let linear = RenderSamplerState::Policy(SamplerPolicy {
+        filter: SamplerFilter::Linear,
+        address: SamplerAddressMode::ClampToEdge,
+    });
+    let sampled = RenderTextureShape::Sampled2D;
+
+    assert_eq!(
+        stages.fragment_texture_declarations,
+        vec![
+            RenderTextureDeclaration {
+                index: 0,
+                binding: 32,
+                sampler_binding: 160,
+                sampler: repeat,
+                shape: sampled,
+            },
+            RenderTextureDeclaration {
+                index: 1,
+                binding: 33,
+                sampler_binding: 160,
+                sampler: repeat,
+                shape: sampled,
+            },
+            RenderTextureDeclaration {
+                index: 2,
+                binding: 34,
+                sampler_binding: 161,
+                sampler: linear,
+                shape: sampled,
+            },
+            RenderTextureDeclaration {
+                index: 3,
+                binding: 35,
+                sampler_binding: 160,
+                sampler: repeat,
+                shape: sampled,
+            },
+        ],
+        "three textures read through the module's repeated AIR state and the third \
+         `[[texture(2)]]` through its linear one: a walk that paired the two states with the \
+         textures by position would hand `[[texture(1)]]` the linear state and run out of \
+         states at `[[texture(2)]]`"
+    );
+    assert_eq!(
+        stages.sampler_family,
+        RenderSamplerFamily {
+            runtime: Vec::new().into(),
+            statics: vec![0, 1].into(),
+            outside_family_statics: Vec::new().into(),
+            sample_sites: RenderSampleSites::Paired,
+        },
+        "the stage binds no runtime `[[sampler(n)]]` argument and carries the two AIR states \
+         its own sample sites read through"
+    );
+    assert!(
+        stages.texture_interface_refusals.is_empty(),
+        "all four textures are inside the translated rail: {:?}",
+        stages.texture_interface_refusals
+    );
+
+    let request = |textures: &[Vec<Vec<u8>>]| sampler_reuse_request(&stages, textures, (width, height));
+    let all = vec![texels.clone(), texels.clone(), texels.clone(), texels.clone()];
+    let base = provider_pixels("sampler reuse", &stages, &request(&all));
+    assert_uniform_frame(
+        "sampler reuse",
+        &base,
+        width,
+        height,
+        [16 * 3, 16 * 3, 16 * 7, 16 * 3],
+    );
+    let Some(engine) = engine_pixels("sampler reuse", &stages, request(&all)) else {
+        return;
+    };
+    assert_frames_equal("sampler reuse", &base, &engine);
+
+    // The reused state's own texel, in the texture that reads through it: the
+    // second `[[texture(i)]]`'s green channel is the reading a positional pairing
+    // would have handed to the *linear* state.
+    let mut reuse_moved = all.clone();
+    reuse_moved[1][3 * width as usize + 3] = vec![255, 0, 0, 255];
+    let reuse_frame = provider_pixels(
+        "the reused state's texel moved",
+        &stages,
+        &request(&reuse_moved),
+    );
+    assert_uniform_frame(
+        "the reused state's texel moved",
+        &reuse_frame,
+        width,
+        height,
+        [16 * 3, 255, 16 * 7, 16 * 3],
+    );
+    assert_frames_differ(
+        "the reused state's texel moved the frame",
+        &base,
+        &reuse_frame,
+    );
+
+    // The other state's own texel: the clamped half reads texel `(7, 3)`, so
+    // moving that texel moves blue — and the negative control below moves the
+    // texel the *repeated* state reads, which must leave the frame alone.
+    let mut clamped_moved = all.clone();
+    clamped_moved[2][3 * width as usize + 7] = vec![255, 0, 0, 255];
+    let clamped_frame = provider_pixels(
+        "the clamped state's texel moved",
+        &stages,
+        &request(&clamped_moved),
+    );
+    assert_uniform_frame(
+        "the clamped state's texel moved",
+        &clamped_frame,
+        width,
+        height,
+        [16 * 3, 16 * 3, 255, 16 * 3],
+    );
+    assert_frames_differ(
+        "the clamped state's texel moved the frame",
+        &base,
+        &clamped_frame,
+    );
+
+    let mut control = all.clone();
+    control[2][3 * width as usize + 3] = vec![255, 0, 0, 255];
+    let control_frame = provider_pixels(
+        "the texel only the repeated state reads, in the clamped texture",
+        &stages,
+        &request(&control),
+    );
+    assert_frames_equal(
+        "the texel only the repeated state reads, in the clamped texture",
+        &base,
+        &control_frame,
+    );
+
+    eprintln!(
+        "R50 sampler reuse: attachment {width}x{height} — red/green/alpha are the repeated \
+         state's texel (3, 3) for three textures and blue the clamped state's (7, 3), the \
+         clamped texture's own (3, 3) moved nothing, and provider and engine agree byte for \
+         byte; {} AIR samplers against {} declarations is the reuse the registration admits",
+        stages.sampler_family.statics.len(),
+        stages.fragment_texture_declarations.len(),
+    );
+}

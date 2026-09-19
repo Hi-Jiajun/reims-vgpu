@@ -1759,12 +1759,17 @@ fn weighed_static_samplers<'a>(
 /// `research/docs/23` §101) — or the sampler-free answer a texture only
 /// `texture.read()` reaches states (R15, §3.3).
 ///
-/// The canonical render sampler pairs the *i*-th reflected sampled texture with
-/// the *i*-th AIR static sampler (`metal-api-vulkan`'s
-/// `translated_texture_slots`), so this walk makes the same pairing over the
-/// same reflection — one list of textures, one list of static samplers, paired
-/// by position — instead of a second rule that could disagree about which state
-/// belongs to which texture. The static half of that list is the AIR samplers
+/// The canonical render sampler binds each sampled texture to the AIR static
+/// sampler the module's own `OpSampledImage` names for it, and keeps the
+/// positional pairing — the *i*-th reflected sampled texture with the *i*-th
+/// AIR static sampler (`metal-api-vulkan`'s `translated_texture_pairs`) — for
+/// the shapes whose own sites name none (R50, 2026-09-20): a `constexpr
+/// sampler` is a value the frontend reuses, so several textures may read
+/// through one, and a walk that paired by position alone would declare the
+/// textures past that sampler's position through no state at all. This walk
+/// takes the same two readings over the same reflection, instead of a second
+/// rule that could disagree about which state belongs to which texture. The
+/// static half of that list is the AIR samplers
 /// the module's own instructions read through ([`weighed_static_samplers`],
 /// E-RS5/v118; R48), because the registration weighs and pairs the same set:
 /// a sampler the lowered module never names in an `OpSampledImage` takes no
@@ -1887,18 +1892,45 @@ pub fn texture_declarations(
             // which is the rule the canonical rail's own walk applies (its
             // static counter advances only for the textures their declaration
             // states static, `metal-api-vulkan/src/render.rs`).
-            let runtime_pair = pairing.sampler_of(binding).and_then(|slot| {
+            // What the module's own sample sites name at all (R50,
+            // 2026-09-20): the sampler descriptor this texture's sites read
+            // through, whatever form it turns out to be.
+            let named = pairing.sampler_of(binding);
+            let runtime_pair = named.and_then(|slot| {
                 runtime_samplers
                     .iter()
                     .find(|(_, runtime_slot)| *runtime_slot == slot)
                     .copied()
             });
+            // The AIR static sampler the module's own sites name, resolved back
+            // to the reflection's own entry — the state the canonical rail
+            // creates that descriptor's `VkSampler` from (R50). A
+            // `constexpr sampler` is a *value* the frontend reuses rather than a
+            // slot it spends once, so several textures may well name one AIR
+            // sampler: the positional rule below pairs one AIR sampler per
+            // static sample and runs out exactly there (census v48's
+            // `texture_sampler` bucket, `[[texture(11)]]` of the LPF family),
+            // while the module's own statement names that one state for every
+            // texture that reads through it.
+            let named_static = named.and_then(|slot| {
+                samplers.iter().find(|sampler| {
+                    sampler
+                        .descriptor
+                        .map(|descriptor| descriptor.binding)
+                        == Some(slot)
+                })
+            });
             // The static half's positional pairing: the AIR static samplers, in
             // the reflection's own order, against the sampled textures that do
             // not read through a runtime argument — a texel-fetched texture
             // states no sampler at all, so it takes no position in that pairing
-            // either (R15).
-            let paired = if fetched || runtime_pair.is_some() {
+            // either (R15). It is the *fallback* now: the module's own sample
+            // sites are read first, and a texture whose own sites name an AIR
+            // static sampler takes no position in this pairing either — the two
+            // rules state the same declaration wherever they agree, and this one
+            // keeps stating it where the module's sites name nothing the
+            // reflection lists.
+            let paired = if fetched || runtime_pair.is_some() || named_static.is_some() {
                 None
             } else {
                 let paired = samplers.get(static_read);
@@ -1914,7 +1946,11 @@ pub fn texture_declarations(
             // that states the pair is the runtime's own, and it is the same
             // helper [`sampler_family`] reads the stage's runtime list with —
             // so the declaration and the gate name one device slot.
-            let static_slot = paired
+            // The static half is one declaration either way (R50): the AIR
+            // static sampler the module's own sites name when they name one the
+            // reflection lists, and the positional one where they name none.
+            let static_sampler = named_static.or(paired);
+            let static_slot = static_sampler
                 .and_then(|sampler| {
                     crate::runtime::spirv_bind::reflected_sampler_binding(sampler, false)
                 })
@@ -1930,7 +1966,7 @@ pub fn texture_declarations(
                 // with the request's own state.
                 (slot, RenderSamplerState::Runtime { index })
             } else {
-                match paired.and_then(|sampler| sampler.static_sampler.as_ref()) {
+                match static_sampler.and_then(|sampler| sampler.static_sampler.as_ref()) {
                     Some(state) => (
                         static_slot,
                         match air_sampler_policy(state) {
@@ -1943,7 +1979,7 @@ pub fn texture_declarations(
                     // No decoded AIR state beside this texture: the AIR static
                     // sampler carries none the translator could read, which the
                     // provider refuses by name.
-                    None if paired.is_some() => (
+                    None if static_sampler.is_some() => (
                         static_slot,
                         RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
                     ),
