@@ -244,6 +244,31 @@ pub struct NarrowLaneSupport {
     pub rg8: bool,
 }
 
+/// The eight-byte half-float sampled lane of the same section
+/// (`research/docs/23` §3.3, §107; census v44's `texture_bind` bucket).
+///
+/// The eighth reading of the same one-snapshot rule and
+/// [`render_texture_narrow_lanes`]'s sibling one width over: the section's own
+/// format list is what decides which texels the provider uploads and samples
+/// (`supported_render_texture_formats`, the field the 2026-09-19 widening
+/// appended `rgba16_float` to), so this lane is answered by membership in
+/// *that* list and not by a second table here.
+///
+/// `false` is the fail-closed answer, and it is what a frame written before
+/// the lane existed decodes to: the code `4` is absent from an older frame's
+/// list — the census's own boots all carry it as an *unlisted* format, which is
+/// exactly the refusal the class states — so a device whose section does not
+/// list the lane keeps those binds on the engine under the class's own name.
+pub fn render_texture_rgba16f_lane(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded
+        .supported_render_texture_formats
+        .contains(&TextureFormat::Rgba16Float))
+}
+
 /// The runtime-sampler half of the same render-sampler section (R36).
 ///
 /// The fifth reading of the one-snapshot rule ([`stage_buffer_support`],
