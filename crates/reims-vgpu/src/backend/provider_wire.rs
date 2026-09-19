@@ -74,6 +74,33 @@ pub struct StageBufferSupport {
     /// The most stage buffer bindings one pass may carry, as the same frame
     /// declares it.
     pub maximum: u32,
+    /// The most stage buffer bindings **one stage** of a pass may carry, as
+    /// the same frame declares it; `0` is the absent section, which is the
+    /// reading every frame written before E-SB2 gives (`research/docs/23`
+    /// §117).
+    ///
+    /// The two numbers are not a list and a sub-list of one rule: `maximum` is
+    /// the *pipeline-level* bound the wire's own declaration block is sized
+    /// by, while this one is the ceiling the canonical contract states on a
+    /// stage's own axis. A frame that carries no section states no per-stage
+    /// ceiling, and the class gate then keeps the stricter merged reading
+    /// rather than half-admitting the pair.
+    pub per_stage: u32,
+}
+
+impl StageBufferSupport {
+    /// Whether the frame states a ceiling on one stage's own list, mirroring
+    /// `ProviderCapabilities::declares_render_stage_buffer_per_stage_ceiling`
+    /// on the decoded side.
+    ///
+    /// The decoded number is what the class gate has to weigh, because a bit
+    /// the frame cannot carry is a bit no remote owner would ever see: an
+    /// owner-side snapshot that declared the window while the wire dropped it
+    /// is exactly the failure [`capabilities_frame`] exists to catch, and the
+    /// missing section is not an error but the older, stricter reading.
+    pub fn declares_per_stage_ceiling(&self) -> bool {
+        self.per_stage != 0
+    }
 }
 
 /// Encode a capability answer, decode it again, and read the stage-buffer bits
@@ -90,6 +117,7 @@ pub fn stage_buffer_support(
     Ok(StageBufferSupport {
         supported: decoded.supports_render_stage_buffers,
         maximum: decoded.max_render_stage_buffers,
+        per_stage: decoded.max_render_stage_buffers_per_stage,
     })
 }
 
