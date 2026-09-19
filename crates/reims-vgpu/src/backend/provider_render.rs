@@ -781,7 +781,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use metal_api_core::provider::{
@@ -4793,6 +4793,100 @@ fn declared_stage_buffer_support(
         })
 }
 
+/// The ceiling one *stage's own* declaration list is admitted under (R46,
+/// E-SB2).
+///
+/// `None` is the frame that carries no per-stage section — the reading every
+/// provider written before E-SB2 gives, and what
+/// [`declared_stage_buffer_support`]'s own decode states for it — and the class
+/// gate answers that arm with R9q's merged rule, byte for byte. `Some(ceiling)`
+/// is the device's own answer, which is `min(MAX_RENDER_STAGE_BUFFERS, the
+/// device's `maxPerStageDescriptorStorageBuffers`)` on the canonical side
+/// (`metal-api-vulkan`'s `stage_buffer_window`): a number that can be *narrower*
+/// than the contract's eight, which is why it is a reading and not a constant.
+///
+/// Read out of the capability *frame* rather than out of the snapshot beside
+/// it, exactly as [`declared_stage_buffer_support`] reads the shape's own bit:
+/// a window the frame cannot carry is a window no remote owner would ever see.
+/// The read happens only for a request whose own statement declares something
+/// ([`stage_buffer_window_candidate`]), so the ~99.9 % of draws that state no
+/// `[[buffer(N)]]` argument reach the rail no earlier than they did.
+pub fn declared_stage_buffer_per_stage_ceiling() -> Result<Option<usize>, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match STAGE_BUFFER_PER_STAGE_ANSWER.load(Ordering::Relaxed) {
+            STAGE_BUFFER_PER_STAGE_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.max_render_stage_buffers_per_stage = answer;
+                declared
+            }
+        }
+    };
+    let support = provider_wire::stage_buffer_support(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })?;
+    Ok(support
+        .declares_per_stage_ceiling()
+        .then_some(support.per_stage as usize))
+}
+
+/// The device's own answer for the per-stage ceiling (R46), and the state the
+/// test instrument below puts it in: `u32::MAX` cannot be a window
+/// (`MAX_RENDER_STAGE_BUFFERS` is eight and a device window is at most that),
+/// so the sentinel is unambiguous beside the zero a *missing* section decodes
+/// to.
+const STAGE_BUFFER_PER_STAGE_DEVICE: u32 = u32::MAX;
+
+/// Whether the per-stage ceiling is read from the device's own frame
+/// ([`STAGE_BUFFER_PER_STAGE_DEVICE`], what production runs) or from an answer
+/// a test stated.
+static STAGE_BUFFER_PER_STAGE_ANSWER: AtomicU32 = AtomicU32::new(STAGE_BUFFER_PER_STAGE_DEVICE);
+
+/// A test's own answer for the per-stage ceiling, restored when it drops
+/// (R46).
+///
+/// The rail reads the number out of the provider's capability frame, and a test
+/// that has to see either fail-closed arm cannot make an admitted device stop
+/// declaring the window: `Some(0)` states the *missing* section (the older,
+/// merged reading) and `Some(n)` states a narrower window. While this guards an
+/// answer, the capability question is asked of a snapshot carrying it —
+/// written, encoded and decoded through the same frame — so the arm a test sees
+/// is the arm such a frame gives, and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`StageBufferNamespaceSplitOverride`] is one: this changes a *decision* and
+/// not an observation, so a test that unwound through a failed assertion would
+/// otherwise leave the next shape in the same binary answering from a device
+/// that is not its own.
+pub struct StageBufferPerStageCeilingOverride {
+    previous: u32,
+}
+
+impl Drop for StageBufferPerStageCeilingOverride {
+    fn drop(&mut self) {
+        STAGE_BUFFER_PER_STAGE_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the per-stage ceiling as `declared` until the returned guard drops, or
+/// as the device's own answer for `None` (R46).
+pub fn override_stage_buffer_per_stage_ceiling(
+    declared: Option<u32>,
+) -> StageBufferPerStageCeilingOverride {
+    let answer = declared.unwrap_or(STAGE_BUFFER_PER_STAGE_DEVICE);
+    StageBufferPerStageCeilingOverride {
+        previous: STAGE_BUFFER_PER_STAGE_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The render-texture half of the same device answer (R28).
 ///
 /// One snapshot, two readings, exactly as [`declared_stage_buffer_support`]:
@@ -5943,6 +6037,20 @@ fn folded_stage_buffer_pair(
     None
 }
 
+/// The count rule's own candidate test (R46, E-SB2).
+///
+/// The per-stage ceiling is the walk's *first* rule, so the class asks the
+/// device for it before the walk runs — and asks it for exactly the population
+/// the rule can answer about: a request whose two stages state no classified
+/// `[[buffer(N)]]` declaration at all is admitted with an empty list whatever
+/// the window is (the walk's own early return), so it never reaches this
+/// question and never puts the rail's provider in place. Everything else is a
+/// shape the count rule weighs, and whether this device executes it is the
+/// device's answer to give.
+fn stage_buffer_window_candidate(inputs: &RenderRailInputs<'_>) -> Option<()> {
+    (!inputs.stage_buffer_statement().declared.is_empty()).then_some(())
+}
+
 /// The sampled bind of another extent one request's declaration walk states, in
 /// the walk's own order (R35/R37).
 ///
@@ -6090,12 +6198,119 @@ fn guest_backing_landing_candidate(inputs: &RenderRailInputs<'_>, req: &DrawRequ
 /// states the pair — the walk keeps both declarations and this rail translates
 /// the vertex half under the canonical namespace layout — and `false` answers
 /// it exactly as R31 did, by name, at the same point in the same order.
+///
+/// `stage_buffer_per_stage_ceiling` is the device's answer to the count rule's
+/// own question since E-SB2 (`Some`), or the absent section of a frame written
+/// before it (`None`). See [`stage_buffer_count_failure`] for what each arm
+/// answers and why the merged reading stays the fallback.
+///
+/// # The count rule's axis (R46, E-SB2)
+///
+/// Metal's `[[buffer(n)]]` index space is one per stage, and the canonical
+/// contract's ceiling now says so too: `MAX_RENDER_STAGE_BUFFERS` is the most
+/// declarations **one stage** may state (`research/docs/23` §117). The
+/// pipeline-level list is its consequence and not a second rule — two stages
+/// of eight are sixteen, which is exactly
+/// `metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS`, the bound
+/// the wire's own declaration block is sized by. This walk states no second
+/// copy of that number: the only list bound it can reach is the two stages' own
+/// ceilings, so 13 declarations (seven vertex + six fragment) cross the seam
+/// and reach the provider, which is what census v39's 92 `stage_buffer_shape`
+/// rows were asking for.
+///
+/// The device's own window narrows the contract's eight — `min(8, the device's
+/// `maxPerStageDescriptorStorageBuffers`)`, whose Vulkan core floor is four —
+/// so a stage whose own list is inside the contract and outside the device is
+/// still a shape admission refuses by name. That is the fail-closed arm, not an
+/// omission: the alternative is handing the pair over and taking the provider's
+/// own `render_stage_buffer_limit` back as a decline.
+enum StageBufferCountFailure {
+    /// The frame states a per-stage ceiling, and one stage's own list is longer
+    /// than it.
+    Stage {
+        stage: RenderPipelineStage,
+        count: usize,
+        ceiling: usize,
+    },
+    /// The frame carries no per-stage ceiling: R9q's merged reading, which is
+    /// the reading every provider written before E-SB2 answers.
+    Merged { count: usize },
+}
+
+impl StageBufferCountFailure {
+    /// The sentence the shape slug answers with.
+    ///
+    /// One slug, two readings: the census bucket is the bare
+    /// `render_provider_out_of_class_stage_buffer_shape` (and its
+    /// [`StageBufferShapeRoute::TooMany`] route), and the sentence is where the
+    /// reading that answered is legible. The stage arm names the stage and the
+    /// device's window; the merged arm is R9q's sentence with the reason the
+    /// rail is reading the merged rule at all stated in front of it.
+    fn sentence(&self) -> String {
+        match self {
+            Self::Stage {
+                stage,
+                count,
+                ceiling,
+            } => format!(
+                "a draw whose {} stage declares {count} stage buffers stays on the engine: the \
+                 canonical contract states at most {MAX_RENDER_STAGE_BUFFERS} stage buffers per \
+                 stage, and this device's own capability answer executes at most {ceiling} — a \
+                 stage above that window is a shape admission refuses by name rather than one the \
+                 provider would refuse back",
+                stage.name(),
+            ),
+            Self::Merged { count } => format!(
+                "a draw whose stages declare {count} stage buffers stays on the engine: the \
+                 provider's capability answer carries no per-stage stage-buffer ceiling, so this \
+                 rail reads the stricter merged bound — at most {MAX_RENDER_STAGE_BUFFERS} \
+                 pipeline-level buffers — and a longer list is a shape admission refuses by name",
+            ),
+        }
+    }
+}
+
+/// One statement's answer to the count rule (R46, E-SB2).
+///
+/// The rule's two arms are the wire's two readings and nothing else: with the
+/// frame's per-stage ceiling in hand the count is the stage's own (every stage
+/// of the pair is weighed, in the walk's canonical stage order, and the first
+/// one over the window answers), and without it the count is the merged list
+/// R9q weighed. Two arms rather than one comparison because the sentences —
+/// and therefore what a census log says about a refused shape — differ.
+fn stage_buffer_count_failure(
+    ordered: &[(RenderPipelineStage, &StageBufferDeclaration, BufferAccess)],
+    per_stage_ceiling: Option<usize>,
+) -> Option<StageBufferCountFailure> {
+    match per_stage_ceiling {
+        Some(ceiling) => [RenderPipelineStage::Vertex, RenderPipelineStage::Fragment]
+            .into_iter()
+            .find_map(|stage| {
+                let count = ordered
+                    .iter()
+                    .filter(|(stated, _, _)| *stated == stage)
+                    .count();
+                (count > ceiling).then_some(StageBufferCountFailure::Stage {
+                    stage,
+                    count,
+                    ceiling,
+                })
+            }),
+        None => {
+            (ordered.len() > MAX_RENDER_STAGE_BUFFERS).then_some(StageBufferCountFailure::Merged {
+                count: ordered.len(),
+            })
+        }
+    }
+}
+
 fn stage_buffer_gate<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &DrawRequest,
     binds: usize,
     vertex_streams: usize,
     stage_buffer_namespace_split: bool,
+    stage_buffer_per_stage_ceiling: Option<usize>,
 ) -> Result<Vec<NarrowStageBuffer<'a>>, OutOfClass> {
     // The one statement this request's two stages make (R9m): `declared` is
     // what the contract, the pass's own views and the wire frame are built
@@ -6147,19 +6362,14 @@ fn stage_buffer_gate<'a>(
     // (`NonCanonicalBindingOrder`) and not a preference.
     let mut ordered = statement.declared;
     ordered.sort_by_key(|(stage, declaration, _)| (stage.code(), declaration.index));
-    if ordered.len() > MAX_RENDER_STAGE_BUFFERS {
+    if let Some(counted) = stage_buffer_count_failure(&ordered, stage_buffer_per_stage_ceiling) {
         // The first of the three rules this slug names, counted under its own
         // route so the next census can size it (R9o): the refusal itself is
         // unchanged, still the bare shape slug.
         note_stage_buffer_shape(StageBufferShapeRoute::TooMany);
         return Err(OutOfClass::owned(
             "render_provider_out_of_class_stage_buffer_shape",
-            format!(
-                "a draw whose stages declare {} stage buffers stays on the engine: the canonical \
-                 contract states at most {MAX_RENDER_STAGE_BUFFERS} pipeline-level buffers, and a \
-                 longer list is a shape admission refuses by name",
-                ordered.len(),
-            ),
+            counted.sentence(),
         ));
     }
     let mut out: Vec<NarrowStageBuffer<'a>> = Vec::with_capacity(ordered.len());
@@ -8819,6 +9029,24 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // R46 (E-SB2): the count rule's own device answer, and the *first* one this
+    // rail asks — the rule it feeds is the walk's first, so an answer read
+    // after the walk would arrive after the walk had already refused the pair
+    // by name. Asked for exactly the population the rule can answer about
+    // ([`stage_buffer_window_candidate`]): a request whose stages state no
+    // classified declaration is admitted with an empty list whatever the
+    // window says, so it keeps the path it had and never puts the rail's
+    // provider in place.
+    let stage_buffer_per_stage_ceiling = match stage_buffer_window_candidate(inputs) {
+        None => None,
+        Some(()) => match declared_stage_buffer_per_stage_ceiling() {
+            Ok(ceiling) => ceiling,
+            // Same fail-closed direction as the folded-pair answer below: an
+            // unanswerable candidate is an in-class candidate, so the draw is
+            // declined rather than run on a rail the class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // R37: the extent rule's own class condition, and the second device answer
     // this rail asks *before* the gate. The rule it lifts sits inside the
     // declaration walk — the walk states the module's textures one by one and
@@ -8964,6 +9192,7 @@ fn submit_render_inner(
         inputs,
         req,
         stage_buffer_namespace_split,
+        stage_buffer_per_stage_ceiling,
         render_texture_gathered_extent,
         render_texture_gathered_extent_no_copy,
         render_vertex_interface_superset,
@@ -9531,7 +9760,7 @@ fn submit_render_inner(
         }
     }
     // R42's probe ends here: every class answer above — the pure gate, the
-    // four capability asks, the attachment window, the two copy-forced arms —
+    // capability asks, the attachment window, the two copy-forced arms —
     // has been given for this request, and a record that reaches this line is
     // in class. Nothing below it runs, so a probe costs the class and no
     // submission, and the class cannot answer the two callers differently.
@@ -9715,11 +9944,14 @@ pub fn stage_buffer_unused_skip_route(skipped: usize) -> &'static str {
 /// `research/docs/26` §30).
 ///
 /// The refusal slug is one name four rules answer under — more declarations
-/// than the canonical contract states ([`MAX_RENDER_STAGE_BUFFERS`]), one
-/// `(stage, index)` declared twice, one index read from both stages (R31, the
-/// canonical rail's merged set 0 folds the two Metal namespaces onto one
-/// descriptor), and a vertex declaration inside the canonical layout's own
-/// `0..vertex_streams` bindings — and until this
+/// than the canonical contract states *for one stage*
+/// ([`MAX_RENDER_STAGE_BUFFERS`], on the axis E-SB2 moved it to; a frame with
+/// no per-stage section answers the merged list bound instead, see
+/// [`stage_buffer_count_failure`]), one `(stage, index)` declared twice, one
+/// index read from both stages (R31, the canonical rail's merged set 0 folds
+/// the two Metal namespaces onto one descriptor), and a vertex declaration
+/// inside the canonical layout's own `0..vertex_streams` bindings — and until
+/// this
 /// increment every one of them was counted as the bare slug: the
 /// 2026-09-17 census v5 read 88026 / 89277 first failures under
 /// `render_provider_out_of_class_stage_buffer_shape` and could not say which
@@ -9744,8 +9976,10 @@ pub fn stage_buffer_shape_route(stage_buffer_shape: StageBufferShapeRoute) -> &'
 /// per `return`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageBufferShapeRoute {
-    /// The statement carries more declarations than
-    /// [`MAX_RENDER_STAGE_BUFFERS`] states.
+    /// The statement carries more declarations than the count rule admits: more
+    /// than the device's own per-stage window when the frame states one
+    /// (E-SB2's axis, whose review ceiling is [`MAX_RENDER_STAGE_BUFFERS`]), or
+    /// more than the merged [`MAX_RENDER_STAGE_BUFFERS`] when it does not.
     TooMany,
     /// One `(stage, index)` is declared twice.
     Duplicate,
@@ -11050,8 +11284,9 @@ fn nonindexed_vertex_span(
 /// from when it is.
 ///
 /// Pure over the request and this rail's own recorded state — plus the one
-/// device answers the caller hands it (`stage_buffer_namespace_split`, R33, and
-/// the extent rule's two arms, `render_texture_gathered_extent`, R37, and
+/// device answers the caller hands it (`stage_buffer_namespace_split`, R33,
+/// `stage_buffer_per_stage_ceiling`, R46/E-SB2, and the extent rule's two arms,
+/// `render_texture_gathered_extent`, R37, and
 /// `render_texture_gathered_extent_no_copy`, R40) — and ordered cheapest-first
 /// so a refused shape costs nothing: no provider call, no translation, and no
 /// registration. Every refusal names the condition that kept the shape on the
@@ -11080,6 +11315,7 @@ fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &'a DrawRequest,
     stage_buffer_namespace_split: bool,
+    stage_buffer_per_stage_ceiling: Option<usize>,
     render_texture_gathered_extent: bool,
     render_texture_gathered_extent_no_copy: bool,
     render_vertex_interface_superset: bool,
@@ -12032,6 +12268,7 @@ fn narrow_class<'a>(
         req.storage_buffers.len(),
         canonical_vertex_stream_count(&req.vertex_attributes),
         stage_buffer_namespace_split,
+        stage_buffer_per_stage_ceiling,
     )?;
     // The sampled textures the fragment stage reads (v101, `research/docs/23`
     // §101): the class states the module's own declarations beside the draw's

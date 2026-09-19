@@ -15241,6 +15241,13 @@ fn a_widened_stage_buffer_declaration_leaves_for_the_provider_and_agrees_with_th
     // The shape past the ceiling, on the same battery: nine declarations — one
     // more than the contract states — answer the shape slug by name, name the
     // live ceiling in the sentence, and never reach the provider.
+    //
+    // One stage naming nine is what R46 answers with the *stage's* own arm of
+    // the count rule (the device this suite runs on states a per-stage ceiling,
+    // and it is eight), so the sentence below is that arm's; the merged arm is
+    // the one a frame with no such section gives, and
+    // `a_per_stage_stage_buffer_shape_leaves_for_the_provider_and_agrees_with_the_engine`
+    // reads both.
     let over = ceiling + 1;
     let mut over_stages = buffer_declaring_stages(
         "render_frag_stage_buffers_eight.air",
@@ -15268,17 +15275,541 @@ fn a_widened_stage_buffer_declaration_leaves_for_the_provider_and_agrees_with_th
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_shape");
     assert!(
-        detail.contains(&format!("declare {over} stage buffers")),
-        "the sentence names the count: {detail}"
+        detail.contains(&format!("fragment stage declares {over} stage buffers")),
+        "the sentence names the stage and the count: {detail}"
     );
     assert!(
-        detail.contains(&format!("at most {ceiling} pipeline-level buffers")),
-        "and the live ceiling it is one past: {detail}"
+        detail.contains(&format!("at most {ceiling} stage buffers per stage")),
+        "and the contract's own per-stage ceiling it is one past: {detail}"
+    );
+    assert!(
+        detail.contains(&format!("executes at most {ceiling}")),
+        "beside the device's own window, which is the number the rule reads: {detail}"
     );
     assert_eq!(
         route_count("stage_buffer_shape_gt4"),
         route_before + 1,
         "the refusal is charged to the tail's own route, once"
+    );
+}
+
+/// The thirteen-declaration pair R46 (E-SB2) is about: seven
+/// `[[buffer(n)]]` arguments on the vertex stage
+/// (`render_vtx_stage_buffers_seven.air`) beside six on the fragment stage
+/// (`render_frag_stage_buffers_six.air`), each list inside the contract's own
+/// ceiling of eight and the two together past the merged one R9q read.
+///
+/// The declarations are the fixtures' own measured reflections, read back from
+/// the canonical translation the provider will run ([`declared_stage_buffers`]),
+/// exactly as [`folded_pair_stages`] and [`buffer_declaring_stages`] read
+/// theirs. The two stages name indices 0..5 in common, so the pair is also the
+/// folded shape R33's namespace split exists for — which is why this helper
+/// states the vertex stage's attribute locations as empty, as that pair's does:
+/// the stage reads its positions out of `[[buffer(0)]]`, so the request
+/// declares no `[[stage_in]]` stream at all.
+fn per_stage_ceiling_stages() -> Stages {
+    let mut stages = Stages {
+        air: (
+            fixture("render_vtx_stage_buffers_seven.air"),
+            fixture("render_frag_stage_buffers_six.air"),
+        ),
+        vertex_entry: "reims_stage_buffers_seven_vertex",
+        fragment_entry: "reims_stage_buffers_six_frag",
+        vertex_attribute_locations: Vec::new(),
+        vertex_stage_buffer_declarations: Vec::new(),
+        fragment_stage_buffer_declarations: Vec::new(),
+        fragment_texture_declarations: Vec::new(),
+        sampler_family: RenderSamplerFamily::default(),
+        texture_interface_refusals: Vec::new(),
+    };
+    stages.vertex_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.0, RenderStage::Vertex, stages.vertex_entry);
+    stages.fragment_stage_buffer_declarations =
+        declared_stage_buffers(&stages.air.1, RenderStage::Fragment, stages.fragment_entry);
+    stages
+}
+
+/// The clear neither arm draws, so a texel the triangle does not reach is a
+/// reading of its own rather than a black the fragment half could have written
+/// (`8`-exact components, like [`FRAGMENT_TEXEL`]).
+const CLEAR_SENTINEL: [f64; 4] = [64.0 / 255.0, 128.0 / 255.0, 191.0 / 255.0, 1.0];
+
+/// The triangle every arm of the R46 test draws: the one R33's folded pair
+/// uses, so its coverage of the (0, 0) texel is the same reading.
+const PER_STAGE_SCREEN: [(f32, f32); 3] = [(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)];
+
+/// One pair's stage buffers as the seam states them: the vertex half's binds in
+/// their own order, then the fragment half's.
+fn per_stage_binds<'a>(
+    vertex: &'a [BufferContent],
+    fragment: &'a [BufferContent],
+) -> Vec<StageBufferBind<'a>> {
+    vertex
+        .iter()
+        .enumerate()
+        .map(|(index, content)| staged_bind(RenderPipelineStage::Vertex, index as u32, content))
+        .chain(fragment.iter().enumerate().map(|(index, content)| {
+            staged_bind(RenderPipelineStage::Fragment, index as u32, content)
+        }))
+        .collect()
+}
+
+/// One request both rails execute, in each stage's own device numbering: the
+/// vertex stage's binds keep their Metal index, while the fragment half moves to
+/// `index + FRAG_BUFFER_BINDING_OFFSET` — the collision rule both halves of the
+/// production seam apply when one index is read from both stages
+/// (`runtime/draw/vulkan.rs`'s `buf_collide`), which the thirteen-declaration
+/// pair is at every index it has.
+fn per_stage_request(vertex: &[BufferContent], fragment: &[BufferContent]) -> DrawRequest {
+    let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    req.vertex_attributes.clear();
+    req.color_attachment = Some(attachment_with_clear(
+        MTL_FORMAT_RGBA8_UNORM,
+        CLEAR_SENTINEL,
+    ));
+    for (index, content) in vertex.iter().enumerate() {
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: index as u32,
+            content: content.clone(),
+        });
+    }
+    for (index, content) in fragment.iter().enumerate() {
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: reims_vgpu::runtime::spirv_bind::FRAG_BUFFER_BINDING_OFFSET + index as u32,
+            content: content.clone(),
+        });
+    }
+    req
+}
+
+/// R46 (E-SB2): the count rule is the *stage's* own, and the device answers how
+/// wide that is.
+///
+/// Census v39 still read 92 rows under
+/// `render_provider_out_of_class_stage_buffer_shape`, and R9q read the shape
+/// behind them out of the census log: a pair that declares **thirteen**
+/// `[[buffer(n)]]` arguments between its two stages, seven on one and six on
+/// the other. E-SB2 moved the contract's ceiling onto the axis Metal's index
+/// space actually has — one list per stage — and published the device's own
+/// window on the capability wire, so this rail's walk states that pair instead
+/// of keeping it on the engine.
+///
+/// Four readings come out of one battery:
+///
+/// - the thirteen declarations leave for the provider on the device's own
+///   window, and the frame is the engine's own frame byte for byte — including
+///   the vertex half, whose seven slots are read through the canonical
+///   namespace layout R33 published;
+/// - both halves' bytes move that frame (the six fragment payloads sum into the
+///   colour, and a vertex offset past the viewport leaves the clear sentinel),
+///   so the list is carried rather than truncated at the old merged bound;
+/// - a frame with **no** per-stage section keeps R9q's merged reading and
+///   refuses the same pair by name — the fail-closed arm every provider written
+///   before E-SB2 answers;
+/// - and a device whose window is narrower than a stage's own list refuses that
+///   stage by name, which is the arm the window exists for: the contract's
+///   eight is a review ceiling, and Vulkan's core floor for the axis is four.
+#[test]
+fn a_per_stage_stage_buffer_shape_leaves_for_the_provider_and_agrees_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = per_stage_ceiling_stages();
+    // The shape, from the fixtures' own translations: seven vertex declarations
+    // (the affine positions argument beside six static `float4` offsets) and six
+    // fragment ones, thirteen together.
+    let vertex_declarations = stages.vertex_stage_buffer_declarations.clone();
+    let fragment_declarations = stages.fragment_stage_buffer_declarations.clone();
+    assert_eq!(
+        vertex_declarations.len(),
+        7,
+        "the vertex fixture declares seven buffers: {vertex_declarations:#?}"
+    );
+    assert_eq!(
+        fragment_declarations.len(),
+        6,
+        "the fragment fixture declares six buffers: {fragment_declarations:#?}"
+    );
+    for (index, declaration) in vertex_declarations.iter().enumerate() {
+        assert_eq!(
+            (declaration.index, declaration.access),
+            (index as u32, StageBufferAccess::Read),
+            "vertex slot {index} is declared at its own Metal index and read"
+        );
+    }
+    assert!(
+        matches!(
+            vertex_declarations[0].footprint,
+            StageBufferFootprint::Affine { .. }
+        ),
+        "the positions argument is the affine `positions[vertex_id]` reach: {:#?}",
+        vertex_declarations[0]
+    );
+    for declaration in &vertex_declarations[1..] {
+        assert_eq!(
+            declaration.footprint,
+            StageBufferFootprint::Static { max_bytes: 16 },
+            "every offset argument is one whole `float4`: {declaration:#?}"
+        );
+    }
+    for (index, declaration) in fragment_declarations.iter().enumerate() {
+        assert_eq!(
+            (declaration.index, declaration.access),
+            (index as u32, StageBufferAccess::Read),
+            "fragment slot {index} is declared at its own Metal index and read"
+        );
+        assert_eq!(
+            declaration.footprint,
+            StageBufferFootprint::Static { max_bytes: 16 },
+            "fragment slot {index} is reached by one whole `float4`"
+        );
+    }
+    // The window, read the way the class gate reads it: out of the capability
+    // frame the provider would send (R46).
+    let window = provider_render::declared_stage_buffer_per_stage_ceiling()
+        .expect("the capability answer encodes and decodes")
+        .expect("this device states a per-stage stage-buffer ceiling");
+    eprintln!(
+        "per-stage ceiling window: per_stage={window} list={} declarations={}",
+        metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+        vertex_declarations.len() + fragment_declarations.len(),
+    );
+    assert_eq!(
+        window,
+        metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS,
+        "the contract's own ceiling is what this device's window is limited by"
+    );
+    assert!(
+        vertex_declarations.len() <= window && fragment_declarations.len() <= window,
+        "each stage's own list is inside the window, which is the whole point of the axis"
+    );
+    assert!(
+        vertex_declarations.len() + fragment_declarations.len()
+            > metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS,
+        "and the pair is past the merged bound R9q read, so the two readings differ here"
+    );
+
+    // The draws. The fragment half's six payloads are `20/255` each except the
+    // one a mutant moves to `40/255`, and the vertex half's six offsets are zero
+    // except the one a mutant moves — so every reading sits far from a
+    // quantisation tie and the two mutations land different frames.
+    let ordinary = 20.0f32 / 255.0f32;
+    let mutant_word = 40.0f32 / 255.0f32;
+    let payloads = |mutant: Option<u32>| -> Vec<BufferContent> {
+        (0..fragment_declarations.len() as u32)
+            .map(|index| {
+                let word = if mutant == Some(index) {
+                    mutant_word
+                } else {
+                    ordinary
+                };
+                let mut bytes = Vec::with_capacity(16);
+                for _ in 0..4 {
+                    bytes.extend_from_slice(&word.to_ne_bytes());
+                }
+                BufferContent::Bytes(std::sync::Arc::new(bytes))
+            })
+            .collect()
+    };
+    let expected_red = |mutant: Option<u32>| -> u8 {
+        let mut sum = 0.0f32;
+        for index in 0..fragment_declarations.len() as u32 {
+            sum += if mutant == Some(index) {
+                mutant_word
+            } else {
+                ordinary
+            };
+        }
+        (sum * 255.0f32).round() as u8
+    };
+    // The vertex half: the affine positions argument first, then the six
+    // offsets, the mutated one carrying a clip-space shift past the viewport.
+    let last_vertex_slot = vertex_declarations.len() as u32 - 1;
+    let vertex_contents = |mutant: Option<(u32, f32, f32)>| -> Vec<BufferContent> {
+        let mut out = vec![BufferContent::Bytes(std::sync::Arc::new(f32x2(
+            &PER_STAGE_SCREEN,
+        )))];
+        for index in 1..=last_vertex_slot {
+            let mut bytes = Vec::with_capacity(16);
+            for component in 0..4 {
+                let word = match mutant {
+                    Some((at, x, _)) if at == index && component == 0 => x,
+                    Some((at, _, y)) if at == index && component == 1 => y,
+                    _ => 0.0f32,
+                };
+                bytes.extend_from_slice(&word.to_ne_bytes());
+            }
+            out.push(BufferContent::Bytes(std::sync::Arc::new(bytes)));
+        }
+        out
+    };
+    let provider_frame =
+        |label: &str, vertex: &[BufferContent], fragment: &[BufferContent]| -> Vec<u8> {
+            let binds = per_stage_binds(vertex, fragment);
+            match provider_render::submit_render(
+                &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+                &per_stage_request(vertex, fragment),
+            ) {
+                RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+                other => panic!(
+                    "{label}: thirteen declarations inside the device's own window advertise a \
+                     shape the class executes: {other:?}"
+                ),
+            }
+        };
+    // The engine arm, on the same AIR translated by this crate's own translator
+    // and put in the numbering the engine's collision rule gives it — the
+    // fragment band relocated, the module rewritten to match. That is what
+    // `runtime/draw/vulkan.rs` does for a prepared draw, and it is why the two
+    // rails can be compared on one request at all.
+    let engine_frame =
+        |label: &str, vertex: &[BufferContent], fragment: &[BufferContent]| -> Option<Vec<u8>> {
+            let cached = |stage| {
+                reims_vgpu::runtime::m2v_cache::translate_cached_reflected(
+                    match stage {
+                        metal2vulkan::passes::Stage::Vertex => stages.air.0.as_slice(),
+                        metal2vulkan::passes::Stage::Fragment => stages.air.1.as_slice(),
+                        metal2vulkan::passes::Stage::Kernel => unreachable!("render stages only"),
+                    },
+                    stage,
+                    0,
+                )
+                .expect("the fixture translates")
+            };
+            let mut req = per_stage_request(vertex, fragment);
+            req.vert_spirv = std::sync::Arc::new(
+                (*cached(metal2vulkan::passes::Stage::Vertex)
+                    .variant(false, false)
+                    .words)
+                    .clone(),
+            );
+            req.frag_spirv = std::sync::Arc::new(
+                (*cached(metal2vulkan::passes::Stage::Fragment)
+                    .variant(false, true)
+                    .words)
+                    .clone(),
+            );
+            engine_pixels_prepared(label, &req)
+        };
+
+    // The shape itself, both rails.
+    let screen = vertex_contents(None);
+    let payload = payloads(None);
+    let submissions = provider_render::provider_submissions();
+    let frame = provider_frame("thirteen declarations", &screen, &payload);
+    assert_texel_count("thirteen declarations", &frame);
+    assert!(
+        provider_render::provider_submissions() > submissions,
+        "the pair reaches the canonical provider rather than the engine"
+    );
+    let expected = expected_red(None);
+    assert_eq!(
+        texel_at(&frame, 0, 0),
+        [expected, expected, expected, expected],
+        "the colour is the six fragment payloads' sum through the format's quantisation"
+    );
+    let Some(engine) = engine_frame("thirteen declarations", &screen, &payload) else {
+        return;
+    };
+    assert_eq!(
+        texel_at(&engine, 0, 0),
+        [expected, expected, expected, expected],
+        "the engine's colour rests on the same thirteen declarations"
+    );
+    assert_frames_equal(
+        "canonical provider vs engine, thirteen declarations",
+        &frame,
+        &engine,
+    );
+    eprintln!(
+        "thirteen declarations: provider == engine, {} bytes, texel {:?}",
+        frame.len(),
+        texel_at(&frame, 0, 0),
+    );
+
+    // The fragment half's last slot is really bound: with it moved to
+    // `40/255` the sum is five payloads of `20/255` plus the one, which is a
+    // different colour — and the engine lands the same one.
+    let moved_payload = payloads(Some(fragment_declarations.len() as u32 - 1));
+    let moved_frame = provider_frame(
+        "thirteen declarations, payload moved",
+        &screen,
+        &moved_payload,
+    );
+    let moved_expected = expected_red(Some(fragment_declarations.len() as u32 - 1));
+    assert_eq!(
+        texel_at(&moved_frame, 0, 0),
+        [
+            moved_expected,
+            moved_expected,
+            moved_expected,
+            moved_expected
+        ],
+        "the moved slot's own bytes reach the frame"
+    );
+    assert_frames_differ(
+        "thirteen declarations: the fragment half's own slot decides the colour",
+        &moved_frame,
+        &frame,
+    );
+    if let Some(engine) = engine_frame(
+        "thirteen declarations, payload moved",
+        &screen,
+        &moved_payload,
+    ) {
+        assert_frames_equal(
+            "canonical provider vs engine, payload moved",
+            &moved_frame,
+            &engine,
+        );
+    }
+
+    // The vertex half's slots are bound bytes too: an offset that pushes the
+    // triangle past the viewport leaves the clear sentinel behind, so the seven
+    // declarations the contract states are read rather than dropped.
+    let shifted = vertex_contents(Some((last_vertex_slot, 2.0, 0.0)));
+    let shifted_frame = provider_frame("thirteen declarations, vertex moved", &shifted, &payload);
+    assert_eq!(
+        texel_at(&shifted_frame, 0, 0),
+        [64, 128, 191, 255],
+        "a vertex offset past the viewport leaves the clear sentinel"
+    );
+    assert_frames_differ(
+        "thirteen declarations: the vertex half's own slots decide the coverage",
+        &shifted_frame,
+        &frame,
+    );
+    if let Some(engine) = engine_frame("thirteen declarations, vertex moved", &shifted, &payload) {
+        assert_eq!(
+            texel_at(&engine, 0, 0),
+            [64, 128, 191, 255],
+            "the engine's own vertex half leaves the sentinel in the same place"
+        );
+        assert_frames_equal(
+            "canonical provider vs engine, vertex moved",
+            &shifted_frame,
+            &engine,
+        );
+    }
+    eprintln!(
+        "thirteen declarations, mutations: fragment -> {:?}, vertex -> {:?}",
+        texel_at(&moved_frame, 0, 0),
+        texel_at(&shifted_frame, 0, 0),
+    );
+
+    // The merged arm: a frame that carries no per-stage section. This is the
+    // arm every provider written before E-SB2 gives, and it reads the same pair
+    // exactly as R9q read it — by name, with the merged bound in the sentence,
+    // and without a submission.
+    let merged_before = route_count("stage_buffer_shape_gt4");
+    let merged_submissions = provider_render::provider_submissions();
+    {
+        let _missing = provider_render::override_stage_buffer_per_stage_ceiling(Some(0));
+        let binds = per_stage_binds(&screen, &payload);
+        let req = per_stage_request(&screen, &payload);
+        let reason = match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &req,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => reason,
+            other => panic!(
+                "a frame with no per-stage section states a window this rail cannot read: {other:?}"
+            ),
+        };
+        eprintln!("door (no per-stage section): {reason}");
+        assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_stage_buffer_shape",
+            "the merged arm answers under the shape slug"
+        );
+        let detail = reason.detail();
+        assert!(
+            detail.contains("declare 13 stage buffers"),
+            "the sentence names the merged count: {detail}"
+        );
+        assert!(
+            detail.contains(&format!(
+                "at most {} pipeline-level buffers",
+                metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS
+            )),
+            "and R9q's own merged bound, which is what the missing section means: {detail}"
+        );
+        assert!(
+            detail.contains("carries no per-stage stage-buffer ceiling"),
+            "with the reason the rail is reading the merged rule at all: {detail}"
+        );
+    }
+    assert_eq!(
+        route_count("stage_buffer_shape_gt4"),
+        merged_before + 1,
+        "the merged refusal is charged to the count rule's own route, once"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        merged_submissions,
+        "the class keeps the shape: it does not hand it over and take a decline back"
+    );
+
+    // The narrowing arm: a device whose window is narrower than one stage's own
+    // list. Four is Vulkan's own core floor for the axis, so this is the shape a
+    // device may state — and the one this rail has to refuse by name rather
+    // than submit and be declined.
+    let narrowed_before = route_count("stage_buffer_shape_gt4");
+    let narrowed_submissions = provider_render::provider_submissions();
+    {
+        let _narrow = provider_render::override_stage_buffer_per_stage_ceiling(Some(4));
+        let six = buffer_declaring_stages(
+            "render_frag_stage_buffers_six.air",
+            "reims_stage_buffers_six_frag",
+        );
+        assert_eq!(
+            six.fragment_stage_buffer_declarations.len(),
+            6,
+            "the fixture declares six, which is inside the contract's eight and outside this window"
+        );
+        let contents: Vec<BufferContent> = (0..6)
+            .map(|_| BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])))
+            .collect();
+        let staged = per_stage_binds(&[], &contents);
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        for (index, content) in contents.iter().enumerate() {
+            req.storage_buffers.push(engine::StorageBufferResource {
+                binding: index as u32,
+                content: content.clone(),
+            });
+        }
+        let reason = match provider_render::submit_render(
+            &inputs_with_binds(&six, RenderChainRole::SoleOrTail, &staged),
+            &req,
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => reason,
+            other => panic!(
+                "a stage above the device's own window is not a shape this rail admits: {other:?}"
+            ),
+        };
+        eprintln!("door (narrow window): {reason}");
+        assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_stage_buffer_shape",
+            "the narrowing arm answers under the shape slug"
+        );
+        let detail = reason.detail();
+        assert!(
+            detail.contains("fragment stage declares 6 stage buffers"),
+            "the sentence names the stage and its own count: {detail}"
+        );
+        assert!(
+            detail.contains("executes at most 4"),
+            "and the window it is above: {detail}"
+        );
+    }
+    assert_eq!(
+        route_count("stage_buffer_shape_gt4"),
+        narrowed_before + 1,
+        "the narrowing refusal is charged to the same route, once"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        narrowed_submissions,
+        "and the provider is never handed a stage list above its own window"
     );
 }
 
@@ -15607,11 +16138,14 @@ fn the_stage_buffer_door_names_every_fact_between_a_declaration_and_the_provider
         "the sentence names the source and the rail that would carry it: {detail}"
     );
 
-    // The canonical list's own shape: at most `MAX_RENDER_STAGE_BUFFERS`
-    // declarations, one per slot. The ceiling is the live contract constant —
-    // E-SB1 raised it from four to eight (`research/docs/23` §108) — so the
-    // shape that crosses it is built from the constant rather than written as
-    // five, and the sentence it is compared with is derived the same way.
+    // The count rule's own shape: at most `MAX_RENDER_STAGE_BUFFERS`
+    // declarations **in one stage**, one per slot. The ceiling is the live
+    // contract constant — E-SB1 raised it from four to eight and E-SB2 put it
+    // on the stage's own axis, which is the axis Metal's `[[buffer(n)]]` index
+    // space has, so the shape that crosses it is built from the constant rather
+    // than written as five, and the sentence it is compared with is derived the
+    // same way (R46; the device's own window narrows it, and this suite's device
+    // states the eight the contract does).
     let over_cap = metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS + 1;
     let too_many = (0..over_cap as u32)
         .map(|index| StageBufferDeclaration {
@@ -15625,8 +16159,8 @@ fn the_stage_buffer_door_names_every_fact_between_a_declaration_and_the_provider
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_shape");
     assert!(
-        detail.contains(&format!("declare {over_cap} stage buffers")),
-        "the sentence names the count: {detail}"
+        detail.contains(&format!("declares {over_cap} stage buffers")),
+        "the sentence names the stage's own count: {detail}"
     );
     let stages = with_fragment(vec![
         declaration(StageBufferFootprint::Static { max_bytes: 4 }),
@@ -16283,15 +16817,18 @@ fn each_stage_buffer_shape_rule_is_counted_under_its_own_route() {
     let duplicate_binds = [staged_bind(RenderPipelineStage::Fragment, 1, &content)];
     // The over-cap shape and the sentence naming its count both come from the
     // live contract ceiling rather than from the four the shape was written
-    // against: E-SB1 raised `MAX_RENDER_STAGE_BUFFERS` to eight
-    // (`research/docs/23` §108), and the rule this arm reads is "longer than the
-    // contract states", not a number of its own.
+    // against: E-SB1 raised `MAX_RENDER_STAGE_BUFFERS` to eight and E-SB2 put
+    // the ceiling on the stage's own axis (`research/docs/23` §117, R46), and
+    // the rule this arm reads is "longer than the contract states for *this*
+    // stage", not a number of its own. The device's own window sits inside that
+    // ceiling and this suite's device states the eight, so the sentence names
+    // the fragment stage and the count the walk weighed.
     let over_cap = metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS + 1;
     let shapes = [
         (
             "too many",
             "render_provider_out_of_class_stage_buffer_shape",
-            format!("declare {over_cap} stage buffers"),
+            format!("fragment stage declares {over_cap} stage buffers"),
             with_declarations(
                 &bases,
                 Vec::new(),
@@ -19421,14 +19958,29 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
     let support = provider_wire::stage_buffer_support(probe.device_epoch(), &probe.capabilities())
         .expect("the capability answer encodes and decodes");
     eprintln!(
-        "wire capability answer: supports_render_stage_buffers={} max_render_stage_buffers={}",
-        support.supported, support.maximum
+        "wire capability answer: supports_render_stage_buffers={} max_render_stage_buffers={} \
+         max_render_stage_buffers_per_stage={}",
+        support.supported, support.maximum, support.per_stage
     );
     assert!(support.supported, "this device declares the shape");
+    // E-SB2 moved the contract's ceiling onto the stage's own axis, and the
+    // capability answer followed it: the *pipeline-level* list bound this frame
+    // carries is the pair's sum (`MAX_RENDER_STAGE_BUFFER_DECLARATIONS`), and
+    // the per-stage window rides beside it as the escape family's own tag —
+    // absent, and therefore `0`, on every frame written before it (R46).
     assert_eq!(
         support.maximum as usize,
+        metal_api_core::provider::MAX_RENDER_STAGE_BUFFER_DECLARATIONS,
+        "the list bound is the pair's sum, which is what the frame's declaration block is sized by"
+    );
+    assert!(
+        support.declares_per_stage_ceiling(),
+        "and this device states the per-stage window the count rule reads"
+    );
+    assert_eq!(
+        support.per_stage as usize,
         metal_api_core::provider::MAX_RENDER_STAGE_BUFFERS,
-        "and the same cap the contract states"
+        "whose value is the contract's own ceiling narrowed by this device"
     );
 
     // The fail-closed arm: the same frame, admitted by a snapshot that does not
@@ -19437,14 +19989,19 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
     let mut unsupporting = probe.capabilities();
     unsupporting.supports_render_stage_buffers = false;
     unsupporting.max_render_stage_buffers = 0;
+    unsupporting.max_render_stage_buffers_per_stage = 0;
     let unsupported =
         provider_wire::stage_buffer_support(probe.device_epoch(), &unsupporting).expect("decode");
     eprintln!(
         "wire capability answer, undeclared snapshot: supports_render_stage_buffers={} \
-         max_render_stage_buffers={}",
-        unsupported.supported, unsupported.maximum
+         max_render_stage_buffers={} max_render_stage_buffers_per_stage={}",
+        unsupported.supported, unsupported.maximum, unsupported.per_stage
     );
     assert!(!unsupported.supported);
+    assert!(
+        !unsupported.declares_per_stage_ceiling(),
+        "and a snapshot that declares no shape states no window either, which is the merged read"
+    );
     let refusal = unsupporting
         .validate_trace(trace.clone(), resources.clone())
         .expect_err("a snapshot without the bit refuses the pass");
