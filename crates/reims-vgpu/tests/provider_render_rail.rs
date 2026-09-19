@@ -17154,6 +17154,302 @@ fn a_stage_buffer_the_seam_derives_from_its_gather_leaves_without_a_copy() {
     );
 }
 
+/// E-TX6/the run-list arm: a stage buffer the GPU would gather from **two**
+/// registered stretches leaves for the provider as the contract's ordered run
+/// list, with nothing copied by this class.
+///
+/// R9e's test above answers the one-stretch gather. The scatter is the shape
+/// the family is actually made of — the guest backs a surface in
+/// physically-contiguous granules, so a bind that is not one granule is two or
+/// more — and it is what `render_provider_out_of_class_stage_buffer_gather`
+/// counted 91 736 of in one boot
+/// (`evidence/gate3-census-fp22-2026-09-19`). The list is the contract's own
+/// multi-window arm (`BufferSource::GuestRuns`, E-TX6): one registered window
+/// per stretch, in window order, whose concatenation *is* the bind's byte range
+/// and whose bytes the provider gathers out of the owner's **live** pages at
+/// execution.
+///
+/// Every fact is checkable at once: the draw reaches the provider, the wire
+/// carries `BufferSource::GuestRuns` with one run per stretch at the bind's own
+/// length, the frame is byte-identical to the engine's for the same request and
+/// the same bytes, the lease row names the borrowed no-copy channel and no copy
+/// of the class's own, and moving the owner's own mapping between submissions
+/// moves the frame — a rail that froze the runs' coordinates at admission would
+/// be unmoved by it.
+///
+/// The first run's window is the granule its own first byte sits in, so the
+/// bind begins at that run's own `GuestRef::head`; the second starts on its
+/// granule's first byte. A rail that read the window's base instead of
+/// `head + skip` would name the granule rather than the bind, which is what
+/// the frame comparison catches.
+#[test]
+fn a_stage_buffer_gather_scattered_over_two_registered_stretches_leaves_without_a_copy() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    /// The first run's own head: how far the bind's first byte sits into the
+    /// granule the registration cut, and where this fixture writes the
+    /// fragment's red.
+    const HEAD: u64 = 8;
+    /// Bytes one stretch of the list carries.
+    const RUN_BYTES: u64 = 8;
+    /// Bytes the declaration covers: the two stretches' sum.
+    const BIND_BYTES: u64 = 2 * RUN_BYTES;
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the run-list arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let head = usize::try_from(HEAD).expect("the head fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The fragment's red at the bind's own first byte: `HEAD` into the first
+    // granule, which is where the first run's window begins.
+    owner.as_mut_slice()[head..head + 4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let reference = |offset: u64, len: u64| {
+        GuestRef::new(
+            std::sync::Arc::clone(&import),
+            import
+                .slice(offset, len)
+                .expect("the stretch is inside the import"),
+        )
+        .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    // The gather a driven draw builds: one host run per stretch, the bind's own
+    // bytes tiled by the two page runs, and the window the registration ledger
+    // derived for each of them. The first stretch starts `HEAD` into its
+    // granule, so its own head carries the difference.
+    let gather = || {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![
+                engine::GuestRun::in_mapping(
+                    owner.pointer as usize,
+                    2 * page as u64,
+                    HEAD,
+                    RUN_BYTES,
+                )
+                .expect("the first stretch is inside the mapping"),
+                engine::GuestRun::in_mapping(
+                    owner.pointer as usize,
+                    2 * page as u64,
+                    page as u64,
+                    RUN_BYTES,
+                )
+                .expect("the second stretch is inside the mapping"),
+            ]),
+            source_offset: 0,
+            total_len: BIND_BYTES,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(vec![
+                GuestWindowRun {
+                    window_offset: 0,
+                    guest: reference(HEAD, RUN_BYTES),
+                    window: Some(RegisteredWindow {
+                        import: import.id(),
+                        base: owner.pointer as u64,
+                        length: page as u64,
+                        epoch: 1,
+                    }),
+                },
+                GuestWindowRun {
+                    window_offset: RUN_BYTES,
+                    guest: reference(page as u64, RUN_BYTES),
+                    window: Some(RegisteredWindow {
+                        import: import.id(),
+                        base: owner.pointer as u64 + page as u64,
+                        length: page as u64,
+                        epoch: 1,
+                    }),
+                },
+            ])),
+            direct_image: None,
+        })
+    };
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    let request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    // The engine's own frame for the same request and the same bytes, taken
+    // before anything is registered on the owner rail: the engine's device
+    // context is created lazily on its first draw, and that creation resets the
+    // owner rail.
+    let Some(engine_frame) =
+        engine_pixels("scattered stage-buffer gather", &stages, request(&gather()))
+    else {
+        return;
+    };
+    // One registration over the whole two-granule allocation: the windows of
+    // both stretches are cut from it, which is what lets one declaration state
+    // the list (the contract pairs every run's reservation with the declaring
+    // view's own allocation).
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let content = gather();
+    let binds = [StageBufferBind {
+        stage: RenderPipelineStage::Fragment,
+        index: 0,
+        content: &content,
+        // The seam states no window: each run derives its own.
+        window: None,
+        landing: None,
+    }];
+    let log_before = std::fs::read_to_string(reims_vgpu_observe::fail_log_path())
+        .unwrap_or_default()
+        .len();
+
+    use reims_vgpu::backend::provider_wire;
+
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts();
+    let delivered = provider_render::provider_submissions();
+    let red = match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(&content),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!(
+            "a two-stretch gather whose windows are registered is a run list, not a refusal: \
+             {other:?}"
+        ),
+    };
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    eprintln!(
+        "scattered stage-buffer gather: device host-import alignment = {alignment}; {BIND_BYTES} \
+         byte(s) of bind over two {RUN_BYTES} byte stretches inside registration {import_id}; \
+         provider submissions {delivered} -> {}, texel (0, 0) {:?}",
+        provider_render::provider_submissions(),
+        texel_at(&red, 0, 0),
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
+    assert_eq!(
+        texel_at(&red, 0, 0),
+        [255, 0, 0, 255],
+        "the fragment read the bind's first bytes through its own run"
+    );
+    assert_frames_equal(
+        "scattered stage-buffer gather, both rails",
+        &red,
+        &engine_frame,
+    );
+
+    // The wire's own reading: the list is what crossed, one run per registered
+    // stretch, at the bind's own length and with the runs tiling it exactly.
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before.submit_frames + 1,
+        "the seam produced exactly one submission frame for the list"
+    );
+    assert_eq!(frames.len(), 1, "and the capture holds it");
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_pass = wire_trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .expect("the frame carries the render pass");
+    let view = wire_pass
+        .stage_buffers
+        .first()
+        .expect("the frame carries the declared stage buffer");
+    let source = match &view.view.source {
+        BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
+        BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
+        BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+        BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+    };
+    eprintln!(
+        "wire stage-buffer view: stage={:?} offset={} length={} source={source}",
+        view.stage, view.view.offset, view.view.length,
+    );
+    let BufferSource::GuestRuns(runs) = &view.view.source else {
+        panic!("a two-stretch gather crosses as the contract's run list: {source}");
+    };
+    assert_eq!(runs.len(), 2, "one run per registered stretch");
+    assert_eq!(
+        view.view.length, BIND_BYTES,
+        "the list is the bind's own bytes, not either granule"
+    );
+    assert_eq!(
+        view.view.offset, 0,
+        "the runs carry their own offsets inside the allocation"
+    );
+    assert_eq!(
+        runs.iter().map(|run| run.length).sum::<u64>(),
+        BIND_BYTES,
+        "the runs tile the view exactly"
+    );
+
+    // The lease row, verbatim: the arm the list left through. One registration
+    // is one lease and one row, however many stretches the list states.
+    let log = std::fs::read_to_string(reims_vgpu_observe::fail_log_path()).expect("fail log");
+    let fresh = &log[log_before.min(log.len())..];
+    let lease = fresh
+        .lines()
+        .find(|line| line.contains("provider_owner_lease") && line.contains("no_copy=1"))
+        .unwrap_or_else(|| panic!("the borrowed lease row was emitted: {fresh}"));
+    eprintln!("lease row: {lease}");
+    assert!(
+        lease.contains("channel=borrowed") && lease.contains(&format!("import={import_id}")),
+        "the row names the no-copy arm and this import: {lease}"
+    );
+    assert!(
+        !fresh
+            .lines()
+            .any(|line| line.contains("provider_owner_lease") && line.contains("no_copy=0")),
+        "the class copied nothing: the list is the owner's own pages"
+    );
+
+    // The falsifiable half: move the owner's bytes at the bind's first byte and
+    // the next submission follows. A rail that had frozen the runs' coordinates
+    // at admission would be unmoved by this.
+    owner.as_mut_slice()[head..head + 4].copy_from_slice(&[0, 0, 0, 0]);
+    let black = match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(&content),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the same list stays in class after the mapping moved: {other:?}"),
+    };
+    eprintln!(
+        "provider texel after moving the mapping's first float: {:?}",
+        texel_at(&black, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&black, 0, 0),
+        [0, 0, 0, 255],
+        "the same list now reads the moved bytes"
+    );
+    assert_frames_differ(
+        "the owner's own bytes reach the provider's frame through the run list",
+        &red,
+        &black,
+    );
+}
+
 /// R18: a window-backed stage buffer whose view pointer misses the device's
 /// import granules is *copied* into the owner's staged arm instead of keeping
 /// the draw on the engine.
@@ -17635,7 +17931,12 @@ fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
         }
     };
 
-    // Scattered: two runs tile the bind, so no single host range is its bytes.
+    // Two runs that do **not** tile the bind: each spans the whole granule, so
+    // their clipped lengths sum to more than the bind. The contract's run list
+    // *is* the view's byte range, so this is a declaration about bytes no
+    // record wrote — and a scatter that does tile the bind with registered
+    // windows is the run-list arm instead
+    // (`a_stage_buffer_gather_scattered_over_two_registered_stretches_leaves_without_a_copy`).
     let scattered = gather(
         0,
         vec![
@@ -17699,6 +18000,204 @@ fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     // Both buckets are counters, not latches.
     assert!(route_count("render_provider_out_of_class_stage_buffer_gather") >= 2);
     assert!(route_count("render_provider_out_of_class_stage_buffer_alignment") >= 1);
+}
+
+/// The run-list arm's own refusals (`E-TX6`): every scatter the contract's
+/// ordered list cannot state keeps the engine by name and reaches no provider
+/// submission.
+///
+/// The positive sibling above states what a list *is* — one registered window
+/// per stretch, in window order, summing to the bind. These are the four facts
+/// that stop it from being one, each answered under
+/// `render_provider_out_of_class_stage_buffer_gather`:
+///
+/// - **a stretch with no registered window** (`window: None`): the ledger holds
+///   no provider region to cut a window from, which is the unregistered
+///   reading R9e's own refusal already names;
+/// - **a window that stops short of the bytes its run carries**: the window is
+///   what the stage would read, so a `head + length` past it names bytes the
+///   declaration never described;
+/// - **runs that do not tile the bind**: the list's concatenation *is* the
+///   view's byte range, so a sum that is not the bind's is a declaration about
+///   bytes no record wrote;
+/// - **runs in two registrations**: the contract pairs every run's reservation
+///   with the *declaring view's* own allocation, so no single declaration can
+///   state a list split across two — this increment's own addition, answered
+///   here rather than left to `provider_owner::plan`'s decline.
+///
+/// Every case also checks that the draw never became a submission: a refusal by
+/// name is the class staying where it was, not a fallback.
+#[test]
+fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    /// Bytes one stretch of a well-formed list carries.
+    const RUN_BYTES: u64 = 8;
+    /// The bind the list has to tile: two stretches.
+    const BIND_BYTES: u64 = 2 * RUN_BYTES;
+    /// The first stretch's own head inside its granule.
+    const HEAD: u64 = 8;
+
+    let _guard = engine_test_session();
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the refusal half needs the no-copy device too"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let reference = |offset: u64, len: u64| {
+        GuestRef::new(
+            std::sync::Arc::clone(&import),
+            import
+                .slice(offset, len)
+                .expect("the stretch is inside the import"),
+        )
+        .expect("the slice came from this import")
+    };
+    let first_window = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let second_window = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64 + page as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The same shape the positive test states, with the one fact each case
+    // below varies. `runs` are not read on any refusal arm, so one host run
+    // covers them all.
+    let gather = |pages: Vec<GuestWindowRun>| -> BufferContent {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                owner.pointer as usize,
+                2 * page as u64,
+                0,
+                BIND_BYTES,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: BIND_BYTES,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
+        })
+    };
+    let both_stretches = |first: Option<RegisteredWindow>, second: Option<RegisteredWindow>| {
+        vec![
+            GuestWindowRun {
+                window_offset: 0,
+                guest: reference(HEAD, RUN_BYTES),
+                window: first,
+            },
+            GuestWindowRun {
+                window_offset: RUN_BYTES,
+                guest: reference(page as u64, RUN_BYTES),
+                window: second,
+            },
+        ]
+    };
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    let delivered = provider_render::provider_submissions();
+    let charged_before = route_count("render_provider_out_of_class_stage_buffer_gather");
+    let answer = |label: &str, content: &BufferContent| -> (String, String) {
+        let binds = [StageBufferBind {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            content,
+            window: None,
+            landing: None,
+        }];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &narrow_request(MTL_FORMAT_RGBA8_UNORM),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: a list the contract cannot state is out of class: {other:?}"),
+        }
+    };
+
+    // A stretch the ledger derived no window for: the unregistered reading.
+    let unregistered = gather(both_stretches(Some(first_window), None));
+    let (slug, detail) = answer("run list with an unregistered stretch", &unregistered);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+    assert!(
+        detail.contains("gathers from guest RAM"),
+        "the sentence names the gather: {detail}"
+    );
+
+    // The window stops one byte short of the bytes its own run carries: the
+    // list would name a byte the registration never derived.
+    let short_window = RegisteredWindow {
+        import: first_window.import,
+        base: first_window.base,
+        length: HEAD + RUN_BYTES - 1,
+        epoch: first_window.epoch,
+    };
+    let short = gather(both_stretches(Some(short_window), Some(second_window)));
+    let (slug, detail) = answer("run list with a window that stops short", &short);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+
+    // Two runs that do not tile the bind: each spans the whole grant, so the
+    // clipped lengths sum past it.
+    let overlapping = gather(vec![
+        GuestWindowRun {
+            window_offset: 0,
+            guest: reference(0, page as u64),
+            window: Some(first_window),
+        },
+        GuestWindowRun {
+            window_offset: RUN_BYTES,
+            guest: reference(0, page as u64),
+            window: Some(first_window),
+        },
+    ]);
+    let (slug, detail) = answer("run list that does not tile the bind", &overlapping);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+
+    // The two stretches live in two registrations: the contract pairs a run's
+    // reservation with the declaring view's own allocation, so no one
+    // declaration can state this list.
+    let mut other_owner = AlignedHost::new(page, page);
+    other_owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    let other_import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(other_owner.pointer as usize, page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let elsewhere = RegisteredWindow {
+        import: other_import.id(),
+        base: other_owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let split = gather(both_stretches(Some(first_window), Some(elsewhere)));
+    let (slug, detail) = answer("run list split across two registrations", &split);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "no refusal the list cannot state reaches the provider"
+    );
+    assert!(
+        route_count("render_provider_out_of_class_stage_buffer_gather") - charged_before >= 4,
+        "every case is charged to the gather bucket the census reads"
+    );
 }
 
 /// R9q: a vertex stream the draw path resolved through the zero-copy rail

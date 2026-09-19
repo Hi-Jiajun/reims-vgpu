@@ -534,13 +534,23 @@
 //!   resolved through the zero-copy rail arrives as a gather
 //!   (`BufferContent::GuestRuns`), whose page runs already carry the
 //!   provider-shaped window the registration ledger derived for them, so
-//!   [`gather_window`] derives it from the source's one stretch instead
+//!   [`gather_run_windows`] derives them from the source's own stretches instead
 //!   (`a_stage_buffer_the_seam_derives_from_its_gather_leaves_without_a_copy`).
 //!   Either way the frame follows the owner's own mapping and nothing is
 //!   copied;
-//! - a gather this rail cannot cut a window from — scattered across stretches,
-//!   unregistered, or with a `source_offset` reaching past its stretch's window
-//!   — keeps the engine by name
+//! - since E-TX6 the second of those ways has a **list** arm. A gather whose
+//!   stretches each carry a registered window and whose lengths sum to the
+//!   bind's own byte range is stated as the contract's ordered run list
+//!   (`BufferSource::GuestRuns` through `provider_owner::Request::Runs`): one
+//!   run per stretch, in window order, whose bytes the provider gathers out of
+//!   the owner's **live** pages at execution
+//!   (`a_stage_buffer_gather_scattered_over_two_registered_stretches_leaves_without_a_copy`).
+//!   One window keeps the borrowed lease above instead, because that is the arm
+//!   with no copy anywhere on the path;
+//! - a gather this rail cannot state — a stretch whose import the ledger never
+//!   registered, a window that stops short of its run's own bytes, a list whose
+//!   lengths do not sum to the bind, or one whose windows live in two
+//!   registrations — keeps the engine by name
 //!   (`render_provider_out_of_class_stage_buffer_gather`);
 //! - R18 gives the window-backed arm its third answer, and it is the one the
 //!   device decides: a window that *does* cover the bind's bytes still cannot be
@@ -564,7 +574,7 @@
 //!   they are the bytes the runtime already read, not a guest bind;
 //! - a stream whose one registered window covers the bind's own bytes travels as
 //!   **borrowed no-copy** ([`StreamSource::Window`], derived by the same
-//!   [`gather_window`], imported by the same plan): the frame follows the
+//!   [`gather_single_window`], imported by the same plan): the frame follows the
 //!   owner's own mapping, and moving that mapping moves the vertex bytes;
 //! - R18's third answer applies here unchanged: a stream whose view pointer
 //!   misses the device's granules is copied into an owner-issued staged lease
@@ -582,7 +592,7 @@
 //! indexed draw binds exactly one index buffer, and the draw path resolves it
 //! through the same zero-copy rail as a vertex stream (`load_index_content_reason`
 //! → `load_buffer_content_resolved`), so the seam derives its window with the
-//! same [`gather_window`] and imports it through the same plan:
+//! same [`gather_single_window`] and imports it through the same plan:
 //!
 //! - staged index bytes stay the third arm, trace-owned
 //!   (`BufferSource::OwnedBytes`): they are the bytes the runtime already read;
@@ -4042,54 +4052,98 @@ fn canonical_vertex_stream_count(attributes: &[VertexAttributeResource]) -> usiz
     heads.len()
 }
 
-/// The registered window one zero-copy gather was cut from (`R9e`).
+/// The registered windows one zero-copy gather was cut from, in window order
+/// (`R9e`, E-TX6).
 ///
 /// The gather's page runs are the guest RAM rail's own bounded references into
 /// the import this process holds, one per maximal stretch, ascending and tiling
 /// the requested window exactly; each carries the provider-shaped window the
 /// registration ledger derived for its own bound
-/// (`crate::runtime::guest_ram_map::GuestWindowRun::window`). The two facts this
-/// function reads are therefore both already derived — where the stretch's
-/// window is, and where inside the stretch the bind's window begins
-/// (`WindowStretch::skip`, the `source_offset` a packed resource binds at).
+/// (`crate::runtime::guest_ram_map::GuestWindowRun::window`). Both facts this
+/// function reads are therefore already derived: where the stretch's window is,
+/// and where inside that window the bind's own bytes begin.
 ///
-/// `None` for every shape a borrowed lease cannot name, and the caller keeps
-/// the draw on the engine for each of them rather than inventing coordinates:
+/// The second coordinate is *two* of the ledger's numbers rather than one. The
+/// window is the granule-aligned range the registration cut
+/// (`GuestRamRegistrations::window`), so the bind's first byte inside it is the
+/// run's own head — [`crate::runtime::guest_ram::GuestRef::head`], the distance
+/// the slice was widened by — *plus* [`WindowStretch::skip`], where the bind's
+/// window begins inside the stretch. The two are added in one place here for
+/// the same reason the seed door adds them ([`load_seed_run_windows`]) and the
+/// sampled sibling does ([`sampled_gather_window`]): the first run of a window
+/// that does not begin on a granule boundary is the one that shows the
+/// difference, and a rail that dropped `head` would name the granule instead of
+/// the bind.
 ///
-/// - **more than one stretch** (`single_stretch`): the bytes are scattered, so
-///   no single host range is the bind's bytes — the GPU copy per stretch is an
-///   engine rail (or a named `_gather` bucket here), not a lease;
-/// - **no registered window on the stretch** (`window: None`): the import was
+/// One window is the borrowed no-copy arm ([`provider_owner::Request::Window`]):
+/// the plan imports the registration and the provider binds its mapping
+/// directly. More than one is the contract's ordered run list
+/// ([`provider_owner::Request::Runs`] → `BufferSource::GuestRuns`, E-TX6): the
+/// runs are stated as coordinates inside one registration's lease, and the
+/// provider gathers the owner's **live** pages at execution — the pass begins
+/// from the bytes the owner holds when it runs, not from a snapshot this rail
+/// took at admission.
+///
+/// `None` for every shape the list cannot state, and the caller keeps the draw
+/// on the engine for each of them rather than inventing coordinates:
+///
+/// - **no page runs at all** (`pages: None`): a synthetic source, or a host
+///   that cannot import the pages behind it, so there is nothing to name;
+/// - **no registered window on a stretch** (`window: None`): the import was
 ///   never registered under the current epoch, or its registration was refused,
 ///   so there is no provider region to cut a window from;
-/// - **a window that does not cover the bind's own bytes**: a `source_offset`
-///   reaching past the stretch's window is a malformed source rather than a
-///   slow one, and stating it would name bytes the stage never reads.
+/// - **a window that does not cover the bind's own bytes**: a head reaching
+///   past the stretch's window is a malformed source rather than a slow one,
+///   and stating it would name bytes the stage never reads;
+/// - **a list that does not tile the bind** (`Σ bytes_len != total_len`): the
+///   contract's run list *is* the view's byte range, so a list that is short,
+///   padded or overlapping is a declaration about bytes no record wrote;
+/// - **windows in more than one registration**: the contract pairs every run's
+///   reservation with the *declaring view's* own allocation
+///   (`ContractError::LeaseMismatch`), so no single declaration can state a
+///   list split across two. `provider_owner::plan` refuses that shape too
+///   (`Decline::RunsSpanRegistrations`), and this rail answers it here by name
+///   rather than admitting a shape that would reach a decline.
 ///
-/// What the returned window still has to satisfy is a device fact — the view's
-/// own host pointer has to be a whole number of the provider's import
-/// alignment, or the canonical rail refuses the import by name
-/// (`resolve_render_input`'s lease alignment refusal) — so that check lives
-/// with the other device answer in [`submit_render`], not here.
-fn gather_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
-    let stretch = source.single_stretch()?;
-    let window = stretch.window?;
-    if stretch.len == 0 || window.length == 0 {
+/// What the returned windows still have to satisfy is a device fact when there
+/// is one of them — the view's own host pointer has to be a whole number of the
+/// provider's import alignment, or the canonical rail refuses the import by
+/// name (`resolve_render_input`'s lease alignment refusal) — so that check lives
+/// with the other device answer in [`submit_render`], not here. The run-list arm
+/// asks the device for the import alone, which is the same answer the borrowed
+/// arm needs.
+fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>> {
+    let mut windows: Vec<StageBufferWindow> = Vec::new();
+    let mut total = 0_u64;
+    for stretch in source.window_stretches()? {
+        let window = stretch.window?;
+        if stretch.len == 0 || window.length == 0 {
+            return None;
+        }
+        // The window has to be the bind's own bytes: the view is what the stage
+        // reads, so a head that reaches past the window, or a bind longer than
+        // what is left of it, is a source this rail cannot state as a window.
+        let head = stretch.guest.head().checked_add(stretch.skip)?;
+        if head.checked_add(stretch.len)? > window.length {
+            return None;
+        }
+        windows.push(StageBufferWindow {
+            import: window.import.get(),
+            host_va: window.base,
+            length: window.length,
+            head,
+            bytes_len: stretch.len,
+        });
+        total = total.checked_add(stretch.len)?;
+    }
+    if windows.is_empty() || total != source.total_len {
         return None;
     }
-    // The window has to be the bind's own bytes: the view is what the stage
-    // reads, so a head that reaches past the window, or a bind longer than what
-    // is left of it, is a source this rail cannot state as a lease.
-    if stretch.skip.checked_add(stretch.len)? > window.length {
+    let first = windows[0].import;
+    if windows.iter().any(|window| window.import != first) {
         return None;
     }
-    Some(StageBufferWindow {
-        import: window.import.get(),
-        host_va: window.base,
-        length: window.length,
-        head: stretch.skip,
-        bytes_len: stretch.len,
-    })
+    Some(windows)
 }
 
 /// The attachment's own previous contents as the ordered list of owner windows
@@ -4483,7 +4537,7 @@ struct SampledGather {
 /// (`R28`), and the stride the class repacks its rows out of when the guest's
 /// own rows are padded (`R36`).
 ///
-/// The sampled sibling of [`gather_window`], on the same fact — one page run
+/// The sampled sibling of [`gather_single_window`], on the same fact — one page run
 /// whose registered window covers the bind's bytes — read for the window rule
 /// the *contract* states for a texture. E's lease channel names a texture's
 /// bytes as "the texture's own tightly packed extent at the reservation's own
@@ -4811,22 +4865,49 @@ impl StreamSource<'_> {
 ///
 /// The decision itself, so the two shapes that reach it cannot disagree about
 /// which arms exist: staged bytes are trace-owned, and a zero-copy bind is the
-/// window the seam derives from the source's own gather ([`gather_window`]).
+/// window the seam derives from the source's own gather
+/// ([`gather_single_window`]).
 /// `None` is every gather the seam cannot cut one window from — scattered over
 /// stretches, never registered under the current epoch, or with a bind reaching
 /// past its stretch's window — and each caller turns it into its own shape's
 /// named refusal, because the census reads the shape that crossed the device.
+///
+/// The single-window narrowing is deliberate and is *not* the stage-buffer
+/// arm's list (`E-TX6`): a stream is a fetch table or an index array the guest
+/// bound once, and the two boots that reached this gate with imports holding —
+/// `evidence/gate3-census-v40-2026-09-19` and `…-fp22-…` — measured **zero**
+/// `render_provider_out_of_class_vertex_staging` and `…_index_staging` rows, so
+/// there is no population for a list to serve. Widening the streams would state
+/// the same declaration over arms the index stream's affine read-back (R47) and
+/// the texturing rails' reservation-start rule both read a single window
+/// through; the stage buffers' list arrives without either, which is why this
+/// increment stops there.
 fn stream_source(content: &BufferContent) -> Option<StreamSource<'_>> {
     match content {
         BufferContent::Bytes(bytes) => Some(StreamSource::Staged(bytes)),
-        BufferContent::GuestRuns(source) => gather_window(source).map(StreamSource::Window),
+        BufferContent::GuestRuns(source) => gather_single_window(source).map(StreamSource::Window),
+    }
+}
+
+/// The one window a zero-copy gather was cut from, when the seam can cut one
+/// (`R9e`'s borrowed arm, as one element of [`gather_run_windows`]).
+///
+/// The single-window readers — the two streams above, and the index stream's
+/// own affine proof — take the arm through the same derivation the stage
+/// buffers' list does, so the coordinates a borrow names cannot be one thing
+/// here and another there. `None` is every gather the list itself refuses, and
+/// a gather whose window is a scatter: a shape no single host range states.
+fn gather_single_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
+    match gather_run_windows(source)?.as_slice() {
+        [only] => Some(*only),
+        _ => None,
     }
 }
 
 /// The source one request attribute's bytes may be stated from (`R9q`).
 ///
 /// Staged bytes are the pre-R9q arm unchanged. A zero-copy bind leaves through
-/// the window the seam derives from its own gather ([`gather_window`]); a
+/// the window the seam derives from its own gather ([`gather_single_window`]); a
 /// gather the seam cannot cut one window from — scattered over stretches,
 /// never registered under the current epoch, or with a bind reaching past its
 /// stretch's window — keeps the draw on the engine under
@@ -4854,7 +4935,7 @@ fn vertex_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, Out
 /// (`load_index_content_reason` → `load_buffer_content_resolved`), so an index
 /// bind can arrive as a gather for exactly the same reason a vertex bind does,
 /// and the window it can be stated from is derived by the same
-/// [`gather_window`]. Staged bytes are the pre-R11 arm unchanged; a gather the
+/// [`gather_single_window`]. Staged bytes are the pre-R11 arm unchanged; a gather the
 /// seam cannot cut one window from keeps the draw on the engine under
 /// `render_provider_out_of_class_index_staging`, the bucket every index gather
 /// answered with before this increment.
@@ -4970,7 +5051,7 @@ fn read_index_window(window: StageBufferWindow) -> Result<Vec<u8>, OutOfClass> {
 /// the resolution (`crate::runtime::guest_ram_map::references_for_runs`), and
 /// each run carries the provider-shaped window the registration ledger derived
 /// for it. So the window a borrowed stage buffer travels under is a fact of the
-/// gather itself — [`gather_window`] reads it off [`GuestRunSource::single_stretch`]
+/// gather itself — [`gather_single_window`] reads it off the source's own runs
 /// rather than asking the seam to restate coordinates the ledger already
 /// produced. One stretch whose window covers exactly the bind's own bytes is
 /// the whole condition; every other shape keeps the draw on the engine under
@@ -6062,7 +6143,7 @@ fn stage_buffer_affine_counts(
         BufferContent::Bytes(bytes) => bytes.as_slice(),
         BufferContent::GuestRuns(source) => {
             if index_bytes.is_none() {
-                let window = gather_window(source).ok_or_else(index_staging_refusal)?;
+                let window = gather_single_window(source).ok_or_else(index_staging_refusal)?;
                 *index_bytes = Some(read_index_window(window)?);
             }
             index_bytes
@@ -6907,7 +6988,7 @@ fn stage_buffer_gate<'a>(
             // from the gather's own page runs below.
             BufferContent::GuestRuns(_) => None,
         };
-        let window = match bind.window {
+        let windows = match bind.window {
             Some(window) => {
                 // The window has to be the bind's own bytes: the view is what
                 // the stage reads, so a window that starts elsewhere or stops
@@ -6930,27 +7011,31 @@ fn stage_buffer_gate<'a>(
                         ),
                     ));
                 }
-                Some(window)
+                vec![window]
             }
             // R9e: the seam states no window, but a bind whose bytes the GPU
-            // would gather from one contiguous registered stretch *has* a
-            // window, and the page runs the source was built from name it — so
-            // this rail derives it here rather than asking the seam for a
-            // second copy of the same coordinates. A gather that is scattered,
-            // unregistered, or whose one stretch does not hold the bind's own
-            // bytes derives nothing and keeps the engine by name below.
+            // would gather out of registered guest RAM *has* windows, and the
+            // page runs the source was built from name them — so this rail
+            // derives them here rather than asking the seam for a second copy
+            // of the same coordinates. One window is the borrowed no-copy arm;
+            // a list of them is the contract's ordered run list (`E-TX6`,
+            // `BufferSource::GuestRuns`), which the provider gathers out of the
+            // owner's live pages at execution. A gather that is unregistered,
+            // reaches past its stretch's window, walks more than one
+            // registration, or whose windows do not tile the bind derives
+            // nothing and keeps the engine by name below.
             None => match bind.content {
-                BufferContent::GuestRuns(source) => gather_window(source),
-                BufferContent::Bytes(_) => None,
+                BufferContent::GuestRuns(source) => gather_run_windows(source).unwrap_or_default(),
+                BufferContent::Bytes(_) => Vec::new(),
             },
         };
-        if bytes.is_none() && window.is_none() {
+        if bytes.is_none() && windows.is_empty() {
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_stage_buffer_gather",
                 format!(
                     "a draw whose {} stage reads a [[buffer({})]] argument the GPU gathers from \
                      guest RAM stays on the engine: this class mints a stage buffer's bytes \
-                     through the owner rail — the staged copy it holds, or the registered window \
+                     through the owner rail — the staged copy it holds, or the registered windows \
                      a zero-copy bind was cut from — and a gather that is neither has no source \
                      this rail can state",
                     stage.name(),
@@ -6964,7 +7049,7 @@ fn stage_buffer_gate<'a>(
             access,
             proof,
             bytes,
-            window,
+            windows,
         });
     }
     Ok(NarrowStageBuffers {
@@ -7288,13 +7373,28 @@ fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor
     for (index, buffer) in pass.stage_buffers.iter().enumerate() {
         let view = &mut descriptor.stage_buffers[index].view;
         let label = stage_buffer_owner_binding(buffer.stage, buffer.index);
-        let bytes = match (buffer.window, buffer.bytes) {
-            (Some(window), _) => provider_owner::window_bytes(owner_window(label, window)).ok()?,
-            (None, Some(bytes)) => bytes.to_vec(),
-            // A bind with neither a window nor staged bytes is an arm the
-            // class admits only under its own name; a pass that reached a
-            // completion carries one of the two.
-            (None, None) => continue,
+        let bytes = match (buffer.borrowed_window(), buffer.run_list(), buffer.bytes) {
+            (Some(window), _, _) => {
+                provider_owner::window_bytes(owner_window(label, window)).ok()?
+            }
+            // The run-list arm reads the same registration the borrow would,
+            // one window at a time, and states the concatenation in window
+            // order — which is the byte range the contract's list declares, so
+            // re-running the pass reads the bytes the first run read.
+            (None, Some(runs), _) => {
+                let mut bytes = Vec::new();
+                for window in runs {
+                    bytes.extend_from_slice(
+                        &provider_owner::window_bytes(owner_window(label, *window)).ok()?,
+                    );
+                }
+                bytes
+            }
+            (None, None, Some(bytes)) => bytes.to_vec(),
+            // A bind with neither windows nor staged bytes is an arm the class
+            // admits only under its own name; a pass that reached a completion
+            // carries one of the two.
+            (None, None, None) => continue,
         };
         own(view, bytes);
     }
@@ -9682,22 +9782,27 @@ fn submit_render_inner(
             return RenderRailOutcome::NotInNarrowClass(reason);
         }
     }
-    // The third device answer (R9e/R9q/R11/R18): every window-backed binding
-    // this pass states — a stage buffer's window, a vertex stream's since R9q,
-    // and the index stream's since R11 — is imported by the owner rail unless
-    // this device cannot take the view's own pointer, in which case the gate
-    // copies the window's bytes and the plan states the staged arm instead
-    // (`window_arm`); a device that cannot import host pointers at all refuses
-    // that arm by name rather than turning it into a copy. The answer is asked
-    // once for the pass, in the order the binds are stated (the stage buffers,
-    // then the vertex streams, then the index stream), so the bucket a refusal
-    // lands in is the one its own shape owns — and so the copies the plan reads
-    // back are keyed the same way the plan states them.
+    // The third device answer (R9e/R9q/R11/R18/E-TX6): every window-backed
+    // binding this pass states — a stage buffer's window, a vertex stream's
+    // since R9q, and the index stream's since R11 — is imported by the owner
+    // rail unless this device cannot take the view's own pointer, in which case
+    // the gate copies the window's bytes and the plan states the staged arm
+    // instead (`window_arm`); a device that cannot import host pointers at all
+    // refuses that arm by name rather than turning it into a copy. The
+    // stage-buffer half has a second shape since E-TX6: a bind whose bytes are
+    // a *scatter* of registered windows (a run list, `stage_run_lists` below)
+    // takes `Request::Runs`, whose registrations the plan imports exactly as it
+    // imports a single window's — so the same answer gates both, and the class
+    // gives it here rather than leaving an admitted list to the plan's decline.
+    // The answer is asked once for the pass, in the order the binds are stated
+    // (the stage buffers, then the vertex streams, then the index stream), so
+    // the bucket a refusal lands in is the one its own shape owns — and so the
+    // copies the plan reads back are keyed the same way the plan states them.
     let window_backed = || {
         pass.stage_buffers
             .iter()
             .filter_map(|buffer| {
-                buffer.window.map(|window| {
+                buffer.borrowed_window().map(|window| {
                     (
                         STAGE_BUFFER_WINDOW,
                         stage_buffer_owner_binding(buffer.stage, buffer.index),
@@ -9717,17 +9822,39 @@ fn submit_render_inner(
                     .map(|window| (INDEX_STREAM_WINDOW, index_stream_owner_binding(), window)),
             )
     };
+    // E-TX6's own arm of the same walk: the stage buffers whose windows are a
+    // list rather than one range. They are not in `window_backed` because there
+    // is no single view pointer for the device to take — the runs are stated as
+    // per-window coordinates and the provider gathers them — but the device
+    // fact they need is the same import, asked through the same rule.
+    let stage_run_lists = || {
+        pass.stage_buffers.iter().filter_map(|buffer| {
+            buffer
+                .run_list()
+                .map(|runs| (stage_buffer_owner_binding(buffer.stage, buffer.index), runs))
+        })
+    };
     // R18: the binds the device's granules turn away from the borrowed arm. The
     // copy is made here rather than inside the plan because this is where the
     // device answer lives, and because a window this rail cannot read has to
     // keep the draw on the engine *by name* — an answer only the class gate can
     // give (`plan`'s refusals are declines, and a decline is not a fallback).
     let mut copies = WindowCopies::default();
-    if window_backed().next().is_some() {
+    if window_backed().next().is_some() || stage_run_lists().next().is_some() {
         let alignment = match declared_host_import() {
             Ok(alignment) => alignment,
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         };
+        for (_, runs) in stage_run_lists() {
+            // The first window answers the device question for the list: the
+            // rule is about the registration the plan will import, and every
+            // run of a list this class admits names the same one
+            // (`gather_run_windows`).
+            if let Err(reason) = window_binding_admits(STAGE_BUFFER_WINDOW, runs[0], alignment) {
+                reason.note();
+                return RenderRailOutcome::NotInNarrowClass(reason);
+            }
+        }
         for (shape, binding, window) in window_backed() {
             match window_arm(shape, binding, window, alignment) {
                 Ok(Some(bytes)) => {
@@ -11109,11 +11236,37 @@ struct NarrowStageBuffer<'a> {
     /// proven to cover it before the view exists.
     proof: FootprintProof,
     /// The owner's staged bytes, when the bind's content is a copy the owner
-    /// holds. `None` is a bind whose bytes exist only behind its window.
+    /// holds. `None` is a bind whose bytes exist only behind its windows.
     bytes: Option<&'a [u8]>,
-    /// The registered window the bind's bytes came from, when the seam stated
-    /// one: the borrowed no-copy arm.
-    window: Option<StageBufferWindow>,
+    /// The registered windows the bind's bytes were cut from, in window order
+    /// ([`gather_run_windows`]). One is the borrowed no-copy arm
+    /// ([`Self::borrowed_window`]); several are the contract's ordered run list
+    /// (`BufferSource::GuestRuns`, E-TX6, [`Self::run_list`]); empty is the
+    /// owner's staged copy (`bytes`), the arm every bind without a registration
+    /// behind it takes.
+    windows: Vec<StageBufferWindow>,
+}
+
+impl NarrowStageBuffer<'_> {
+    /// The bind's one window, when it has exactly one: the borrowed no-copy arm
+    /// (`provider_owner::Request::Window`), whose view pointer the device's own
+    /// granules then decide between the import and the R18 copy.
+    fn borrowed_window(&self) -> Option<StageBufferWindow> {
+        match self.windows.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
+    /// The bind's windows when they are a list the contract states as runs
+    /// (`provider_owner::Request::Runs`, E-TX6): the scattered arm, whose runs
+    /// the provider gathers out of the owner's live pages at execution.
+    fn run_list(&self) -> Option<&[StageBufferWindow]> {
+        match self.windows.as_slice() {
+            [] | [_] => None,
+            runs => Some(runs),
+        }
+    }
 }
 
 /// The whole admitted shape, in the terms the trace needs.
@@ -13632,6 +13785,60 @@ fn submit_narrow(
     let mut stage_buffer_slots: Vec<StageBufferSlot> = Vec::with_capacity(pass.stage_buffers.len());
     for buffer in &pass.stage_buffers {
         let binding = stage_buffer_owner_binding(buffer.stage, buffer.index);
+        // E-TX6: a bind whose bytes are a scatter of registered windows travels
+        // as the contract's ordered run list rather than as a lease window. The
+        // declaration is the pair the plan minted for the list — its allocation
+        // (`Plan::run_allocation`, which the contract pairs with every run's own
+        // reservation) and the per-run coordinates inside it (`Plan::guest_runs`)
+        // — stated at the bind's own byte range, so the length the contract
+        // checks, the runs' concatenation and the stage's reach are one number.
+        // The source is the owner's *live* pages: the provider gathers them at
+        // execution (`research/docs/23` §74), which is why nothing here reads a
+        // byte or freezes a coordinate.
+        if let Some(runs) = buffer.run_list() {
+            let view_id = ViewId::new(next_view);
+            let (allocation, _, _) = leases
+                .as_ref()
+                .and_then(|plan| plan.run_allocation(binding))
+                .expect("the owner plan covers the runs of every admitted list");
+            let length = runs
+                .iter()
+                .try_fold(0_u64, |total, window| total.checked_add(window.bytes_len))
+                .expect("the gate admitted a list whose windows tile the bind");
+            stage_buffer_slots.push(StageBufferSlot {
+                stage: buffer.stage,
+                index: buffer.index,
+                view: view_id,
+                allocation,
+                // The list's own declaration starts at the allocation's first
+                // byte: the runs carry their offsets individually, which is the
+                // whole difference between this arm and the borrowed window.
+                view_offset: 0,
+                view_length: length,
+                access: buffer.access,
+            });
+            stage_buffers.push(StageBufferView {
+                stage: buffer.stage,
+                view: BufferView {
+                    view_id,
+                    metal_binding: buffer.index,
+                    allocation_id: allocation,
+                    offset: 0,
+                    length,
+                    access: buffer.access,
+                    attribute_stride: None,
+                    source: BufferSource::GuestRuns(
+                        leases
+                            .as_ref()
+                            .and_then(|plan| plan.guest_runs(binding))
+                            .expect("the owner plan states the runs of every admitted list")
+                            .to_vec(),
+                    ),
+                },
+            });
+            next_view += 1;
+            continue;
+        }
         let view = leases
             .as_ref()
             .and_then(|plan| plan.view(binding))
@@ -14904,24 +15111,62 @@ fn plan_owner_leases(
     if !pass.travels_the_owner_wire() {
         return Ok(None);
     }
-    let mut requests: Vec<provider_owner::Request<'_>> = pass
+    // E-TX6's stage-buffer list, built before the requests that borrow it: the
+    // plan states a run list as `Window`s inside one registration's lease, and
+    // the requests hold slices of these lists, so nothing may move them after
+    // the requests are built. One entry per list-shaped bind, in the order the
+    // binds are stated.
+    let stage_run_windows: Vec<(u32, Vec<provider_owner::Window>)> = pass
         .stage_buffers
         .iter()
-        .map(|buffer| {
-            let binding = stage_buffer_owner_binding(buffer.stage, buffer.index);
-            match buffer.window {
-                Some(window) => window_arm_request(binding, window, copies),
-                None => provider_owner::Request::Staged(provider_owner::Staged {
+        .filter_map(|buffer| {
+            buffer.run_list().map(|runs| {
+                (
+                    stage_buffer_owner_binding(buffer.stage, buffer.index),
+                    runs.iter()
+                        .map(|window| {
+                            owner_window(
+                                stage_buffer_owner_binding(buffer.stage, buffer.index),
+                                *window,
+                            )
+                        })
+                        .collect(),
+                )
+            })
+        })
+        .collect();
+    let mut requests: Vec<provider_owner::Request<'_>> = Vec::new();
+    let mut lists_stated = 0_usize;
+    for buffer in &pass.stage_buffers {
+        let binding = stage_buffer_owner_binding(buffer.stage, buffer.index);
+        match (buffer.borrowed_window(), buffer.run_list()) {
+            (Some(window), _) => requests.push(window_arm_request(binding, window, copies)),
+            (None, Some(_)) => {
+                // The run-list arm: one request per list, under the binding its
+                // own stage and index name, over the `Window`s built above. The
+                // copy arm cannot answer it — a list has no single view pointer
+                // for the device's granules to turn away — so the request is the
+                // borrowed list itself, and the provider reads the owner's live
+                // pages at execution rather than any bytes this rail copied.
+                let (_, windows) = &stage_run_windows[lists_stated];
+                lists_stated += 1;
+                requests.push(provider_owner::Request::Runs(provider_owner::Runs {
                     binding,
-                    // The gate admits a bind with neither a window nor staged
-                    // bytes only under its own name, so this arm is total here.
+                    windows,
+                }));
+            }
+            (None, None) => {
+                requests.push(provider_owner::Request::Staged(provider_owner::Staged {
+                    binding,
+                    // The gate admits a bind with neither windows nor staged bytes
+                    // only under its own name, so this arm is total here.
                     bytes: buffer
                         .bytes
                         .expect("a stage buffer without a window carries the owner's staged bytes"),
-                }),
+                }))
             }
-        })
-        .collect();
+        }
+    }
     requests.extend(pass.vertex_windows().map(|(binding, window)| {
         window_arm_request(vertex_stream_owner_binding(binding), window, copies)
     }));
