@@ -11812,6 +11812,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // exactly as it did before this increment.
                 chain_keeps_frame: req.chain_keeps_frame,
                 chain_loads_resident: req.chain_loads_resident,
+                // R42c: the promise both ends of a relay link are admitted
+                // against, as the walk stated it — the pair the frame this
+                // record begins from is kept under, and the pair the record
+                // after it promised to load its own frame under. Both are
+                // `None` for every packet the walk did not admit, and both are
+                // read by the class for a mapper-ref-texture surface target
+                // only, whose identity is the one that moves under a packet.
+                chain_resident_attachment: req.chain_resident_attachment,
+                chain_resident_successor: req.chain_resident_successor,
                 // R23: the chain's own frame, when this record's previous
                 // contents are the engine's registry resident and the caller
                 // could read them out (`resident_chain_source_frame`). The

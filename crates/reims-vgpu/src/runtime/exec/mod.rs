@@ -5290,12 +5290,18 @@ fn finish_stream<M: HostMemory + HostOps>(
         // So the walk proves the reader *before* it keeps anything, and the
         // proof is the next record's own class answer, asked through the same
         // gate the record will meet with exactly the shape it will run with.
-        // The probes run from the tail backwards, which is what makes the
-        // assumption sound: a probe of record `di + 1` states
+        // A probe of record `di + 1` states
         // `chain_loads_resident`, i.e. it asks the class the question "would you
         // answer this record if the frame it begins from were your own kept
         // image?" — and that is precisely the shape the record runs with when
-        // `di` kept its frame, which the probe's own answer decides.
+        // `di` kept its frame, which the probe's own answer decides. The probes
+        // run in the packet's own order (R42c): each one also states the
+        // `(allocation, view)` pair the record *before* it resolved to when its
+        // own probe answered, which is the token a mapper-ref-texture surface's
+        // relayed load is admitted against — the pair is the surface's
+        // generation, and the class refuses a relayed load whose token is
+        // missing or names another image rather than keeping a frame the walk
+        // cannot prove the record after it will still name.
         //
         //   * the last record keeps nothing: the packet's own guest Store is
         //     its reader, and it publishes;
@@ -5314,7 +5320,8 @@ fn finish_stream<M: HostMemory + HostOps>(
         // escapes that proof (a record that answers `NotInNarrowClass` *after*
         // its predecessor kept) is refused by name in the seam and counted as
         // `provider_chain_middle_handoff_lost`.
-        for di in (0..requests.len()).rev() {
+        let mut promise: Option<(u64, u64)> = None;
+        for di in 0..requests.len() {
             // Charged to `Retarget`, which is what the probes do: they assemble
             // the record's own shape (the same request the encode will be handed
             // and the same resolution it will use) and ask the class about it.
@@ -5327,6 +5334,9 @@ fn finish_stream<M: HostMemory + HostOps>(
             probe.chain_from_resident = load_resident;
             probe.chain_loads_resident = load_resident;
             probe.chain_keeps_frame = keep_frame[di];
+            // The record before this one's own answer, carried forward: what
+            // its identity resolved to is what this record's load has to name.
+            probe.chain_resident_attachment = promise;
             let answer = crate::backend::selected().probe_draw_chain(
                 state,
                 host,
@@ -5335,6 +5345,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             );
             probes[di] = answer;
             crate::runtime::drain::note_store_route("provider_chain_middle_probed");
+            promise = probes[di].attachment;
         }
         keep_frame = chain_relay_keep_plan(&probes);
         for (di, pd) in draw_list.iter().enumerate() {
@@ -5345,6 +5356,14 @@ fn finish_stream<M: HostMemory + HostOps>(
             req.chain_keeps_frame = keep_frame[di];
             req.chain_loads_resident = provider_resident_chain;
             req.chain_resident_attachment = provider_resident_attachment;
+            // R42c: the promise this record would be keeping its frame against —
+            // the pair the record after it said it would load. Read by the
+            // class for a mapper-ref-texture surface target only, where the
+            // frame is kept exactly while this record's own identity still
+            // mints it.
+            req.chain_resident_successor = probes
+                .get(di + 1)
+                .and_then(|successor| successor.attachment);
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 // A resident mapper-ref-texture target carries attachment contents between

@@ -699,6 +699,15 @@ pub struct DrawEncodeRequest {
     /// R42: the `(allocation, view)` pair the frame this record begins from is
     /// kept under, as the caller's own record of its predecessor's answer.
     ///
+    /// Stated for both questions the walk asks about a relayed load: a **probe**
+    /// carries the pair the record before it reported when *its* own probe
+    /// answered (the walk probes in packet order for exactly this reason), and a
+    /// **submission** carries the pair its predecessor's answer did. The class
+    /// reads it for a mapper-ref-texture surface target, where the pair *is* the
+    /// surface's generation token (one mint per identity, never reused), and
+    /// refuses a relayed load whose token is missing or names another image
+    /// (R42c).
+    ///
     /// Stated beside [`Self::chain_loads_resident`], and *checked* by the seam:
     /// the identity this record's own pass resolves must mint to the same pair,
     /// or the load would name an image no submission of this rail ever stored —
@@ -710,6 +719,22 @@ pub struct DrawEncodeRequest {
     /// see, because the walk's own probe runs before the predecessor has
     /// answered.
     pub chain_resident_attachment: Option<(u64, u64)>,
+    /// R42c: the `(allocation, view)` pair the walk's own probe of the **next
+    /// record of this packet** reported as the image it will load this record's
+    /// frame from, when this record is the one the walk promised that frame to.
+    ///
+    /// Stated beside [`Self::chain_keeps_frame`] — the walk's promise — and read
+    /// by the class for a mapper-ref-texture surface target: the frame is kept
+    /// only while the surface's own identity still mints that pair, so a
+    /// surface the guest re-mapped between the walk and this submission is
+    /// answered the pre-R42 way (the frame is published and the record after it
+    /// begins from those bytes) instead of leaving an image behind that the
+    /// record after it can no longer name. R42's seam keeps its own guard on
+    /// the loading side ([`Self::chain_resident_attachment`] re-checked against
+    /// the identity this record resolves); this is the same equality asked
+    /// *before* the promise is committed, which is the only place it can be
+    /// asked without costing the packet.
+    pub chain_resident_successor: Option<(u64, u64)>,
     /// This draw continues the Metal render encoder of the preceding draw in
     /// the same decoded stream. Vulkan may keep an identical render pass open
     /// when no command that is illegal inside it intervenes.
