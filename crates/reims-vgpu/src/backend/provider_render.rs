@@ -212,7 +212,32 @@
 //!   arm), which differs from its answer wherever the shader reads a texel this
 //!   pass has already written, so the shape keeps its own name and its frame is
 //!   never read.
-//!   Frozen boundary (census v29: 550 records; engine arm: sampled_self_feedback_loop). Reopen only with a native oracle.
+//!
+//!   # The attachment's own entry content, stated on the device (E-TX15)
+//!
+//!   Census v29 froze that boundary at 550 records (engine arm:
+//!   `sampled_self_feedback_loop`) and v43 still read 5 847
+//!   `texture_source_order` records, every one of them `fmt=0x50`, `load=Load`,
+//!   `skip=resident store=1` — a record that samples the attachment it renders
+//!   into with no evidence that the shader reads a texel the pass itself wrote.
+//!   E-TX15 (`research/docs/23` §118) is the contract arm the shape was waiting
+//!   for: `TextureSource::PassEntrySnapshot` states the read as the
+//!   attachment's bytes **as the pass opens them**, and `metal-api-vulkan`
+//!   resolves it by copying the attachment image on the device before
+//!   `vkCmdBeginRenderPass`. A device that declares
+//!   `supports_render_pass_entry_snapshot` therefore executes exactly the record
+//!   the engine's own *fallback* arm draws (its snapshot), one submission
+//!   earlier than the frame the extension would have read.
+//!
+//!   The class admits the arm only where the contract's own four rules hold —
+//!   the pass's primary colour attachment, a load arm that keeps prior contents
+//!   (`Load`/`Resident`, never a `Clear` or a discard), a declaration that
+//!   restates the attachment's format and extent, and one plain single-sample 2D
+//!   view — and every other shape keeps the refusal above, its slug, its
+//!   sentence and its route, byte for byte. The frame of an admitted record is
+//!   still never read by the caller (nothing on the host uses it), and the two
+//!   readings a census takes of the boundary are the refusal's (falling) and the
+//!   arm's own (`render_provider_pass_entry_snapshot`, rising).
 //! - **the attachment's own blend state** (R10, `research/docs/23` §100): a
 //!   blend the canonical pass can state *and* the command channel's v40 section
 //!   carries (blending enabled, one operation for both channel pairs, every
@@ -2339,6 +2364,31 @@ fn fold_channel_plan(plan: &crate::protocol::pixel_format::SwizzlePlan, texels: 
     widened
 }
 
+/// The pass-entry snapshot arm's own facts, as the class gate hands them to the
+/// declaration walk (E-TX15).
+///
+/// The device's answer (`supports_render_pass_entry_snapshot`) is the
+/// *permission*; these are the two facts about *this* attachment the
+/// declaration has to restate, and they are read where both are in hand: the
+/// attachment's texel order (the contract compares the sampled declaration's
+/// format against it field by field,
+/// `RenderPassEntrySnapshotShapeMismatch`), and whether its load arm keeps the
+/// prior contents the snapshot promises — a `Clear` establishes the clear
+/// colour and a discarded attachment establishes nothing, so neither is "the
+/// bytes the attachment held when the pass opened"
+/// (`RenderPassEntrySnapshotLoadUnsupported`, and the same fact the engine's
+/// own fallback reads: it copies the *prior resident* content, which a clear
+/// or a discard does not have).
+#[derive(Clone, Copy, Debug)]
+struct EntrySnapshotArm {
+    /// The attachment's own texel order, which the sampled declaration has to
+    /// restate ([`AttachmentFormat::as_texture_format`]).
+    format: AttachmentFormat,
+    /// Whether the attachment's load arm is one that keeps its prior contents:
+    /// the contract's `Load`/`Resident` pair, and not a `Clear`.
+    loads_prior_contents: bool,
+}
+
 /// The sampled textures one request's fragment stage declares, weighed against
 /// the module's own declarations (R10, `research/docs/23` §101).
 ///
@@ -2443,6 +2493,15 @@ fn sampled_textures<'a>(
     // stays pure: the parameter is the whole answer, and `false` keeps the
     // census's refusal sentence and slug for the shape, byte for byte.
     render_pixel_coordinate_sampler: bool,
+    // Whether this draw's provider executes E-TX15's arm, with the two facts
+    // the declaration has to restate when it does: the attachment's own texel
+    // order, and whether the attachment's load arm keeps the prior contents the
+    // snapshot promises. Read by [`submit_render`] before the gate out of the
+    // same capability frame under its own candidate test
+    // ([`sampled_bind_of_the_attachment`]), and `None` — the bit left out, or
+    // the caller's candidate test answering no — keeps the census's refusal
+    // sentence and slug for the shape, byte for byte.
+    entry_snapshot: Option<EntrySnapshotArm>,
 ) -> Result<NarrowSampling<'a>, OutOfClass> {
     if req.color_input {
         return Err(OutOfClass::new(
@@ -2900,27 +2959,81 @@ fn sampled_textures<'a>(
                 }
             }
             crate::backend::vulkan::engine::SampledSource::Target(identity) => {
-                // A record that samples the attachment it writes would need the
-                // production *after* the read, and this record's read is the
-                // live attachment: the engine states that read itself whenever
-                // the device carries `VK_EXT_attachment_feedback_loop_layout`
-                // (`sampled_self_feedback_loop` in the census), and every arm
-                // the canonical contract can state resolves *before* the pass
-                // opens — a trace-produced view is an earlier pass's landed
-                // store (`render_texture_source_order_unsupported` is the
-                // contract's name for the other order), and a declaration that
-                // names the pass's own attachment view is refused as
-                // `RenderTextureAttachmentConflict`, "anything but a race".
-                // Serving the read from bytes a copy captured before the pass
-                // would state the engine's *fallback* (its snapshot arm) rather
-                // than its answer, so the shape is answered by name rather than
-                // reordered — and its frame is not read at all (R24's caller
-                // skips it), because nothing would use it.
-                if req.writes_attachment(identity) {
-                    return Err(OutOfClass::owned(
-                        "render_provider_out_of_class_texture_source_order",
-                        format!(
-                            "a draw whose `[[texture({})]]` samples the very attachment it \
+                // E-TX15 (2026-09-19, `research/docs/23` §118): the arm the
+                // shape below was frozen against. The read this record states
+                // is the attachment's **pass-entry** content, and the canonical
+                // rail can state it exactly when the device declares that it
+                // copies the attachment image on the device *before* the pass
+                // opens and binds the copy as the sampled view
+                // (`TextureSource::PassEntrySnapshot`,
+                // `supports_render_pass_entry_snapshot`). The declaration then
+                // names the attachment's own `(allocation, view)` pair — the
+                // pair the trace's own builder derives for the pass's colour
+                // attachment, so the two cannot be two images — and carries no
+                // bytes at all.
+                //
+                // Every rule below is one the contract re-asks of the values
+                // (`RenderPassEntrySnapshotUnattached` / `...ShapeMismatch` /
+                // `...LoadUnsupported` / `...ShapeUnsupported`) and would refuse
+                // by name, which is why none of them may be assumed here: this
+                // rail answers the class, and a shape it hands over that the
+                // provider then refuses is a *decline*, not a fallback.
+                //
+                // * the bind resolved to the pass's own **primary colour**
+                //   attachment. A secondary or depth attachment is a different
+                //   declaration and keeps the refusal below;
+                // * the attachment's load arm keeps its prior contents
+                //   (`NarrowLoad::Bytes`/`Resident`/`GuestRuns` — the
+                //   `Load`/`Resident` pair the contract admits). A `Clear`
+                //   establishes the clear colour and a discarded attachment
+                //   nothing at all, so neither is "the bytes the attachment
+                //   held when the pass opened";
+                // * the bind's texel order is the attachment's own: the
+                //   snapshot *is* the attachment's texel grid, and a declaration
+                //   that restates another order or another extent would sample
+                //   texels the attachment never held. R41's folded plan is one
+                //   such restatement (it names `rgba8_unorm` whatever the bind's
+                //   lane was), so it keeps the refusal;
+                // * the bind's extent is the attachment's own — the pass's
+                //   extent, which the class weighs against a source of another
+                //   extent further down.
+                //
+                // A record the arm takes is counted under its own name, charged
+                // where the refusal below used to stand: the census reads the
+                // two numbers side by side, so "the bucket fell" is never read
+                // as "the shape went away".
+                let entry_snapshot = entry_snapshot
+                    .filter(|_| req.writes_attachment(identity))
+                    .filter(|_| req.target_identity.as_ref() == Some(identity))
+                    .filter(|arm| arm.loads_prior_contents)
+                    .filter(|arm| format == arm.format.as_texture_format())
+                    .filter(|_| fold.is_none())
+                    .filter(|_| [image.width, image.height] == [req.width, req.height]);
+                if let Some(_arm) = entry_snapshot {
+                    crate::runtime::drain::note_store_route("render_provider_pass_entry_snapshot");
+                    NarrowTextureSource::EntrySnapshot
+                } else {
+                    // A record that samples the attachment it writes would need the
+                    // production *after* the read, and this record's read is the
+                    // live attachment: the engine states that read itself whenever
+                    // the device carries `VK_EXT_attachment_feedback_loop_layout`
+                    // (`sampled_self_feedback_loop` in the census), and every arm
+                    // the canonical contract can state resolves *before* the pass
+                    // opens — a trace-produced view is an earlier pass's landed
+                    // store (`render_texture_source_order_unsupported` is the
+                    // contract's name for the other order), and a declaration that
+                    // names the pass's own attachment view is refused as
+                    // `RenderTextureAttachmentConflict`, "anything but a race".
+                    // Serving the read from bytes a copy captured before the pass
+                    // would state the engine's *fallback* (its snapshot arm) rather
+                    // than its answer, so the shape is answered by name rather than
+                    // reordered — and its frame is not read at all (R24's caller
+                    // skips it), because nothing would use it.
+                    if req.writes_attachment(identity) {
+                        return Err(OutOfClass::owned(
+                            "render_provider_out_of_class_texture_source_order",
+                            format!(
+                                "a draw whose `[[texture({})]]` samples the very attachment it \
                              renders into stays on the engine: the read this record states is the \
                              live frame it is writing, while every arm this class can declare \
                              resolves before the pass opens — the trace's own earlier production \
@@ -2928,26 +3041,26 @@ fn sampled_textures<'a>(
                              contract refuses by name (`RenderTextureAttachmentConflict`), and a \
                              copy taken before the pass is the engine's fallback arm, not its \
                              answer",
-                            declaration.index,
-                        ),
-                    ));
-                }
-                match recorded_production(identity) {
-                    Some(production) => {
-                        // The sampled declaration has to restate the stored
-                        // surface's format and extent, exactly as the contract
-                        // holds it (`RenderTextureSourceShapeMismatch`): the
-                        // bytes the trace produces are the *stored* surface's,
-                        // so a declaration that names another texel order or
-                        // another extent would sample texels the production
-                        // never wrote.
-                        if production.format.as_texture_format() != format
-                            || [production.width, production.height]
-                                != [u64::from(image.width), u64::from(image.height)]
-                        {
-                            return Err(OutOfClass::owned(
-                                "render_provider_out_of_class_texture_source_shape",
-                                format!(
+                                declaration.index,
+                            ),
+                        ));
+                    }
+                    match recorded_production(identity) {
+                        Some(production) => {
+                            // The sampled declaration has to restate the stored
+                            // surface's format and extent, exactly as the contract
+                            // holds it (`RenderTextureSourceShapeMismatch`): the
+                            // bytes the trace produces are the *stored* surface's,
+                            // so a declaration that names another texel order or
+                            // another extent would sample texels the production
+                            // never wrote.
+                            if production.format.as_texture_format() != format
+                                || [production.width, production.height]
+                                    != [u64::from(image.width), u64::from(image.height)]
+                            {
+                                return Err(OutOfClass::owned(
+                                    "render_provider_out_of_class_texture_source_shape",
+                                    format!(
                                     "a draw whose `[[texture({})]]` is {}x{} {:?} stays on the \
                                      engine when the target's own production stored {:?} at {}x{}: \
                                      the canonical rail pairs a trace-produced declaration with \
@@ -2963,26 +3076,26 @@ fn sampled_textures<'a>(
                                     production.width,
                                     production.height,
                                 ),
-                            ));
+                                ));
+                            }
+                            NarrowTextureSource::Produced {
+                                production: Arc::clone(&production),
+                            }
                         }
-                        NarrowTextureSource::Produced {
-                            production: Arc::clone(&production),
-                        }
-                    }
-                    // R24: no pass of this rail ever stated that target's
-                    // production, but the *bytes* are not the caller's to
-                    // invent — the engine's registry holds them (`SampledSource::
-                    // Target` is a resident bind), and the caller that owns that
-                    // registry reads them out with the same `read_target` R23's
-                    // arm reads a chain frame with. The declaration then states
-                    // the request's own copy (`TextureSource::OwnedBytes`),
-                    // which is the arm every pre-R22 sampled texture takes, so
-                    // the two rails read one set of bytes through one view.
-                    None => {
-                        let Some(frame) = inputs.sampled_target_frame(identity) else {
-                            return Err(OutOfClass::owned(
-                                "render_provider_out_of_class_texture_source_undeclared",
-                                format!(
+                        // R24: no pass of this rail ever stated that target's
+                        // production, but the *bytes* are not the caller's to
+                        // invent — the engine's registry holds them (`SampledSource::
+                        // Target` is a resident bind), and the caller that owns that
+                        // registry reads them out with the same `read_target` R23's
+                        // arm reads a chain frame with. The declaration then states
+                        // the request's own copy (`TextureSource::OwnedBytes`),
+                        // which is the arm every pre-R22 sampled texture takes, so
+                        // the two rails read one set of bytes through one view.
+                        None => {
+                            let Some(frame) = inputs.sampled_target_frame(identity) else {
+                                return Err(OutOfClass::owned(
+                                    "render_provider_out_of_class_texture_source_undeclared",
+                                    format!(
                                     "a draw whose `[[texture({})]]` texels come from a GPU target \
                                      stays on the engine when this rail has no production to \
                                      restate for it and the caller hands no frame over: the \
@@ -2994,21 +3107,21 @@ fn sampled_textures<'a>(
                                      after this one",
                                     declaration.index,
                                 ),
-                            ));
-                        };
-                        // The frame is the target's own tightly packed extent
-                        // read out of its image, and the declaration states the
-                        // *bind's* view over exactly those bytes (E-TX1/§107:
-                        // the byte order is the name's, not the memory's), so a
-                        // length that is not that extent is a caller wiring bug
-                        // and is refused under its own name rather than uploaded
-                        // and refused by the contract — a decline is never a
-                        // fallback.
-                        let expected = u64::from(image.width)
-                            .checked_mul(u64::from(image.height))
-                            .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
-                        if expected != u64::try_from(frame.len()).ok() {
-                            return Err(OutOfClass::owned(
+                                ));
+                            };
+                            // The frame is the target's own tightly packed extent
+                            // read out of its image, and the declaration states the
+                            // *bind's* view over exactly those bytes (E-TX1/§107:
+                            // the byte order is the name's, not the memory's), so a
+                            // length that is not that extent is a caller wiring bug
+                            // and is refused under its own name rather than uploaded
+                            // and refused by the contract — a decline is never a
+                            // fallback.
+                            let expected = u64::from(image.width)
+                                .checked_mul(u64::from(image.height))
+                                .and_then(|texels| texels.checked_mul(format.bytes_per_texel()));
+                            if expected != u64::try_from(frame.len()).ok() {
+                                return Err(OutOfClass::owned(
                                 "render_provider_out_of_class_texture_source_frame_shape",
                                 format!(
                                     "a draw whose `[[texture({})]]` view carries the caller's {} \
@@ -3027,8 +3140,9 @@ fn sampled_textures<'a>(
                                         * format.bytes_per_texel(),
                                 ),
                             ));
+                            }
+                            NarrowTextureSource::Frame(frame)
                         }
-                        NarrowTextureSource::Frame(frame)
                     }
                 }
             }
@@ -6198,6 +6312,133 @@ pub fn override_pixel_coordinate_sampler(declared: Option<bool>) -> PixelCoordin
     }
 }
 
+/// The pass-entry snapshot arm's own candidate test (E-TX15).
+///
+/// The pure half of that class condition, stated where the device answer is
+/// asked and read again by the walk itself — one spelling, two readers, exactly
+/// as [`sampled_bind_of_a_narrow_lane`] is for R39. What it answers is whether
+/// the request's own statement names the shape the arm can carry: a sampled
+/// declaration whose bind resolved to the very attachment this draw writes
+/// (`SampledSource::Target` beside `DrawRequest::writes_attachment`), which is
+/// the record the census reads as `texture_source_order`. Every other record —
+/// a bind of another extent, one whose texels resolved elsewhere, a record that
+/// samples a target it does not write — reaches the rail's provider no earlier
+/// than it did.
+///
+/// The test is on the request alone: the *identity* of the attachment the arm
+/// declares is derived by the trace's own builder
+/// ([`attachment_identity`]), so this ask cannot drift from what the
+/// declaration will name.
+fn sampled_bind_of_the_attachment(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> bool {
+    inputs
+        .fragment_texture_declarations
+        .iter()
+        .any(|declaration| {
+            req.sampled_images
+                .iter()
+                .find(|image| image.binding == declaration.binding)
+                .is_some_and(|image| match &image.source {
+                    crate::backend::vulkan::engine::SampledSource::Target(identity) => {
+                        req.target_identity.as_ref() == Some(identity)
+                    }
+                    _ => false,
+                })
+        })
+}
+
+/// Whether this provider executes a render pass whose sampled declaration is
+/// the **pass-entry snapshot** of the colour attachment the same pass writes
+/// (`research/docs/23` §118, E-TX15).
+///
+/// The eleventh device answer this rail asks *before* the gate, on the same
+/// terms as the ten above: the rule it lifts sits inside the declaration walk
+/// (the walk weighs each sampled bind, and this one answers whether a bind
+/// naming the pass's own attachment view can be stated at all), so an answer
+/// read after the walk would arrive after the walk had already refused the
+/// shape by name. The ask is gated on the request's own statement being that
+/// shape ([`sampled_bind_of_the_attachment`], the same intersection the walk
+/// tests), so no other record reaches the rail's provider any earlier than it
+/// did.
+///
+/// A device (or a frame) that declares the arm executes the record the census
+/// reads as `texture_source_order` — the canonical declaration names the
+/// attachment's own `(allocation, view)` pair and the provider copies that
+/// image on the device before the pass opens
+/// (`TextureSource::PassEntrySnapshot`) — and a device whose frame leaves the
+/// bit out keeps the census's slug and sentence for the shape, byte for byte,
+/// at the same point in the same order. The frame's own answer is the one the
+/// class gets (a bit the owner→provider frame cannot carry is a bit no remote
+/// owner would ever see), and an unanswerable candidate is fail-closed rather
+/// than run on a rail the class never named.
+fn declared_render_pass_entry_snapshot() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written — the
+    // same rule the readings above keep.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match PASS_ENTRY_SNAPSHOT_ANSWER.load(Ordering::Relaxed) {
+            PASS_ENTRY_SNAPSHOT_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_pass_entry_snapshot =
+                    answer == PASS_ENTRY_SNAPSHOT_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_pass_entry_snapshot(rail.provider.device_epoch(), &capabilities).map_err(
+        |decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        },
+    )
+}
+
+/// The device's own answer for the pass-entry snapshot capability (E-TX15), and
+/// the states the test instrument below can put it in — the same three states,
+/// for the same reason, as [`PIXEL_COORDINATE_SAMPLER_ANSWER`]'s.
+const PASS_ENTRY_SNAPSHOT_DEVICE: u8 = 0;
+const PASS_ENTRY_SNAPSHOT_NOT_DECLARED: u8 = 1;
+const PASS_ENTRY_SNAPSHOT_DECLARED: u8 = 2;
+
+/// Whether the pass-entry snapshot capability is read from the device's own
+/// frame ([`PASS_ENTRY_SNAPSHOT_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static PASS_ENTRY_SNAPSHOT_ANSWER: AtomicU8 = AtomicU8::new(PASS_ENTRY_SNAPSHOT_DEVICE);
+
+/// A test's own answer for the pass-entry snapshot capability, restored when it
+/// drops (E-TX15).
+///
+/// The mirror of [`PixelCoordinateSamplerOverride`], and a guard for the same
+/// reason: this changes a *decision* rather than an observation, so a test that
+/// unwound through a failed assertion must not leave the next shape in the same
+/// binary answering from a device that is not its own. The answer travels
+/// through the capability frame — written, encoded and decoded — so the arm a
+/// test sees is the arm an old frame gives.
+pub struct PassEntrySnapshotOverride {
+    previous: u8,
+}
+
+impl Drop for PassEntrySnapshotOverride {
+    fn drop(&mut self) {
+        PASS_ENTRY_SNAPSHOT_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the pass-entry snapshot capability as `declared` until the returned
+/// guard drops, or as the device's own answer for `None` (E-TX15).
+pub fn override_render_pass_entry_snapshot(declared: Option<bool>) -> PassEntrySnapshotOverride {
+    let answer = match declared {
+        None => PASS_ENTRY_SNAPSHOT_DEVICE,
+        Some(false) => PASS_ENTRY_SNAPSHOT_NOT_DECLARED,
+        Some(true) => PASS_ENTRY_SNAPSHOT_DECLARED,
+    };
+    PassEntrySnapshotOverride {
+        previous: PASS_ENTRY_SNAPSHOT_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// Whether this draw's own fragment module can be executed with a
 /// pixel-coordinate sampler (2026-09-19, census v43's `texture_state` axis).
 ///
@@ -7702,6 +7943,15 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
     // R41's folded texels join them on exactly that fact: the descriptor carries
     // the widened copy as `TextureSource::OwnedBytes` too, so a re-run states the
     // same bytes and never re-reads the window the fold was made from.
+    //
+    // E-TX15's pass-entry snapshot is the one source arm that is **not**
+    // restatable, and it is absent from the list below on purpose: a re-run of
+    // the producing pass would state the *entry* content of an attachment the
+    // later trace does not carry, so the production would have to be the
+    // attachment's own bytes — which the declaration deliberately does not
+    // have. (The arm's own records never reach this function anyway: the walk
+    // admits it only beside a load that keeps prior contents, and the check
+    // above records only a pass that opens from a `Clear`.)
     if pass.textures.iter().any(|texture| {
         !matches!(
             texture.source,
@@ -9854,6 +10104,29 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // E-TX15: the eleventh device answer this rail asks *before* the gate, on
+    // the same terms as the ten above. The rule it lifts is the declaration
+    // walk's self-sampling refusal: a sampled bind whose texels resolved to the
+    // attachment this draw writes can be stated as that attachment's
+    // pass-entry snapshot — one declaration naming the attachment's own
+    // `(allocation, view)` pair, whose bytes the provider copies on the device
+    // before the pass opens — exactly when the device executes that arm. The
+    // ask is gated on the request's own statement being that shape
+    // ([`sampled_bind_of_the_attachment`], the same intersection the walk
+    // tests), so no other record reaches the rail's provider any earlier than
+    // it did. A frame that leaves the bit out keeps the census's refusal, its
+    // slug and its sentence, at the same point in the same order.
+    let render_pass_entry_snapshot = match sampled_bind_of_the_attachment(inputs, req) {
+        false => false,
+        true => match declared_render_pass_entry_snapshot() {
+            Ok(declared) => declared,
+            // A provider that cannot be reached cannot answer the question the
+            // walk needs, and an unanswerable candidate is an in-class
+            // candidate: fail closed, exactly as the answers above do, rather
+            // than running the shape on a rail the class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // E-TX13: the fifth device answer this rail asks *before* the gate, on the
     // same terms as the four above. The rule it lifts is the guest-backed tail's
     // refusal: a record whose attachment is backed by the guest's own pages,
@@ -9906,6 +10179,7 @@ fn submit_render_inner(
         attachment_landing_view,
         kept_frame_landing,
         render_pixel_coordinate_sampler,
+        render_pass_entry_snapshot,
     ) {
         Err(reason) => {
             reason.note();
@@ -11348,6 +11622,27 @@ enum NarrowTextureSource<'a> {
     /// so a pass that samples one is still restatable as a production: its
     /// descriptor carries the bytes, not a lease.
     Frame(&'a [u8]),
+    /// The pass's **own colour attachment**, as it stands when the pass opens
+    /// (`TextureSource::PassEntrySnapshot`, `research/docs/23` §118, E-TX15):
+    /// the read the census names `texture_source_order`, stated by the arm that
+    /// resolves it before the pass opens instead of by name.
+    ///
+    /// The variant carries nothing, and that is its whole shape: the bytes are
+    /// the attachment's own, the declaration names the attachment's own
+    /// `(allocation, view)` pair — the pair the trace's own builder derives for
+    /// the pass's colour attachment ([`attachment_identity`]), so the sampled
+    /// view and the attachment cannot name two images — and the provider copies
+    /// that image on the device ahead of the pass
+    /// (`metal-api-vulkan`'s `AttachmentSnapshot`). A declaration of *this*
+    /// variant states no bytes, mints no allocation of its own, and is stated
+    /// for the view the attachment's own declaration already named.
+    ///
+    /// The arm's rules are the walk's ([`sampled_textures`]' `Target` branch):
+    /// the primary colour attachment, a load arm that keeps its prior contents,
+    /// the attachment's own texel order and extent, and no folded channel plan.
+    /// Every shape they do not cover keeps the census's refusal, slug, sentence
+    /// and route, byte for byte.
+    EntrySnapshot,
     /// The registered guest RAM window the bind's own zero-copy gather was cut
     /// from (R28): the texels live in the guest's pages, and the run carries
     /// the provider-shaped window the registration ledger derived for it — the
@@ -11476,7 +11771,10 @@ impl NarrowTextureSource<'_> {
         match self {
             Self::Bytes(bytes) | Self::Frame(bytes) => Some(bytes),
             Self::Depadded { .. } | Self::Folded { .. } => texture_copies.bytes(index),
-            Self::Produced { .. } | Self::Window { .. } => None,
+            // E-TX15's snapshot carries no bytes of its own: what it reads is
+            // the attachment's image, on the device, and the declaration names
+            // the attachment's own allocation rather than minting one here.
+            Self::Produced { .. } | Self::Window { .. } | Self::EntrySnapshot => None,
         }
     }
 }
@@ -12092,6 +12390,13 @@ fn narrow_class<'a>(
     // needs (2026-09-19, census v43's `texture_state` axis); the caller reads
     // both before the gate, exactly as it reads the six answers beside them.
     render_pixel_coordinate_sampler: bool,
+    // Whether this draw's provider executes the sampled declaration E-TX15
+    // opened — the pass-entry snapshot of the colour attachment the same pass
+    // writes. Read by the caller out of the same capability frame and under its
+    // own candidate test, exactly as the ten answers beside it are; the walk
+    // below weighs each sampled bind against the arm's own shape rules and
+    // keeps the census's refusal for every one it cannot state.
+    render_pass_entry_snapshot: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
@@ -13140,6 +13445,16 @@ fn narrow_class<'a>(
         render_texture_gathered_extent_no_copy,
         render_texture_narrow_lanes,
         render_pixel_coordinate_sampler,
+        // E-TX15's arm, with the two facts the declaration has to restate: the
+        // attachment's own texel order, and whether its load arm keeps the
+        // prior contents the snapshot promises (a `Clear` establishes the clear
+        // colour and `DontCare` nothing at all, so neither is a copy of what
+        // the attachment held). `None` is the arm being undeclared, which keeps
+        // the walk's refusal for the shape.
+        render_pass_entry_snapshot.then_some(EntrySnapshotArm {
+            format,
+            loads_prior_contents: !matches!(load, NarrowLoad::Clear(_)),
+        }),
     )?;
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
@@ -14343,6 +14658,19 @@ fn submit_narrow(
                     TextureSource::TraceView,
                 )
             }
+            // E-TX15: the snapshot is the pass's own colour attachment, so the
+            // declaration names **that declaration's** pair — the same
+            // `(allocation, view)` the attachment's own view is stated with, so
+            // the two cannot be two images — and carries no bytes: what the arm
+            // reads is the attachment image, which the provider copies on the
+            // device before the pass opens. Nothing is minted here: the view and
+            // its allocation are the attachment's, and the resource table
+            // already records that allocation at the pass's own extent.
+            NarrowTextureSource::EntrySnapshot => (
+                attachment.view,
+                attachment.allocation,
+                TextureSource::PassEntrySnapshot,
+            ),
             // R28: the lease the plan minted for this texture's window, under
             // the label both halves key it by. Its *channel* is the device's
             // answer ([`texture_window_arm`]): the borrowed no-copy window, or
