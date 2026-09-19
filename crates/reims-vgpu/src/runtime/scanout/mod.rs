@@ -1337,11 +1337,37 @@ const FIELD_PATCH_SIDE: u32 = 8;
 /// swap chain hold different frames and a shared slot would report every
 /// alternation between them as a change.
 static FIELD_WITNESS_LAST: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+    std::sync::Mutex<std::collections::HashMap<u32, u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Presents between samples once the power-of-two spacing has opened up.
 const FIELD_WITNESS_STRIDE: u64 = 64;
+
+/// The login window's own controls, in the layer's own pixels.
+///
+/// The four field patches above answer "is the background behind everything
+/// painted". The defect these exist for is the other half of that reading: a
+/// window whose *controls* are missing while its background is not, which no
+/// record of a background can name. The rectangles are absolute rather than
+/// fractional because they are one window's layout and not a shape -- a surface
+/// that does not contain every one of them is a different window, and a reading
+/// rescaled onto it would describe rectangles nothing drew.
+const FIELD_ELEMENT_RECTS: [(u32, u32, u32, u32); 4] = [
+    (880, 587, 160, 28), // the credential field
+    (835, 966, 35, 35),  // the three controls beneath it
+    (943, 966, 35, 35),
+    (1051, 966, 35, 35),
+];
+
+/// Binds between lines once a mapping has been sampled at least once.
+///
+/// Shorter than [`FIELD_WITNESS_STRIDE`] on purpose: the present witness rides
+/// a rate the guest sets, and the interval this record is for is a *still*
+/// window, where the only line the guest would produce is the one at the click
+/// that repairs the defect. One line per eight binds costs a few lines a second
+/// on a still desktop and makes the missing-controls reading a measurement
+/// rather than an artifact of when someone clicked.
+const SAMPLED_FIELD_STRIDE: u64 = 8;
 
 /// What one background patch of the presented plane's guest pages holds.
 ///
@@ -1362,10 +1388,127 @@ fn field_patch_verdict(mean: f32, sd: f32) -> &'static str {
     }
 }
 
+/// What the login window's controls hold, read out of the same guest pages the
+/// background patches come from.
+enum FieldElements {
+    /// Every rectangle was read: the per-rectangle `verdict:mean/sd`, the first
+    /// texel's bytes, and the four verdicts as one word so a change of the
+    /// controls is a comparison and not a string diff.
+    Reading {
+        report: String,
+        first: String,
+        pattern: u64,
+    },
+    /// The surface does not contain these rectangles, so it is not this
+    /// window and there is no element reading to make of it.
+    NotThisWindow,
+    /// The surface contains them and its pages could not be read. A gap in the
+    /// record rather than a reading: the callers drop the whole line instead of
+    /// printing one without its element half, because absence of the half would
+    /// otherwise be read as absence of the controls.
+    Unreadable,
+}
+
+/// [`FIELD_ELEMENT_RECTS`], read straight out of a window's guest pages.
+///
+/// No settle, for [`note_present_field_witness`]'s reason: landing deferred work
+/// into these pages is one of the repairs this defect could need, so an
+/// instrument that settled would report the frame it had just fixed.
+fn field_element_patches<M: HostMemory>(
+    host: &M,
+    window: SampledFieldWindow,
+    gpas: &[u64],
+    page: u64,
+) -> FieldElements {
+    let SampledFieldWindow {
+        width,
+        height,
+        base_off,
+        bpr,
+        bpp,
+        ..
+    } = window;
+    let fits = FIELD_ELEMENT_RECTS.iter().all(|&(x, y, w, h)| {
+        x.checked_add(w).is_some_and(|right| right <= width)
+            && y.checked_add(h).is_some_and(|bottom| bottom <= height)
+    });
+    if !fits {
+        return FieldElements::NotThisWindow;
+    }
+    let read = bpp.min(4) as usize;
+    let colour = read.min(3);
+    let mut report = String::new();
+    let mut first = String::new();
+    let mut verdicts: Vec<u8> = Vec::with_capacity(FIELD_ELEMENT_RECTS.len());
+    for (i, &(x, y, w, h)) in FIELD_ELEMENT_RECTS.iter().enumerate() {
+        // The centre of the rectangle, so a border or a rounded corner is not
+        // what the reading is about.
+        let x0 = x + w / 2 - FIELD_PATCH_SIDE / 2;
+        let y0 = y + h / 2 - FIELD_PATCH_SIDE / 2;
+        let mut texels = [0f32; (FIELD_PATCH_SIDE * FIELD_PATCH_SIDE) as usize];
+        let mut n = 0usize;
+        let mut first_texel = String::new();
+        for dy in 0..FIELD_PATCH_SIDE {
+            for dx in 0..FIELD_PATCH_SIDE {
+                let off = base_off
+                    + u64::from(y0 + dy) * u64::from(bpr)
+                    + u64::from(x0 + dx) * u64::from(bpp);
+                let Some(&gpa) = gpas.get((off / page) as usize) else {
+                    continue;
+                };
+                let mut texel = [0u8; 4];
+                if host
+                    .read_gpa(gpa + (off % page), &mut texel[..read])
+                    .is_err()
+                {
+                    continue;
+                }
+                if first_texel.is_empty() {
+                    first_texel = texel[..read].iter().map(|b| format!("{b:02x}")).collect();
+                }
+                // The colour bytes, skipping byte 3 when there are four — the
+                // same reading the present witness takes, and the one the
+                // host-side grader takes, so the two can be compared without a
+                // channel order.
+                texels[n] =
+                    texel[..colour].iter().map(|b| f32::from(*b)).sum::<f32>() / colour as f32;
+                n += 1;
+            }
+        }
+        if n == 0 || first_texel.is_empty() {
+            return FieldElements::Unreadable;
+        }
+        let mean = texels[..n].iter().sum::<f32>() / n as f32;
+        let sd = (texels[..n].iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
+        let verdict = field_patch_verdict(mean, sd);
+        verdicts.push(verdict.as_bytes()[0]);
+        if i != 0 {
+            report.push(',');
+            first.push(',');
+        }
+        report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
+        first.push_str(&format!("0x{first_texel}"));
+    }
+    let pattern = verdicts
+        .iter()
+        .fold(0u64, |acc, v| (acc << 8) | u64::from(*v));
+    FieldElements::Reading {
+        report,
+        first,
+        pattern,
+    }
+}
+
 /// The last field pattern reported for each large sampled surface, so the
 /// witness below reports a change rather than a sample.
 static SAMPLED_FIELD_LAST: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How many times each large sampled surface has been asked about, so the
+/// witness below can report a still window as well as a changing one.
+static SAMPLED_FIELD_SAMPLES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Texels of a sampled surface below which it is not worth asking this
@@ -1398,11 +1541,20 @@ pub fn note_sampled_surface_field<M: HostMemory>(
     mapping_id: u32,
     texture_ref: u32,
     route: &str,
+    resident: &str,
 ) {
     let Some(window) = SampledFieldWindow::of_mapping(state, mapping_id) else {
         return;
     };
-    note_sampled_surface_field_window(state, host, mapping_id, texture_ref, route, window);
+    note_sampled_surface_field_window(
+        state,
+        host,
+        mapping_id,
+        texture_ref,
+        route,
+        resident,
+        window,
+    );
 }
 
 /// The texels a sampled bind reads out of one mapping, and where they sit in it.
@@ -1458,12 +1610,20 @@ impl SampledFieldWindow {
 
 /// [`note_sampled_surface_field`] over an explicitly named window, for a bind
 /// whose texels are not the mapping's own geometry.
+///
+/// `resident` is the rail's own reading of the copy its ladder would serve
+/// *above* these pages for the same mapping — empty on a rail that keeps no
+/// such copy or has nothing to say about this one. It rides here rather than in
+/// a witness of its own because the two readings are only interpretable as a
+/// pair: pages that hold a rectangle say what the surface *is*, and the copy the
+/// ladder would serve says what a composite actually got.
 pub fn note_sampled_surface_field_window<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     mapping_id: u32,
     texture_ref: u32,
     route: &str,
+    resident: &str,
     window: SampledFieldWindow,
 ) {
     let SampledFieldWindow {
@@ -1540,16 +1700,48 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     if verdicts.is_empty() {
         return;
     }
+    // The window's own controls, off the same page list and in the same pass.
+    // A surface that contains them and cannot be read drops the line whole: the
+    // reader of this record cannot tell a missing field from a missing
+    // instrument, and "the controls are not there" is exactly what an absent
+    // element half would be read as.
+    let (elements, element_pattern) = match field_element_patches(host, window, &gpas, page) {
+        FieldElements::Reading {
+            report,
+            first,
+            pattern,
+        } => (format!(" elems=[{report}] elem_first=[{first}]"), pattern),
+        FieldElements::NotThisWindow => (String::new(), 0),
+        FieldElements::Unreadable => return,
+    };
+    let (map_gen, epoch) = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| (m.map_generation, m.surface_content_epoch))
+        .unwrap_or((0, 0));
     let pattern = verdicts
         .iter()
-        .fold(0u64, |acc, v| (acc << 8) | u64::from(*v));
+        .fold(0u64, |acc, v| (acc << 8) | u64::from(*v))
+        | (element_pattern << 32);
     let changed = {
         let mut last = SAMPLED_FIELD_LAST
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         last.insert((mapping_id, base_off), pattern) != Some(pattern)
     };
-    if !changed {
+    // A still window reports too. The element half is the reading a user's
+    // report is about, and a window that is not being touched is precisely the
+    // interval in which nothing changes: on change alone this record would be
+    // silent for the whole defect and speak only at the click that repairs it.
+    let heartbeat = {
+        let mut seen = SAMPLED_FIELD_SAMPLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = seen.entry(mapping_id).or_insert(0);
+        *count = count.wrapping_add(1);
+        (*count).is_power_of_two() || (*count).is_multiple_of(SAMPLED_FIELD_STRIDE)
+    };
+    if !changed && !heartbeat {
         return;
     }
     // The draws that went into this surface since the last change of its field,
@@ -1562,7 +1754,8 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
         .plane_draw_witness(crate::backend::PlaneDrawReader::PresentedPlane, mapping_id);
     crate::observe::off(format!(
         "sampled_surface_field mid={mapping_id} ref={texture_ref} {width}x{height} \
-         fmt={format:#x} off={base_off:#x} bpr={bpr} route={route} patches=[{report}] \
+         fmt={format:#x} off={base_off:#x} bpr={bpr} route={route}{resident} \
+         map_gen={map_gen} epoch={epoch}{elements} patches=[{report}] \
          first=0x{first_texel}{ring} (guest pages, no settle)"
     ));
 }
@@ -1714,11 +1907,35 @@ pub fn note_present_field_witness<M: HostMemory>(
         }
         report.push_str(&format!("{verdict}:{mean:.0}/{sd:.0}"));
     }
-    // The four verdicts as one word, so "did this plane's field change" is a
-    // comparison and not a string diff.
+    // The element rectangles, off the same page list, under the same
+    // fail-closed rule as the sampled-layer witness: a plane that contains them
+    // and cannot be read drops the line whole rather than offering a background
+    // reading that an absent element half would turn into "the controls are not
+    // there".
+    let elements_window = SampledFieldWindow {
+        width,
+        height,
+        format: u32::from(format),
+        base_off,
+        bpr,
+        bpp,
+    };
+    let (elements, element_pattern) =
+        match field_element_patches(host, elements_window, &gpas, page) {
+            FieldElements::Reading {
+                report,
+                first,
+                pattern,
+            } => (format!(" elems=[{report}] elem_first=[{first}]"), pattern),
+            FieldElements::NotThisWindow => (String::new(), 0),
+            FieldElements::Unreadable => return,
+        };
+    // The four verdicts, and the four controls behind them, as one word — so
+    // "did this plane's field change" is a comparison and not a string diff.
     let pattern = verdicts
         .iter()
-        .fold(0u32, |acc, v| (acc << 8) | u32::from(*v));
+        .fold(0u64, |acc, v| (acc << 8) | u64::from(*v))
+        | (element_pattern << 32);
     let changed = {
         let mut last = FIELD_WITNESS_LAST
             .lock()
@@ -1793,8 +2010,8 @@ pub fn note_present_field_witness<M: HostMemory>(
     };
     crate::observe::off(format!(
         "present_field_witness mid={mapping_id} {width}x{height} map_gen={map_gen} \
-         epoch={epoch} seq={seq} why={} unpainted={blank}/4 patches=[{report}]{ring}\
-         {reach}{span} (guest pages, no settle)",
+         epoch={epoch} seq={seq} why={} unpainted={blank}/4{elements} \
+         patches=[{report}]{ring}{reach}{span} (guest pages, no settle)",
         if changed { "changed" } else { "heartbeat" }
     ));
 }

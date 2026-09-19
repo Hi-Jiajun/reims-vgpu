@@ -2371,6 +2371,32 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     resident_content_backing(identity) != ResidentContentBacking::NotReady
 }
 
+/// Record that a frame this resident does not hold replaced the surface's
+/// content, so the sampling ladder may not serve it again until a draw or a
+/// store makes the image current.
+///
+/// The sampling side's own witness, separate from
+/// [`stamp_resident_content_epoch`] because the two answer different questions:
+/// the stamp is the LOAD elision's "do the pages agree with this image", and a
+/// draw into the slot clears it while leaving the image current. See
+/// [`crate::backend::vulkan::engine::pools::ResidentTargetSlot::sampled_content_replaced`].
+pub fn mark_resident_sampled_content_replaced(identity: &TargetIdentity) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_mark_sampled_content_replaced(identity)
+}
+
+/// Whether this resident is known to hold a frame the surface has moved past.
+///
+/// `false` for an identity with no slot: nothing is being served, so nothing is
+/// being refused.
+pub fn resident_sampled_content_replaced(identity: &TargetIdentity) -> bool {
+    let guard = lock_engine();
+    guard
+        .pools
+        .registry_get(identity)
+        .is_some_and(|slot| slot.sampled_content_replaced)
+}
+
 #[cfg(test)]
 mod resident_content_backing_tests {
     use super::*;

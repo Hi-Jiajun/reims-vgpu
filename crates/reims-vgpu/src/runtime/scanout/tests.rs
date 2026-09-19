@@ -1443,3 +1443,113 @@ fn the_efi_console_paint_refuses_a_span_whose_hole_is_not_at_either_end() {
          read, not vouched for by its two endpoints"
     );
 }
+
+/// The element rectangles are the half of a field reading a user's report is
+/// about, so the instrument has to name all three states it can be in: read,
+/// not this window, and unreadable.
+///
+/// The coordinates are one window's, which makes the helper's own bound part of
+/// its contract — a surface one row short of the bottom controls must come back
+/// `NotThisWindow` rather than read the row above them and report wallpaper
+/// where a control is. That is the class this instrument exists to separate, so
+/// the bound is asserted from both sides.
+#[test]
+fn the_element_reading_names_what_the_window_holds_and_admits_when_it_cannot() {
+    let page = 1u64 << crate::model::PAGE_SHIFT_X86;
+    let width = 1086u32;
+    let height = 1001u32;
+    let bpp = 4u32;
+    let bpr = width * bpp;
+    let base_off = 0u64;
+    let span = u64::from(height) * u64::from(bpr);
+    let pages = span.div_ceil(page);
+    let gpa0 = 0x4000_0000u64;
+    let window = SampledFieldWindow {
+        width,
+        height,
+        format: u32::from(MTL_FORMAT_BGRA8_UNORM),
+        base_off,
+        bpr,
+        bpp,
+    };
+
+    // A uniform dark field, which is what an unwritten window reads as.
+    let mut host = FakeHost::new();
+    host.map_range(gpa0, (pages * page) as usize, 0x20);
+    let gpas: Vec<u64> = (0..pages).map(|i| gpa0 + i * page).collect();
+
+    // The credential field's centre written with alternating bytes, so the
+    // patch is *painted* rather than merely bright: a uniform white field is
+    // the verdict for something that wrote over the window, not for content.
+    let (x, y, w, h) = FIELD_ELEMENT_RECTS[0];
+    let (cx, cy) = (x + w / 2, y + h / 2);
+    let (px, py) = (cx - FIELD_PATCH_SIDE / 2, cy - FIELD_PATCH_SIDE / 2);
+    for dy in 0..FIELD_PATCH_SIDE {
+        for dx in 0..FIELD_PATCH_SIDE {
+            let off = base_off
+                + u64::from(py + dy) * u64::from(bpr)
+                + u64::from(px + dx) * u64::from(bpp);
+            let texel = if dx % 2 == 0 {
+                [0x00u8, 0x00, 0x00, 0xff]
+            } else {
+                [0xffu8, 0xff, 0xff, 0xff]
+            };
+            host.write_gpa(gpa0 + off, &texel).unwrap();
+        }
+    }
+
+    match field_element_patches(&host, window, &gpas, page) {
+        FieldElements::Reading {
+            report,
+            first,
+            pattern,
+        } => {
+            assert!(report.starts_with("painted:"), "{report}");
+            assert_eq!(
+                report.matches(",black:32/0").count(),
+                3,
+                "the unwritten controls must read as the uniform field they are: {report}"
+            );
+            assert!(
+                first.starts_with("0x000000ff"),
+                "the first texel names the byte that filled the field: {first}"
+            );
+            assert_ne!(pattern, 0);
+        }
+        _ => panic!("a window holding the controls must be read, not declined"),
+    }
+
+    // One row short of the bottom controls: a different window, and the
+    // reading is dropped rather than rescaled onto it.
+    assert!(matches!(
+        field_element_patches(
+            &host,
+            SampledFieldWindow {
+                height: height - 1,
+                ..window
+            },
+            &gpas,
+            page
+        ),
+        FieldElements::NotThisWindow
+    ));
+    // One column short of the rightmost control, likewise.
+    assert!(matches!(
+        field_element_patches(
+            &host,
+            SampledFieldWindow {
+                width: width - 1,
+                ..window
+            },
+            &gpas,
+            page
+        ),
+        FieldElements::NotThisWindow
+    ));
+    // The window, with pages this device cannot read: a gap in the record, and
+    // the callers drop the whole line rather than print half an answer.
+    assert!(matches!(
+        field_element_patches(&host, window, &[], page),
+        FieldElements::Unreadable
+    ));
+}
