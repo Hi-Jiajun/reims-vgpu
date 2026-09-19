@@ -24338,3 +24338,378 @@ fn the_seed_run_shapes_beside_the_list_stay_on_the_engine_by_name() {
         "a seed the class cannot state never reaches the provider"
     );
 }
+
+/// B5 (RAIL-D): the record the census's `load_action` bucket is made of — one
+/// GVA attachment whose declared action preserves what is already in it
+/// (`MTLLoadActionDontCare`, which is why the guest can redraw only its damage
+/// rect), no seed of its own, the packet's one position the guest's pages are
+/// owed the frame — leaves the engine when the seam states the attachment's own
+/// window for it, and lands exactly the frame it began from.
+///
+/// The class arm this drives is already on the tree (B3's window arm beside the
+/// store election that lands the frame back in the same declaration); what this
+/// increment adds is the seam's *third* cut, which is the layer a test cannot
+/// mint without a guest (`runtime::draw::vulkan`'s page walk plus the payment
+/// `INV-LAND` rests on). So the readings here are the class's half, one at a
+/// time:
+///
+/// * **B off** (no window stated): today's answer, verbatim — the
+///   `load_action` bucket +1, the same slug and the same sentence the seam has
+///   charged since R32 — and the engine's own answer for the same record, a
+///   pass begun with undefined contents (`passbegin_undefined` +1). The seam's
+///   own `dontcare_seed_empty` reading is charged by the request builder, one
+///   layer above this file, and is read on the boot census.
+/// * **B on** (the window stated): the record reaches the canonical provider,
+///   its declaration is priced under `render_provider_attachment_guest_window_bytes`
+///   at the attachment's own extent, the frame lands in that same window
+///   (`render_provider_borrowed_landing_bytes`), and the completed frame is the
+///   frame the engine produces when the *same* previous contents are loaded
+///   through its own preserving arm — byte for byte.
+/// * the falsifiable half: the window the door stated is the page the payment
+///   landed, so a window over the *older* page moves the frame's undrawn half
+///   with it (a seam that read the page the debt had not been paid into lands a
+///   different picture, which is what makes this rail fail there), and a
+///   two-run declaration moves the frame's halves when the runs are swapped
+///   (the run list is read in the order it states).
+#[test]
+fn a_preserving_gva_tails_own_window_leaves_for_the_provider_and_lands_the_same_frame() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::protocol::pass_action::LoadAction;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let half = width / 2;
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    let texel = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    };
+    // Per-texel bytes rather than one colour: which bytes the pass began from is
+    // read texel by texel, in the half this pass does not draw.
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the window arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    assert!(
+        frame_len <= page as u64,
+        "the fixture's window fits one provider page"
+    );
+    // Two pages of one registration: the first is the frame the declaration is
+    // about (the one the door's payment lands), the second an older frame that
+    // no reader may mistake for it.
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&pattern(0));
+    owner.as_mut_slice()[page..page + frame_len as usize].copy_from_slice(&pattern(0x33));
+    let import = 0x9e5d_u64;
+    // The owner's own address, read once: the closures below must not borrow
+    // the allocation, because the falsifiable half rewrites it.
+    let base = owner.pointer as u64;
+    let window = |page_index: usize, head: u64, bytes_len: u64| StageBufferWindow {
+        import,
+        host_va: base + (page_index * page) as u64,
+        length: page as u64,
+        head,
+        bytes_len,
+    };
+    let paid = window(0, 0, frame_len);
+    let older = window(1, 0, frame_len);
+    let paid_bytes = pattern(0);
+
+    // The record's own shape: a declared action that preserves what is already
+    // in the attachment, **no seed of its own**, the withheld readback the
+    // census's shapes show (`ResidentStore` — the deferred rails' own reason,
+    // which is the statement that the frame's destination is this attachment's
+    // pages), and the partial scissor that leaves the window's bytes readable.
+    let request = || {
+        let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(LoadAction::DontCare);
+        // The identity the seam's own GVA deferred-Store rail mints for this
+        // record (`gva_chain_identity`): the withheld readback below is that
+        // rail's answer, and the class keys its resident arms on the identity
+        // the request names.
+        req.target_identity = Some(engine::TargetIdentity::Gva {
+            gva: 0x58_0000,
+            width,
+            height,
+            generation: 1,
+            format: ash::vk::Format::R8G8B8A8_UNORM,
+        });
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: half,
+            height,
+        });
+        req
+    };
+    // The engine's own answer for the same record, read back rather than
+    // withheld (the engine's readback is not what this rail is about, and the
+    // class's election is: the seam's record withholds it because the frame's
+    // destination is the attachment's own pages). `Load` with the caller's
+    // bytes (`target_rgba8`) is the frame the declaration *permits* — `DontCare`
+    // is "undefined", and undefined permits preserving — while the same record
+    // without those bytes begins undefined.
+    let engine_arm = |declared: LoadAction, seed: bool| {
+        let mut req = request();
+        req.color0_declared = Some(declared);
+        req.skip_readback = false;
+        req.readback_skip_reason = ReadbackSkipReason::None;
+        if seed {
+            req.target_rgba8 = Some(std::sync::Arc::new(pattern(0)));
+        }
+        req
+    };
+
+    // B off: today's answer, verbatim. The class cannot name this record's
+    // previous contents, so the engine keeps the draw.
+    let bucket_before = route_count("render_provider_out_of_class_load_action");
+    let deliveries = provider_render::provider_submissions();
+    let refused = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &request(),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => reason,
+        other => {
+            panic!("a preserving record whose window is not stated stays on the engine: {other:?}")
+        }
+    };
+    assert_eq!(
+        refused.slug(),
+        "render_provider_out_of_class_load_action",
+        "the record's own bucket is the load action's, not a window's"
+    );
+    assert_eq!(
+        refused.detail(),
+        "the canonical class loads by `Clear` or from the provider's own image; a Load or \
+         DontCare record whose previous contents this rail cannot name stays on the engine",
+        "the sentence is the one the census has read since R32: it moves no edge"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_action") - bucket_before,
+        1,
+        "the refusal is counted under its own bucket"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries,
+        "a record the class keeps never reaches the provider"
+    );
+
+    // The engine's own answer for the same record, and the oracle for the
+    // window's bytes: `passbegin_undefined` +1 is the weak answer the refusal
+    // hands this record to (it writes none of the attachment and invents no
+    // colour), and the `Load` arm beside it is the frame the provider's window
+    // has to reproduce.
+    let undefined_before = route_count("passbegin_undefined");
+    let Some(undefined) = engine_pixels(
+        "B5 DontCare GVA",
+        &stages,
+        engine_arm(LoadAction::DontCare, false),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        route_count("passbegin_undefined") - undefined_before,
+        1,
+        "the record the class keeps is a pass begun with undefined contents"
+    );
+    let Some(engine) = engine_pixels(
+        "B5 preserving GVA",
+        &stages,
+        engine_arm(LoadAction::Load, true),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        engine.len(),
+        frame_len as usize,
+        "the engine's own frame covers the whole attachment"
+    );
+    // The undefined arm writes none of the attachment: whatever it read back is
+    // not a promise any rail may rely on, which is exactly why the window is
+    // the only declaration that can carry these contents.
+    assert_eq!(
+        undefined.len(),
+        engine.len(),
+        "both engine arms cover the same extent"
+    );
+
+    // B on: the window the seam's third cut states.
+    //
+    // Registered *after* the engine arm above: its device context is created
+    // lazily on the first draw, and that creation resets the owner rail, so a
+    // registration made before it would be gone by the time the provider looks
+    // at the window.
+    provider_owner::register(Region {
+        import,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x58_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+    let window_bytes_before = route_count("render_provider_attachment_guest_window_bytes");
+    let landing_before = route_count("render_provider_borrowed_landing_bytes");
+    let deliver = |runs: &[StageBufferWindow]| -> Vec<u8> {
+        let inputs = inputs_held_with_attachment_window(&stages, RenderChainRole::SoleOrTail, runs);
+        match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => {
+                panic!("a preserving record whose own window is stated is in class: {other:?}")
+            }
+        }
+    };
+    let single = [paid];
+    let provided = deliver(&single);
+    assert!(
+        provider_render::provider_submissions() > deliveries,
+        "the released shape reaches the canonical provider instead of the engine"
+    );
+    assert_frames_equal(
+        "B5 the declaration's own window, both rails",
+        &provided,
+        &engine,
+    );
+    assert_eq!(
+        route_count("render_provider_attachment_guest_window_bytes") - window_bytes_before,
+        frame_len,
+        "the declaration is priced at exactly the attachment's own extent"
+    );
+    assert_eq!(
+        route_count("render_provider_borrowed_landing_bytes") - landing_before,
+        frame_len,
+        "the frame landed in the window it began from (E-TX8's borrow)"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_load_action") - bucket_before,
+        1,
+        "the bucket the record used to keep does not move: the two submissions above are one \
+         refusal and one admission, not two refusals"
+    );
+    for x in 0..half {
+        assert_texel_near(
+            &format!("B5 drawn texel ({x}, 0)"),
+            texel(&provided, x, 0),
+            FRAGMENT_TEXEL,
+        );
+    }
+    for y in 0..height {
+        for x in half..width {
+            let expected = paid_bytes[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&provided, x, y).to_vec(),
+                expected,
+                "texel ({x}, {y}) is the window's own byte: a rail that read anything else — \
+                 zeros, a copy, or an image of its own — lands a different picture here"
+            );
+        }
+    }
+    // `INV-RETURN`: the window holds the frame the pass produced, byte for byte.
+    assert_eq!(
+        owner.as_mut_slice()[..frame_len as usize].to_vec(),
+        provided,
+        "the registered page holds the published frame: a rail that only loaded it would leave \
+         the pre-pass pattern in every undrawn texel"
+    );
+
+    // The falsifiable half, one: the payment. A window over the page the debt
+    // was *not* paid into carries the older frame, and the undrawn half of the
+    // completed frame is where that shows — so a seam that cut the pages before
+    // `pay_gva_plane` landed them (or a class that assembled another window)
+    // fails the comparison above, not merely a counter.
+    let older_frame = deliver(&[older]);
+    assert_eq!(
+        texel(&older_frame, width - 1, height - 1).to_vec(),
+        pattern(0x33)[((height - 1) * width + (width - 1)) as usize * 4..][..4].to_vec(),
+        "the window over the older page carries the older frame's own bytes"
+    );
+    assert_frames_differ(
+        "the page the window names reaches the frame",
+        &provided,
+        &older_frame,
+    );
+    for y in 0..height {
+        for x in half..width {
+            let expected = pattern(0x33)[((y * width + x) * 4) as usize..][..4].to_vec();
+            assert_eq!(
+                texel(&older_frame, x, y).to_vec(),
+                expected,
+                "the older page's texel ({x}, {y}) is what an unpaid cut would have read"
+            );
+        }
+    }
+
+    // The falsifiable half, two: the run list's order. Two half-windows of one
+    // page, swapped, move the frame's halves with them — the declaration is read
+    // in the order it states, and no run may be dropped.
+    let half_len = frame_len / 2;
+    owner.as_mut_slice()[page..page + frame_len as usize].copy_from_slice(&pattern(0x33));
+    let first = window(1, 0, half_len);
+    let second = window(1, half_len, half_len);
+    let straight = deliver(&[first, second]);
+    let swapped = deliver(&[second, first]);
+    assert_frames_differ(
+        "the window's run order reaches the frame",
+        &straight,
+        &swapped,
+    );
+    // Both runs come from the same page, so the declaration's order is the only
+    // difference between the two submissions: the assembled image's *byte*
+    // halves are swapped with the runs.
+    let source = pattern(0x33);
+    let mut swapped_source = source[half_len as usize..].to_vec();
+    swapped_source.extend_from_slice(&source[..half_len as usize]);
+    let undrawn_half = |frame: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity((half * height * 4) as usize);
+        for y in 0..height {
+            for x in half..width {
+                out.extend_from_slice(&texel(frame, x, y));
+            }
+        }
+        out
+    };
+    assert_eq!(
+        undrawn_half(&straight),
+        undrawn_half(&source),
+        "in declaration order the assembled window is the pattern itself"
+    );
+    assert_eq!(
+        undrawn_half(&swapped),
+        undrawn_half(&swapped_source),
+        "swapping the two runs moves the undrawn half with them"
+    );
+    eprintln!(
+        "B5 declaration's own window: {width}x{height} attachment, {frame_len} byte window in \
+         registration {import:#x} (host import alignment {alignment}); B off: \
+         render_provider_out_of_class_load_action +1 with the R32 sentence verbatim, \
+         passbegin_undefined +1 on the engine arm, provider submissions +0; B on: \
+         render_provider_attachment_guest_window_bytes +{frame_len}, \
+         render_provider_borrowed_landing_bytes +{frame_len}, the provider's frame equal to the \
+         engine's preserving arm byte for byte, and the registered page holds the published \
+         frame; a window over the older page and a swapped two-run declaration both move the \
+         frame's undrawn half"
+    );
+}

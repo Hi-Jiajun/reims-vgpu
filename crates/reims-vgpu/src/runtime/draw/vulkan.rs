@@ -3151,6 +3151,72 @@ fn attachment_window_input(
     }
 }
 
+/// B5: the facts that say whether a record is the one the third window answers
+/// — the *declaration's* own window, cut for the record whose previous contents
+/// nothing else on the rail can name.
+///
+/// The conditions are the class's own (`provider_render.rs`'s last load arm
+/// states an attachment's own window when the record carries no seed, no live
+/// image and no guest backing, and its declared action preserves what is already
+/// there), plus the two facts this door adds and that the class's *store*
+/// election reads for the same record: the position the guest's pages are owed
+/// the frame ([`RenderChainRole::SoleOrTail`] — a middle's previous contents are
+/// the walk's chain value, not this plane's stored pages) and a readback
+/// withheld in the window's own currency (`ReadbackSkipReason::ResidentStore`:
+/// the deferred Store rails' reason, which is the same statement as "the pages
+/// are this frame's destination").
+///
+/// The table is a value rather than a chain of `&&`s so the shape can be driven
+/// condition by condition (`preserving_window_door_tests` below): this is a
+/// fact about the seam, and no boot can be asked what a *single* condition was
+/// worth.
+#[cfg(feature = "provider-render")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreservingWindowDoor {
+    /// Colour0 is a linear GVA target (`mapping_id == 0 && target_gva != 0`) and
+    /// the record carries exactly one colour attachment: the window is *one*
+    /// attachment's own declaration, and a record with seconds is a shape the
+    /// class answers further down by name (`…_mrt`).
+    gva_target: bool,
+    /// The record's declared action preserves whatever is already in the
+    /// attachment (`LoadAction::preserves_prior_contents()`): a `Clear` states
+    /// its own contents and is not this door's shape.
+    preserves: bool,
+    /// The record states a source of its own — the R32 run list
+    /// (`target_guest_seed`), the caller's bytes (`target_rgba8`), the live GPU
+    /// image (`load_from_target`), or the mapper-ref surface's backing
+    /// (`load_guest_target_backing`). Two statements for one attachment's
+    /// contents is the disagreement the class refuses by name, so such a record
+    /// is not admitted here (the class filters the same two fields off its own
+    /// arm).
+    carries_its_own_source: bool,
+    /// The record continues the encoder: its previous contents are the frame the
+    /// record before it produced, which this seam does not claim the plane's
+    /// pages hold.
+    continues_render_pass: bool,
+    /// This record's place in the packet.
+    role: crate::backend::provider_render::RenderChainRole,
+    /// The caller withheld this record's readback because the frame's
+    /// destination is the attachment's own declaration
+    /// ([`crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore`]).
+    /// One declaration carries both halves then: the pass begins from the window
+    /// and its frame lands back in it (`StoreOp::Borrowed`).
+    withheld_in_the_window: bool,
+}
+
+#[cfg(feature = "provider-render")]
+impl PreservingWindowDoor {
+    /// Whether this record is the third window's shape.
+    fn applies(self) -> bool {
+        self.gva_target
+            && self.preserves
+            && !self.carries_its_own_source
+            && !self.continues_render_pass
+            && self.role == crate::backend::provider_render::RenderChainRole::SoleOrTail
+            && self.withheld_in_the_window
+    }
+}
+
 /// Whether one cut of a mapping's guest window pays the surface's own writeback
 /// debt before it names the pages (E-TX8 / E-TX13).
 ///
@@ -9620,6 +9686,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         > = None;
         #[cfg(feature = "provider-render")]
         let mut seed_window_miss: Option<AttachmentWindowMiss> = None;
+        // B5: the **declaration's own** window — the third window a record can
+        // state, and the only one no door cuts for it: the record declares that
+        // it preserves what is already in the attachment
+        // (`LoadAction::preserves_prior_contents()`, which is `Load` *and*
+        // `DontCare`), carries no seed of its own, and is the packet's one
+        // position the guest's pages are owed the frame. The pages are that
+        // attachment's own storage, so the same cut the GVA elision door makes
+        // names them — payment first (`INV-LAND`: the plane's debt is landed
+        // before the pages are read), then the owner run list — and the answer
+        // travels in its own pair of locals because the class reads it through
+        // the *elision* door's input: at most one of the two doors applies to
+        // one record, and a miss here must not be filed as the other door's.
+        // Asked below, where the facts the class's own arm filters on
+        // (`load_from_target`, `load_guest_target_backing`, the two resolved
+        // seed fields) and the record's role are final.
+        #[cfg(feature = "provider-render")]
+        let mut preserving_window_runs: Option<
+            Vec<crate::backend::provider_render::StageBufferWindow>,
+        > = None;
+        #[cfg(feature = "provider-render")]
+        let mut preserving_window_miss: Option<AttachmentWindowMiss> = None;
         // E-TX13: the **landing** door's own window — the third door that has
         // one, and the only one whose declaration is a destination rather than a
         // source. The record it answers is the guest-backed tail the two doors
@@ -11489,6 +11576,76 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     None
                 };
+            // B5: the third window. The elision door above cuts the pages an
+            // elision already read; this one cuts the pages a record that never
+            // elided begins from — the attachment's own storage, named by the
+            // record's own declaration that it preserves what is there
+            // (`LoadAction::preserves_prior_contents()`), with no seed of its
+            // own to state them instead. `PreservingWindowDoor` is the shape,
+            // and every field of it is a fact the class's arm reads the same
+            // way: the record is the packet's one position the guest's pages
+            // are owed the frame (a middle's previous contents are the walk's
+            // chain value), it carries no second statement of its contents, and
+            // its readback was withheld *in the window's own currency* — the
+            // deferred Store rails' reason, which is the same statement as "the
+            // pages are this frame's destination".
+            //
+            // The cut is [`gva_attachment_window`], the elision door's own
+            // call: it pays the plane's debt before it names the pages
+            // (`INV-LAND` — the pages hold the frame the declaration is about
+            // and not an older one), then walks them into the owner run list
+            // the class's own arm states as the attachment's view (E-TX6), and
+            // the pass's frame lands back in that same declaration
+            // (`StoreOp::Borrowed`, E-TX8; elected by the class's existing
+            // store arm). A cut the walk refuses leaves the record exactly
+            // where it is today: the class answers under the same slug, the
+            // same sentence and the same bucket, and the fact that stopped the
+            // window is charged under its own route so the census can size it.
+            if preserving_window_runs.is_none()
+                && attachment_window_runs.is_none()
+                && seed_window_runs.is_none()
+                && (PreservingWindowDoor {
+                    gva_target: req.colors.len() == 1
+                        && req
+                            .colors
+                            .first()
+                            .is_some_and(|c0| c0.mapping_id == 0 && c0.target_gva != 0),
+                    preserves: req.colors.first().is_some_and(|c0| {
+                        reims_vgpu_protocol::pass_action::LoadAction::from_declared(c0.load_action)
+                            .preserves_prior_contents()
+                    }),
+                    carries_its_own_source: req
+                        .colors
+                        .first()
+                        .is_some_and(|c0| c0.target_seed_rgba.is_some())
+                        || resources.load_from_target
+                        || resources.load_guest_target_backing
+                        || resources.target_guest_seed.is_some()
+                        || resources.target_rgba8.is_some(),
+                    continues_render_pass: resources.continues_render_pass,
+                    role,
+                    withheld_in_the_window: resources.skip_readback
+                        && matches!(
+                            resources.readback_skip_reason,
+                            crate::backend::vulkan::engine::ReadbackSkipReason::ResidentStore
+                        ),
+                })
+                .applies()
+            {
+                if let (Some(c0), Some(extent)) = (req.colors.first(), attachment_window_extent) {
+                    match gva_attachment_window(state, host, req.task_id, c0, extent) {
+                        Ok(runs) => preserving_window_runs = Some(runs),
+                        Err(miss) => {
+                            preserving_window_miss = Some(miss);
+                            crate::runtime::drain::note_store_route(
+                                crate::backend::provider_render::resident_source_route(
+                                    miss.route(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
             // R24: the frames this caller can read out for the record's own
             // sampled GPU targets — the same registry read R23's arm makes for
             // the chain, one question over. Materialized before the submission
@@ -11590,7 +11747,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 attachment_guest_window: attachment_window_input(
                     &attachment_window_runs,
                     attachment_window_miss,
-                ),
+                )
+                // B5: the same declaration for the third door. The two doors
+                // are disjoint by construction (each filters the record's own
+                // seed fields, and this one also filters the elision's
+                // `load_from_target`), so at most one of the two pairs is ever
+                // set: a record the elision door answered keeps its answer, and
+                // a record only the declaration's own door answered is stated
+                // here rather than in the class, which reads one input.
+                .or_else(|| {
+                    attachment_window_input(&preserving_window_runs, preserving_window_miss)
+                }),
                 // E-TX13: the same declaration asked for the record whose frame
                 // the guest's pages are owed and whose own load is some *other*
                 // statement of its contents. The class elects the store arm
@@ -18785,6 +18952,105 @@ mod mapper_ref_handover_tests {
             "no elision, no frame to hand over — the GVA elision and every record whose previous \
              contents are not this surface's resident are refused by the class's own name"
         );
+    }
+}
+
+/// B5: the shape the *declaration's* own window is cut for.
+///
+/// The rule is a fact about the seam, and one no boot can be asked: the class's
+/// last load arm already states an attachment's own window whenever the record
+/// carries none of its own, but until this increment nothing *cut* that window
+/// for a record no elision named. Which condition of the cut did the work is
+/// therefore invisible in a census that can only read the whole answer.
+///
+/// The table is driven here, row by row, and the class's own half — the bucket
+/// and sentence the record keeps when no window is stated, the window's byte
+/// counter and the frame the provider lands when one is — is driven in
+/// `tests/provider_render_rail.rs`.
+#[cfg(all(test, feature = "provider-render"))]
+mod preserving_window_door_tests {
+    use super::PreservingWindowDoor;
+    use crate::backend::provider_render::RenderChainRole;
+
+    /// The record the census's `load_action` bucket is made of: one 180x180 GVA
+    /// attachment, a declared action that preserves what is already there, no
+    /// seed of its own, the packet's only record, and a readback withheld with
+    /// the deferred Store rails' own reason.
+    fn record() -> PreservingWindowDoor {
+        PreservingWindowDoor {
+            gva_target: true,
+            preserves: true,
+            carries_its_own_source: false,
+            continues_render_pass: false,
+            role: RenderChainRole::SoleOrTail,
+            withheld_in_the_window: true,
+        }
+    }
+
+    #[test]
+    fn the_declarations_window_is_cut_for_this_shape_and_no_neighbour() {
+        assert!(
+            record().applies(),
+            "the record whose previous contents nothing else on this rail can name is the one \
+             the declaration's own window is cut for"
+        );
+        for (row, name) in [
+            (
+                PreservingWindowDoor {
+                    gva_target: false,
+                    ..record()
+                },
+                "a mapper-ref target, or one with seconds",
+            ),
+            (
+                PreservingWindowDoor {
+                    preserves: false,
+                    ..record()
+                },
+                "a `Clear` (it states its own contents)",
+            ),
+            (
+                PreservingWindowDoor {
+                    carries_its_own_source: true,
+                    ..record()
+                },
+                "a record with a seed of its own",
+            ),
+            (
+                PreservingWindowDoor {
+                    continues_render_pass: true,
+                    ..record()
+                },
+                "a record that continues the encoder",
+            ),
+            (
+                PreservingWindowDoor {
+                    role: RenderChainRole::Middle,
+                    ..record()
+                },
+                "a middle (its previous contents are the walk's chain value)",
+            ),
+            (
+                PreservingWindowDoor {
+                    role: RenderChainRole::Head,
+                    ..record()
+                },
+                "a head",
+            ),
+            (
+                PreservingWindowDoor {
+                    withheld_in_the_window: false,
+                    ..record()
+                },
+                "a record whose readback is published rather than withheld",
+            ),
+        ] {
+            assert!(
+                !row.applies(),
+                "{name} is not this door's shape: the window carries both halves of the \
+                 obligation or it is not stated at all"
+            );
+        }
     }
 }
 
