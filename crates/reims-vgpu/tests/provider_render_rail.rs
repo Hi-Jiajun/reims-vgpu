@@ -36,11 +36,11 @@ use metal_api_vulkan::{
 use reims_vgpu::backend::provider_owner::{self, Region};
 use reims_vgpu::backend::provider_render::{
     self, PresentSurfaceKey, ProviderRenderDecline, RenderChainRole, RenderInterfaceRefusal,
-    RenderPresentRequest, RenderRailInputs, RenderRailOutcome, RenderRuntimeSampler,
-    RenderSampleSites, RenderSamplerFamily, RenderSamplerRefusal, RenderSamplerState,
-    RenderTextureDeclaration, RenderTextureShape, RenderTextureShapeRefusal, ResidentSourceRoute,
-    StageBufferAccess, StageBufferBind, StageBufferDeclaration, StageBufferFootprint,
-    StageBufferLanding, StageBufferWindow, StageWriteback,
+    RenderPresentRequest, RenderRailInputs, RenderRailOutcome, RenderRailOutput,
+    RenderRuntimeSampler, RenderSampleSites, RenderSamplerFamily, RenderSamplerRefusal,
+    RenderSamplerState, RenderTextureDeclaration, RenderTextureShape, RenderTextureShapeRefusal,
+    ResidentSourceRoute, StageBufferAccess, StageBufferBind, StageBufferDeclaration,
+    StageBufferFootprint, StageBufferLanding, StageBufferWindow, StageWriteback,
 };
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendStateResource, BufferContent, DepthState, DrawRequest, IndexType,
@@ -13187,6 +13187,173 @@ fn the_runtime_sampler_state_refusals_are_counted_by_the_axis_that_read_them() {
         value_counts(),
         values_before,
         "a state inside the family charges no value"
+    );
+}
+
+/// The address axis a 2D view does not read is folded into the U/V mode
+/// (2026-09-19, census v38).
+///
+/// Census v38 split the `texture_state` door in two: `address` (212 records,
+/// every one of them a `clampToEdge` (0) `address_mode_w` beside a U/V mode the
+/// family states) and `anisotropy` (174). The first of the two is the shape
+/// this test pins. Every view this class admits is a single-sample, non-arrayed
+/// `D2` surface, and a 2D sample reads only the two coordinates `addressModeU`
+/// and `addressModeV` decide — so a W that differs cannot move a sample on
+/// either rail: the canonical `VkSampler` is created with the U/V mode on all
+/// three axes, and the engine executes the guest's own W, which the same
+/// argument leaves unread.
+///
+/// Three readings, and the door's own sentence stays out of all of them:
+///
+/// - the census shape (`w = clampToEdge` beside a stated U/V mode) is executed,
+///   and its frame is the equal-axes frame **byte for byte** — the fold is a
+///   reading of one sample program, not a substitution;
+/// - a W that names another mode (`mirrorRepeat`) is executed the same way, and
+///   its raw value travels in the fold's own sum;
+/// - the axes that *do* address (`u != v`) keep the door and its byte-for-byte
+///   sentence, and charge the fold nothing — the axis this test opens is the
+///   third one only.
+#[test]
+fn the_address_axis_a_twod_view_does_not_read_is_folded_into_the_uv_mode() {
+    let _guard = engine_test_session();
+    let stages = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    use reims_vgpu::protocol::sampler as mtl;
+    let nearest = mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+    let not_mipmapped = mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED;
+    let clamp_to_edge = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    let clamp_to_zero = mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO;
+    let mirror_repeat = mtl::MTL_SAMPLER_ADDRESS_MODE_MIRROR_REPEAT;
+    let area = |address: u32| {
+        widened_runtime_sampled_request(
+            &stages,
+            texels.clone(),
+            (width, height),
+            nearest,
+            not_mipmapped,
+            address,
+        )
+    };
+
+    /// The sentence this door answers with, as `request_sampler_policy`'s
+    /// caller builds it for the runtime half at device binding 160 — the same
+    /// bytes the axis probe pinned, and the bytes that do not move here.
+    const SENTENCE: &str = "a draw whose runtime sampler at `[[sampler(0)]]` is outside the \
+                            family the canonical rail creates stays on the engine: the canonical \
+                            `VkSampler` is created from nearest or linear filtering under one of \
+                            the three mip filters, with one address mode on all three axes \
+                            (clamped, mirror-clamped, repeated, mirror-repeated or clamped to \
+                            zero), normalized coordinates, no comparison and no anisotropy, and \
+                            the bind at device binding 160 states another filter, another mip \
+                            filter, another address mode, unnormalized coordinates, a comparison \
+                            or anisotropy";
+    const FOLDED: &str = "render_provider_texture_state_address_w_folded";
+    const FOLDED_VALUE: &str = "render_provider_texture_state_address_w_folded_value";
+    const FOLDED_U_VALUE: &str = "render_provider_texture_state_address_folded_u_value";
+    const ADDRESS: &str = "render_provider_texture_state_address";
+    const ADDRESS_W_RECORDS: &str = "render_provider_texture_state_address_w_records";
+
+    let completed = |label: &str, request: &DrawRequest| -> RenderRailOutput {
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), request)
+        {
+            RenderRailOutcome::ProviderCompleted(out) => out,
+            other => panic!("{label}: the state is inside the widened family: {other:?}"),
+        }
+    };
+
+    // The state the family has always stated: one mode on the two axes that
+    // address. It is the oracle the fold has to reduce to — not because its
+    // frame is "right", but because the fold claims the two requests are one
+    // sample program, and a claim like that is read off the bytes.
+    let equal_axes = completed("equal axes", &area(clamp_to_zero));
+    let folded_before = route_count(FOLDED);
+    let folded_value_before = route_count(FOLDED_VALUE);
+    let folded_u_before = route_count(FOLDED_U_VALUE);
+
+    // The census v38 shape: the guest states `clampToZero` on U/V and leaves W
+    // at the default `clampToEdge`. The frame is the equal-axes frame, byte for
+    // byte, and the fold is counted with no value beside it (`clampToEdge` is
+    // ordinal 0, and `note_store_route_n` skips a zero increment — which is why
+    // the count is the companion that keeps the record visible).
+    let mut census_shape = area(clamp_to_zero);
+    census_shape.samplers[0].address_mode_w = clamp_to_edge;
+    let folded_frame = completed("the census shape", &census_shape);
+    assert_eq!(
+        folded_frame.bytes, equal_axes.bytes,
+        "a W the 2D view does not read does not move the frame"
+    );
+    assert_eq!(folded_frame.bgra, equal_axes.bgra);
+    assert_eq!(
+        route_count(FOLDED) - folded_before,
+        1,
+        "the fold is counted where it is decided"
+    );
+    assert_eq!(
+        route_count(FOLDED_VALUE),
+        folded_value_before,
+        "a clampToEdge contributor sums to nothing; the count above is its divisor"
+    );
+    assert_eq!(
+        route_count(FOLDED_U_VALUE) - folded_u_before,
+        u64::from(clamp_to_zero),
+        "the kept mode's own ordinal is the fold's second sum"
+    );
+
+    // A W that names another mode is the same reading: still executed, and the
+    // raw ordinal travels in the fold's own sum.
+    let mut named_w = area(clamp_to_zero);
+    named_w.samplers[0].address_mode_w = mirror_repeat;
+    let named_frame = completed("a named W", &named_w);
+    assert_eq!(
+        named_frame.bytes, equal_axes.bytes,
+        "another W name is still a W the 2D view does not read"
+    );
+    assert_eq!(route_count(FOLDED) - folded_before, 2);
+    assert_eq!(
+        route_count(FOLDED_VALUE) - folded_value_before,
+        u64::from(mirror_repeat),
+        "the folded W's own ordinal is the sum's contributor"
+    );
+    assert_eq!(
+        route_count(FOLDED_U_VALUE) - folded_u_before,
+        2 * u64::from(clamp_to_zero),
+        "both folded records state the same kept mode"
+    );
+
+    // The counterexample the fold must not swallow: the axes that address
+    // disagree. Same door, same slug, the sentence byte for byte — and the fold
+    // charges nothing, because the refusal is built before the fold is read.
+    let mut split_axes = area(clamp_to_zero);
+    split_axes.samplers[0].address_mode_v = clamp_to_edge;
+    let address_before = route_count(ADDRESS);
+    let records_before = route_count(ADDRESS_W_RECORDS);
+    let fold_before_split = route_count(FOLDED);
+    let sentence = match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &split_axes,
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_state",
+                "the axes that address keep the door"
+            );
+            reason.detail().to_owned()
+        }
+        other => panic!("u != v is outside the family: {other:?}"),
+    };
+    eprintln!("door: {sentence}");
+    assert_eq!(
+        sentence, SENTENCE,
+        "the sentence stays byte for byte the one the gate published"
+    );
+    assert_eq!(route_count(ADDRESS) - address_before, 1);
+    assert_eq!(route_count(ADDRESS_W_RECORDS) - records_before, 1);
+    assert_eq!(
+        route_count(FOLDED),
+        fold_before_split,
+        "a refusal on the axes that address is not a fold"
     );
 }
 

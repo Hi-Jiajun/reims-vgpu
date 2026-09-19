@@ -111,6 +111,18 @@
 //!   the frame does not list — the fail-closed half of R39, which reads the
 //!   sentence this class shipped before the increment, verbatim — and a draw
 //!   whose sampler says another state;
+//!   The family's **third addressing axis** is folded rather than compared
+//!   (2026-09-19, census v38): every surface this class samples is a
+//!   single-sample, non-arrayed 2D view, whose samples read only the two
+//!   coordinates U/V address, so `address_mode_w` is unread on both rails — a W
+//!   that differs is admitted and counted
+//!   (`..._texture_state_address_w_folded` beside its value sum), while `u != v`
+//!   keeps the door and its sentence byte for byte.
+//!   Frozen boundary (census v38: 174 records, every one `maxAnisotropy = 8`).
+//!   Anisotropy is not a gap: it moves which texels a sample averages, the
+//!   canonical device does not enable `samplerAnisotropy`, and no rail here
+//!   defines the frame such a state owes. Reopen only with an OpenSpec change
+//!   whose Why answers who defines that frame.
 //! - **a sampled texture whose texels are the guest's own pages** (R28): the
 //!   bind a real boot resolves through the zero-copy rail
 //!   (`SampledSource::GuestRuns`) leaves for the provider through the owner
@@ -1522,12 +1534,21 @@ pub fn texture_declarations(
     /// is one measurement restated, not a second opinion — including its two
     /// by-name refusals (`bicubic`, whose four taps the family cannot state,
     /// and `clampToBorderColor`, whose border colour is a state of its own).
+    ///
+    /// One axis is read here that the *runtime* half's own gate does not read:
+    /// the AIR state's `address_mode_r`. It is folded exactly as the runtime
+    /// half folds `address_mode_w` (2026-09-19, census v38): the surface a
+    /// sample of this family reaches is one single-sample, non-arrayed 2D view
+    /// (`sampled_shape` below refuses every other shape, and the provider
+    /// refuses the reflected ones), and a 2D sample carries no third coordinate
+    /// for an `addressModeW` to address. So the two rails agree on the *two*
+    /// axes that can move a sample, which is what the pairing of a module's AIR
+    /// state with the request's declaration is about.
     fn air_sampler_policy(
         state: &metal2vulkan::reflect::StaticSamplerState,
     ) -> Option<SamplerPolicy> {
         if state.min_filter != state.mag_filter
             || state.address_mode_s != state.address_mode_t
-            || state.address_mode_s != state.address_mode_r
             || state.coordinates != SamplerCoordinates::Normalized
             || state.compare_function != SamplerCompareFunction::Never
             || state.reduction != SamplerReduction::WeightedAverage
@@ -3078,8 +3099,12 @@ fn sampled_textures<'a>(
 /// # What each axis is
 ///
 /// - [`SamplerStateAxis::MinMag`] — `min_filter != mag_filter`;
-/// - [`SamplerStateAxis::Address`] — the three address axes do not state one
-///   mode (`address_mode_u`, `_v` and `_w` disagree);
+/// - [`SamplerStateAxis::Address`] — the two axes a 2D view reads do not state
+///   one mode (`address_mode_u` and `_v` disagree, or name a mode the family
+///   has no name for). The third axis (`address_mode_w`) answers here only in
+///   that it is not read at all: no view this family samples carries a third
+///   coordinate, so a W that differs is folded into the U/V mode and counted
+///   beside the door (`..._state_address_w_folded`) instead of refusing;
 /// - [`SamplerStateAxis::Mip`] — the mip filter names no mip mode the family
 ///   creates (with `min == mag` already read, that is the only way the
 ///   `(min, mip)` table can miss for a member's ordinal — a min/mag ordinal
@@ -3244,6 +3269,22 @@ fn note_sampler_state_refusal(
 /// its border colour is a state of its own (`MTLSamplerBorderColor`) that the
 /// family does not name, so a sampler created for it would answer with a
 /// colour the request never stated.
+///
+/// The address half is the mode of the two axes a **2D** view reads
+/// (2026-09-19, census v38). Every view this class admits is one single-sample,
+/// non-arrayed `D2` surface — the bind gate refuses every other kind by name,
+/// and the canonical provider refuses the reflected shapes too
+/// (`render_texture_shape_unsupported`) — and a 2D sample reads only the two
+/// coordinates `addressModeU`/`addressModeV` decide: Vulkan applies
+/// `addressModeW` to the third coordinate, which a 2D view has none of (it is a
+/// 3D view's r; array layers are selected rather than addressed). The guest's
+/// own `address_mode_w` is therefore unread by both rails on every draw this
+/// class admits: the canonical `VkSampler` is created with the folded U/V mode
+/// on all three axes, and the engine executes the guest's own W, which the same
+/// argument leaves unread. A W that differs is counted rather than dropped
+/// silently (`..._state_address_w_folded` beside its value sum), and the door's
+/// sentence does not move: the `VkSampler` it describes is still created with
+/// one address mode on all three axes.
 fn request_sampler_policy(
     sampler: &crate::backend::vulkan::engine::SamplerResource,
 ) -> Result<SamplerPolicy, SamplerStateAxis> {
@@ -3262,10 +3303,29 @@ fn request_sampler_policy(
     if sampler.min_filter != sampler.mag_filter {
         return Err(SamplerStateAxis::MinMag);
     }
-    if sampler.address_mode_u != sampler.address_mode_v
-        || sampler.address_mode_u != sampler.address_mode_w
-    {
+    if sampler.address_mode_u != sampler.address_mode_v {
         return Err(SamplerStateAxis::Address);
+    }
+    if sampler.address_mode_w != sampler.address_mode_u {
+        // The fold, charged where it is decided: the W axis is not read by any
+        // view this class admits (see the doc comment above), so a W that
+        // differs is not a refusal — but it is a fact the next census has to be
+        // able to read back, and the sum's companion (the route itself) keeps a
+        // `clampToEdge` (0) contributor visible beside the records that sum to
+        // nothing (`note_store_route_n` skips a zero increment).
+        crate::runtime::drain::note_store_route("render_provider_texture_state_address_w_folded");
+        crate::runtime::drain::note_store_route_n(
+            "render_provider_texture_state_address_w_folded_value",
+            u64::from(sampler.address_mode_w),
+        );
+        // The mode the two axes that *are* read stated, summed over the folded
+        // population: `u == v` is the rule's own precondition, so one sum names
+        // the kept mode (a `clampToZero` (4) census shape reads as 4 × the fold
+        // count), and the fold's own count is its divisor.
+        crate::runtime::drain::note_store_route_n(
+            "render_provider_texture_state_address_folded_u_value",
+            u64::from(sampler.address_mode_u),
+        );
     }
     if sampler.unnormalized_coordinates {
         return Err(SamplerStateAxis::Coordinates);
