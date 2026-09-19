@@ -123,6 +123,23 @@
 //!   canonical device does not enable `samplerAnisotropy`, and no rail here
 //!   defines the frame such a state owes. Reopen only with an OpenSpec change
 //!   whose Why answers who defines that frame.
+//!   **The stage's AIR static samplers are weighed as a family, not one
+//!   declaration at a time** (R45, census v39): the registration pairs one AIR
+//!   static sampler with one sampled texture that reads through one and
+//!   refuses a stage whose two counts disagree by name
+//!   (`render_stage_reflection_mismatch`), and it weighs every AIR sampler the
+//!   stage carries before that pairing, so an unpaired sampler is refused there
+//!   by its own state too (`render_stage_unsupported_interface`). This walk
+//!   consulted a static sampler only where a declaration paired with one, so a
+//!   stage carrying one more than its sampled half reads left for the provider
+//!   and came back a refusal no rail answered — census v39's four
+//!   `draws_skipped_after_engine_refusal`, every one of them a fragment stage
+//!   whose AIR sampler states `coord::pixel` beside a state inside the family.
+//!   The counts are compared where the declarations are in hand and the shape
+//!   stays on the engine by name
+//!   (`render_provider_out_of_class_texture_static_sampler_unpaired`), with the
+//!   axis of an unpaired sampler outside the family named in the sentence
+//!   (`RenderUnsupportedStaticSampler`).
 //! - **a sampled texture whose texels are the guest's own pages** (R28): the
 //!   bind a real boot resolves through the zero-copy rail
 //!   (`SampledSource::GuestRuns`) leaves for the provider through the owner
@@ -1389,6 +1406,17 @@ pub struct RenderRuntimeSampler {
 /// in the form the module's own sample sites name, and a module whose sites name
 /// *two* samplers for one image — which no per-texture declaration can state —
 /// stays on the engine by name.
+///
+/// The third list is the same AIR half read the way the *registration* reads it
+/// (R45). The registration weighs every AIR sampler the stage carries before it
+/// pairs one, so an AIR state outside the family is refused there whether or not
+/// a sampled texture reads through it — and a stage whose sampler count and
+/// sampled-half count disagree is refused by its own name
+/// (`render_stage_reflection_mismatch`). This class consulted a static sampler
+/// only where a declaration paired with one, so a stage carrying one more than
+/// its sampled half reads was handed to the provider for a refusal the engine
+/// never got to answer (census v39's four `draws_skipped_after_engine_refusal`);
+/// the list below is the fact that lets the gate answer that shape by name.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RenderSamplerFamily {
     pub runtime: Arc<[RenderRuntimeSampler]>,
@@ -1396,9 +1424,32 @@ pub struct RenderSamplerFamily {
     /// reflection's own order — the order the canonical rail's positional
     /// pairing counts against.
     pub statics: Arc<[u32]>,
+    /// The AIR static samplers this stage carries whose decoded state is
+    /// *outside* the family the canonical rail creates, in the reflection's own
+    /// order (R45). The registration refuses such a sampler wherever it sits —
+    /// paired or not — so the gate reads the same list rather than only the
+    /// entries its per-texture walk happened to pair.
+    pub outside_family_statics: Arc<[RenderUnsupportedStaticSampler]>,
     /// What the module's own sample sites state (`R37`): the pairing the
     /// runtime half of every declaration is read off, one texture at a time.
     pub sample_sites: RenderSampleSites,
+}
+
+/// One AIR `constexpr sampler` whose decoded state the canonical rail's
+/// registration refuses (R45).
+///
+/// The pair travels together because both halves are read from the module and
+/// neither is derivable from the other: the index is where the state sits in
+/// the reflection's own order (what a reader compares against the sampled
+/// half's count), and the axis is [`air_sampler_policy`]'s own sentence for the
+/// field that read it — the same field the registration's
+/// `render_stage_unsupported_interface` detail names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderUnsupportedStaticSampler {
+    /// The Metal index the reflection states for this AIR sampler.
+    pub index: u32,
+    /// Which axis of the state is outside the family.
+    pub axis: &'static str,
 }
 
 /// What one module's sample sites state about the sampler beside each of its
@@ -1479,6 +1530,82 @@ pub struct RenderInterfaceRefusal {
     pub index: u32,
 }
 
+/// The module's AIR state in the canonical policy's two fields, or the axis
+/// that keeps it outside the family the canonical rail creates.
+///
+/// This is the same rule `metal-api-vulkan`'s `static_sampler_policy` applies
+/// to the very same reflection, at the widened family E-TX2 landed there (R21,
+/// `research/docs/26` §44): the six filters the two `MTLSamplerMinMagFilter`
+/// values and three `MTLSamplerMipFilter` values cross into, and the four
+/// address modes the translator's own vocabulary can name. The two rails
+/// translate one AIR with one translator, so this is one measurement restated,
+/// not a second opinion — including its two by-name refusals (`bicubic`, whose
+/// four taps the family cannot state, and `clampToBorderColor`, whose border
+/// colour is a state of its own).
+///
+/// One axis is read here that the *runtime* half's own gate does not read:
+/// the AIR state's `address_mode_r`. It is folded exactly as the runtime
+/// half folds `address_mode_w` (2026-09-19, census v38): the surface a
+/// sample of this family reaches is one single-sample, non-arrayed 2D view
+/// (`sampled_shape` below refuses every other shape, and the provider
+/// refuses the reflected ones), and a 2D sample carries no third coordinate
+/// for an `addressModeW` to address. So the two rails agree on the *two*
+/// axes that can move a sample, which is what the pairing of a module's AIR
+/// state with the request's declaration is about.
+///
+/// The `Err` half is the axis' own sentence (R45). Both halves of the class
+/// read this one function — the per-texture walk, which answers
+/// [`RenderSamplerRefusal::AirState`] for a *paired* state, and the
+/// stage-level walk (`sampler_family`), which reports an *unpaired* one with
+/// the axis that read it — so a reader comparing the two refusal sites reads
+/// one rule rather than two that could drift.
+#[cfg(feature = "provider-render")]
+fn air_sampler_policy(
+    state: &metal2vulkan::reflect::StaticSamplerState,
+) -> Result<metal_api_core::provider::SamplerPolicy, &'static str> {
+    use metal2vulkan::reflect::{
+        SamplerAddressMode as AirAddress, SamplerCompareFunction, SamplerCoordinates,
+        SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
+    };
+    use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
+
+    if state.min_filter != state.mag_filter {
+        return Err("its min and mag filters differ");
+    }
+    if state.address_mode_s != state.address_mode_t {
+        return Err("its two addressing axes disagree");
+    }
+    if state.coordinates != SamplerCoordinates::Normalized {
+        return Err("its coordinates are pixel coordinates");
+    }
+    if state.compare_function != SamplerCompareFunction::Never {
+        return Err("it names a comparison function");
+    }
+    if state.reduction != SamplerReduction::WeightedAverage {
+        return Err("it names a reduction that is not weighted average");
+    }
+    if state.max_anisotropy != 1 {
+        return Err("it names anisotropy");
+    }
+    let filter = match (state.min_filter, state.mip_filter) {
+        (AirFilter::Nearest, SamplerMipFilter::None) => SamplerFilter::Nearest,
+        (AirFilter::Linear, SamplerMipFilter::None) => SamplerFilter::Linear,
+        (AirFilter::Nearest, SamplerMipFilter::Nearest) => SamplerFilter::NearestMipNearest,
+        (AirFilter::Nearest, SamplerMipFilter::Linear) => SamplerFilter::NearestMipLinear,
+        (AirFilter::Linear, SamplerMipFilter::Nearest) => SamplerFilter::LinearMipNearest,
+        (AirFilter::Linear, SamplerMipFilter::Linear) => SamplerFilter::LinearMipLinear,
+        (AirFilter::Bicubic, _) => return Err("it names the bicubic filter"),
+    };
+    let address = match state.address_mode_s {
+        AirAddress::ClampToEdge => SamplerAddressMode::ClampToEdge,
+        AirAddress::Repeat => SamplerAddressMode::Repeat,
+        AirAddress::MirroredRepeat => SamplerAddressMode::MirrorRepeat,
+        AirAddress::ClampToZero => SamplerAddressMode::ClampToZero,
+        AirAddress::ClampToBorder => return Err("it names clampToBorderColor"),
+    };
+    Ok(metal_api_core::provider::SamplerPolicy { filter, address })
+}
+
 /// The `[[texture(i)]]` arguments one fragment stage's reflection declares, with
 /// the AIR sampler state its samples were lowered against (R10,
 /// `research/docs/23` §101) — or the sampler-free answer a texture only
@@ -1516,64 +1643,7 @@ pub fn texture_declarations(
     words: &[u32],
 ) -> Arc<[RenderTextureDeclaration]> {
     use metal2vulkan::meta::{TextureComponent, TextureDimension, TextureShape};
-    use metal2vulkan::reflect::{
-        ResourceKind, SamplerAddressMode as AirAddress, SamplerCompareFunction, SamplerCoordinates,
-        SamplerFilter as AirFilter, SamplerMipFilter, SamplerReduction,
-    };
-    use metal_api_core::provider::{SamplerAddressMode, SamplerFilter};
-
-    /// The module's AIR state in the canonical policy's two fields, or `None`
-    /// when the state is outside the family the canonical rail creates.
-    ///
-    /// This is the same rule `metal-api-vulkan`'s `static_sampler_policy`
-    /// applies to the very same reflection, at the widened family E-TX2 landed
-    /// there (R21, `research/docs/26` §44): the six filters the two
-    /// `MTLSamplerMinMagFilter` values and three `MTLSamplerMipFilter` values
-    /// cross into, and the four address modes the translator's own vocabulary
-    /// can name. The two rails translate one AIR with one translator, so this
-    /// is one measurement restated, not a second opinion — including its two
-    /// by-name refusals (`bicubic`, whose four taps the family cannot state,
-    /// and `clampToBorderColor`, whose border colour is a state of its own).
-    ///
-    /// One axis is read here that the *runtime* half's own gate does not read:
-    /// the AIR state's `address_mode_r`. It is folded exactly as the runtime
-    /// half folds `address_mode_w` (2026-09-19, census v38): the surface a
-    /// sample of this family reaches is one single-sample, non-arrayed 2D view
-    /// (`sampled_shape` below refuses every other shape, and the provider
-    /// refuses the reflected ones), and a 2D sample carries no third coordinate
-    /// for an `addressModeW` to address. So the two rails agree on the *two*
-    /// axes that can move a sample, which is what the pairing of a module's AIR
-    /// state with the request's declaration is about.
-    fn air_sampler_policy(
-        state: &metal2vulkan::reflect::StaticSamplerState,
-    ) -> Option<SamplerPolicy> {
-        if state.min_filter != state.mag_filter
-            || state.address_mode_s != state.address_mode_t
-            || state.coordinates != SamplerCoordinates::Normalized
-            || state.compare_function != SamplerCompareFunction::Never
-            || state.reduction != SamplerReduction::WeightedAverage
-            || state.max_anisotropy != 1
-        {
-            return None;
-        }
-        let filter = match (state.min_filter, state.mip_filter) {
-            (AirFilter::Nearest, SamplerMipFilter::None) => SamplerFilter::Nearest,
-            (AirFilter::Linear, SamplerMipFilter::None) => SamplerFilter::Linear,
-            (AirFilter::Nearest, SamplerMipFilter::Nearest) => SamplerFilter::NearestMipNearest,
-            (AirFilter::Nearest, SamplerMipFilter::Linear) => SamplerFilter::NearestMipLinear,
-            (AirFilter::Linear, SamplerMipFilter::Nearest) => SamplerFilter::LinearMipNearest,
-            (AirFilter::Linear, SamplerMipFilter::Linear) => SamplerFilter::LinearMipLinear,
-            (AirFilter::Bicubic, _) => return None,
-        };
-        let address = match state.address_mode_s {
-            AirAddress::ClampToEdge => SamplerAddressMode::ClampToEdge,
-            AirAddress::Repeat => SamplerAddressMode::Repeat,
-            AirAddress::MirroredRepeat => SamplerAddressMode::MirrorRepeat,
-            AirAddress::ClampToZero => SamplerAddressMode::ClampToZero,
-            AirAddress::ClampToBorder => return None,
-        };
-        Some(SamplerPolicy { filter, address })
-    }
+    use metal2vulkan::reflect::ResourceKind;
 
     /// The reflected shape, reduced to the one family the canonical render
     /// sampler executes and the named refusal otherwise.
@@ -1708,8 +1778,10 @@ pub fn texture_declarations(
                     Some(state) => (
                         static_slot,
                         match air_sampler_policy(state) {
-                            Some(policy) => RenderSamplerState::Policy(policy),
-                            None => RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState),
+                            Ok(policy) => RenderSamplerState::Policy(policy),
+                            Err(_) => {
+                                RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState)
+                            }
                         },
                     ),
                     // No decoded AIR state beside this texture: the AIR static
@@ -1866,9 +1938,32 @@ pub fn sampler_family(
         .filter(|binding| binding.kind == ResourceKind::StaticSampler)
         .map(|binding| binding.metal_index)
         .collect::<Vec<_>>();
+    // The same bindings read for their own state (R45): the registration weighs
+    // every AIR sampler the stage carries before it pairs one, so a state
+    // outside the family is refused there whether or not a sampled texture
+    // reads through it. A binding whose state the translator could not decode
+    // is reported beside them — the per-texture walk answers those as
+    // `AirState` too (`the AIR static sampler carries no decoded state`), and
+    // the registration refuses them by the same door.
+    let outside_family_statics = fragment
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+        .filter_map(|binding| {
+            let axis = match binding.static_sampler.as_ref() {
+                Some(state) => air_sampler_policy(state).err()?,
+                None => "it carries no decoded AIR state",
+            };
+            Some(RenderUnsupportedStaticSampler {
+                index: binding.metal_index,
+                axis,
+            })
+        })
+        .collect::<Vec<_>>();
     RenderSamplerFamily {
         runtime: runtime.into(),
         statics: statics.into(),
+        outside_family_statics: outside_family_statics.into(),
         // The pairing the per-texture declarations are read off (`R12`), in
         // its own three answers (R37): the class keeps the stage on the engine
         // when it is not one sampler per image.
@@ -3047,6 +3142,80 @@ fn sampled_textures<'a>(
                  (`render_runtime_sampler_undeclared`) rather than binding a state nothing \
                  samples through",
                 unpaired.index, unpaired.binding,
+            ),
+        ));
+    }
+    // The AIR static half's own mirror of the rule above, and the half this
+    // class was missing (R45, census v39). The registration pairs *one* AIR
+    // static sampler with one sampled texture that reads through one and
+    // refuses a stage whose two counts disagree by name
+    // (`render_stage_reflection_mismatch`, "this rail pairs one AIR static
+    // sampler with one sampled texture") — and it weighs every AIR sampler the
+    // stage carries *before* that pairing, so an unpaired sampler is refused
+    // there by its own state too (`render_stage_unsupported_interface`). This
+    // walk consulted a static sampler only where a declaration paired with one,
+    // so a stage carrying one more than its sampled half reads was handed to
+    // the provider for a refusal the engine never got to answer: census v39's
+    // four `draws_skipped_after_engine_refusal`, every one of them a fragment
+    // stage whose one AIR sampler states `coord::pixel` — a state the
+    // translation lowers with fetches, so the declaration beside it states no
+    // sampler at all and the pairing above never reached it. A refusal is a
+    // decline rather than a fallback, so the class answers the shape here
+    // instead of letting the provider decline a draw the engine could run.
+    let static_declarations = inputs
+        .fragment_texture_declarations
+        .iter()
+        .filter(|declaration| {
+            matches!(
+                declaration.sampler,
+                RenderSamplerState::Policy(_)
+                    | RenderSamplerState::Unsupported(RenderSamplerRefusal::AirState)
+            )
+        })
+        .count();
+    // One direction only: *more* AIR samplers than the declarations read
+    // through. The other direction cannot be produced by the walk above — a
+    // declaration states the static arm only where one of those samplers was
+    // there to pair with — and a contract stated by hand for a shape the walk
+    // never emits is the provider's own refusal to answer
+    // (`render_texture_access_unsupported`), which is the reading
+    // `a_declaration_that_does_not_repeat_the_module_is_refused_by_name` holds.
+    if family.statics.len() > static_declarations {
+        // Which of the two refusals the registration would have answered with,
+        // named where the facts are still in hand: an unpaired sampler whose
+        // own state is outside the family is the *state* door's
+        // (`render_stage_unsupported_interface`), and one whose state is inside
+        // it is the counting rule's alone.
+        let outside = family
+            .outside_family_statics
+            .first()
+            .map(|sampler| {
+                format!(
+                    "; the registration would answer this stage under \
+                     `render_stage_unsupported_interface` first, because the AIR sampler at \
+                     Metal index {} is outside the state family it creates ({})",
+                    sampler.index, sampler.axis,
+                )
+            })
+            .unwrap_or_else(|| {
+                String::from(
+                    "; every AIR sampler the stage carries is inside the state family, so the \
+                     counting rule is the only half that refuses this stage",
+                )
+            });
+        return Err(OutOfClass::owned(
+            "render_provider_out_of_class_texture_static_sampler_unpaired",
+            format!(
+                "a fragment stage that carries {} AIR static samplers against {} sampled \
+                 textures reading through one stays on the engine: the canonical rail's \
+                 registration pairs one AIR static sampler with one sampled texture, weighs \
+                 every AIR sampler the stage carries before it pairs one, and refuses the counts \
+                 by name (`render_stage_reflection_mismatch`, \"this rail pairs one AIR static \
+                 sampler with one sampled texture\") rather than executing a sample through a \
+                 state nothing pairs it with{}",
+                family.statics.len(),
+                static_declarations,
+                outside,
             ),
         ));
     }
