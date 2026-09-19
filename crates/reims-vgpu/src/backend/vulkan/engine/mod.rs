@@ -2559,6 +2559,30 @@ fn landable_resident_format(format: ash::vk::Format) -> bool {
 /// of the provider's. Merging makes the image the surface's current content
 /// again, and the ladder serves it with both.
 ///
+/// # The entry this records on
+///
+/// The copy is a transfer command that is not part of any draw, so it needs an
+/// entry of its own — and an entry whose command buffer is *recording*. This
+/// merge claims its entry the way every other transfer rail in this file does,
+/// and for the same two reasons:
+///
+/// * an open batch is ridden rather than flushed, so the copy lands in the same
+///   submission as the draws it has to follow (`read_target_inner`'s
+///   `appended` arm, and its comment on why that is one submission and not
+///   two);
+/// * a CB a ring slot hands back is **retired, not recording** — `begin_entry`
+///   ends whatever pass the slot's last entry left and returns the CB for its
+///   *next* user to reset and begin. `begin_slot_recording` is that reset plus
+///   begin, and skipping it records into a command buffer in the executable
+///   state: a Vulkan state violation the software rail's driver tolerates and
+///   a real one faults on (this rail's `fp20`/`b2` rounds, 2026-09-19).
+///
+/// The staging slot is acquired **after** that decision, for the reason
+/// `copy_image_level0_to_host` states where it takes its own: `begin_entry`
+/// submits the open batch, so a slot acquired ahead of it is sealed into *that*
+/// submission's cleanup and returned to the free list under a copy this entry
+/// has not recorded yet.
+///
 /// Fail-closed on every miss: the refusal stands, and the ladder keeps reading
 /// the guest's pages exactly as it does today. A merge that cannot be recorded
 /// or submitted is [`LandedFrameMergeMiss::Upload`], never a silent success.
@@ -2610,6 +2634,47 @@ pub fn merge_landed_frame_into_resident(
             return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
         }
     }
+    // The entry is claimed **before** the staging slot is acquired, and the
+    // copy rides the open batch when there is one — the two together are what
+    // make the recording legal and the slot's life as long as the copy that
+    // reads it. A `vkCommandBuffer` handed back by `begin_entry` is retired, not
+    // recording: recording into it without `begin_slot_recording` is the
+    // executable state's CB being written to, which the software rail's tests
+    // accept and a real driver's does not. And a slot acquired *ahead* of
+    // `begin_entry` is sealed into whatever batch that call flushes, so the
+    // fence of a submission this copy is not in returns it to the free list
+    // underneath the copy — `copy_image_level0_to_host` acquires its slots
+    // after the same flush for the same reason.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        // A batch's CB is still recording and holds the draws this copy must
+        // follow; appending is what puts the copy in their own submission
+        // instead of paying a second one, exactly as the readback rail does.
+        Some(pair) => pair,
+        None => {
+            let (cb, fence) = match unsafe { pools.begin_entry(ctx, counters) } {
+                Ok(pair) => pair,
+                Err(_) => return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload),
+            };
+            let begun = unsafe {
+                pools.begin_slot_recording(
+                    ctx,
+                    cb,
+                    gpu_span::Kind::Store,
+                    VkOp::MergeResetCb,
+                    VkOp::MergeBeginCb,
+                )
+            };
+            if let Err(e) = begun {
+                crate::observe::fail(format!("vk_engine_merge_reset {e}"));
+                return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+            }
+            (cb, fence)
+        }
+    };
+    // A deferred draw may have left its render pass standing in this same
+    // command buffer, and both commands below are outside-pass commands.
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
     let staging = match unsafe { pools.acquire_staging(ctx, bytes, counters) } {
         Ok(slot) => slot,
         Err(_) => return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload),
@@ -2625,10 +2690,6 @@ pub fn merge_landed_frame_into_resident(
     if written.is_err() {
         return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
     }
-    let (cb, fence) = match unsafe { pools.begin_entry(ctx, counters) } {
-        Ok(pair) => pair,
-        Err(_) => return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload),
-    };
     // One barrier carries both halves of the transfer: the layout the image
     // rests in (`access.layout()`, whatever the last rail to touch it left) to
     // the one the copy writes in, and the source scope that orders this write
@@ -2637,7 +2698,7 @@ pub fn merge_landed_frame_into_resident(
     // leaves the image where the ladder's barrier expects to find it.
     let next = pools::ResidentAccess::transfer_write(guest_imported);
     let (src_stage, src_access) = access.source_scope();
-    let ended = unsafe {
+    unsafe {
         let barrier = [ash::vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
@@ -2667,18 +2728,36 @@ pub fn merge_landed_frame_into_resident(
             })];
         ctx.device
             .cmd_copy_buffer_to_image(cb, staging.buffer, image, next.layout(), &copy);
-        ctx.device.end_command_buffer(cb)
-    };
-    if ended.is_err() {
-        return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
     }
-    let command_buffers = [cb];
-    let token = match unsafe { ctx.submit_guest_work(&command_buffers, fence) } {
-        Ok(token) => token,
-        Err(_) => return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload),
-    };
-    let sealed = pools.seal_entry(Vec::new(), Vec::new());
-    unsafe { pools.finish_entry_async(&ctx.device, sealed, token) };
+    if appended.is_some() {
+        // The batch's own flush ends and submits the CB, and seals the cleanup
+        // this copy's staging slot is in — one submission for the draws and the
+        // copy together, which is the whole reason to ride the batch.
+        if unsafe { pools.batch_flush(ctx, counters) }.is_err() {
+            return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+        }
+    } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        let end = unsafe { ctx.device.end_command_buffer(cb) }
+            .map_err(|e| VkCall::new(VkOp::MergeEndCb, e));
+        if let Err(e) = end {
+            crate::observe::fail(format!("vk_engine_merge {e}"));
+            return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+        }
+        let command_buffers = [cb];
+        let token = match unsafe { ctx.submit_guest_work(&command_buffers, fence) } {
+            Ok(token) => token,
+            Err(e) => {
+                crate::observe::fail(format!(
+                    "vk_engine_merge {}",
+                    VkCall::new(VkOp::MergeSubmit, e)
+                ));
+                return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+            }
+        };
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        unsafe { pools.finish_entry_async(&ctx.device, sealed, token) };
+    }
     // Once the submission exists, the image's own record says a transfer wrote
     // it and the sampling-side refusal is answered. Both are registry writes
     // under the same engine lock, so no draw can bind the image in between.
@@ -6341,6 +6420,19 @@ pub fn test_quiesce_ring() {
         return;
     };
     let _ = unsafe { pools.retire_all(ctx, counters) };
+}
+
+/// Test hook: how many entries this device has reset **and** begun a slot
+/// command buffer for — see [`pools::ResourcePools::entry_record_begins`].
+///
+/// A rail test reads this around a transfer it expects to record on an entry
+/// of its own, because the defect that count catches is *invisible* on a
+/// software driver: recording into a command buffer `begin_entry` handed back
+/// (retired, not recording) is a state violation the driver tolerates and a
+/// discrete one faults on. A recorder that took a slot and never reset it
+/// leaves the count where it was — that is the assertion.
+pub fn test_entry_record_begins() -> u64 {
+    lock_engine().pools.entry_record_begins()
 }
 
 /// Recreate budget remaining / count (for tests).

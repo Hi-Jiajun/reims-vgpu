@@ -65,6 +65,23 @@ pub enum VkOp {
     /// `vkQueueSubmit` of the guest-page copy.
     GuestWriteSubmit,
 
+    // ---- mod.rs `merge_landed_frame_into_resident` — the provider landing's
+    //      own transfer upload, on the entry it claims when no batch is open ----
+    /// `vkResetCommandBuffer` before recording the landing's copy.
+    ///
+    /// Named although the call itself lives in
+    /// [`super::pools::ResourcePools::begin_slot_recording`] with every other
+    /// rail's: the merge is the one entry that records a transfer *outside* a
+    /// draw, so a CB it takes from the ring is one a previous submission left in
+    /// the executable state, and the reset is what makes recording legal.
+    MergeResetCb,
+    /// `vkBeginCommandBuffer` for the landing's copy.
+    MergeBeginCb,
+    /// `vkEndCommandBuffer` closing the landing's copy.
+    MergeEndCb,
+    /// `vkQueueSubmit` of the landing's copy.
+    MergeSubmit,
+
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
     /// `vkResetCommandBuffer` before recording the storage flush copy.
@@ -377,6 +394,11 @@ impl Decline for VkCall {
             VkOp::GuestWriteEndCb => "vk_guest_write_end_cb",
             VkOp::GuestWriteSubmit => "vk_guest_write_submit",
 
+            VkOp::MergeResetCb => "vk_merge_reset_cb",
+            VkOp::MergeBeginCb => "vk_merge_begin_cb",
+            VkOp::MergeEndCb => "vk_merge_end_cb",
+            VkOp::MergeSubmit => "vk_merge_submit",
+
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
@@ -557,6 +579,10 @@ mod tests {
         VkOp::GuestWriteBeginCb,
         VkOp::GuestWriteEndCb,
         VkOp::GuestWriteSubmit,
+        VkOp::MergeResetCb,
+        VkOp::MergeBeginCb,
+        VkOp::MergeEndCb,
+        VkOp::MergeSubmit,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,

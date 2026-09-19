@@ -331,6 +331,216 @@ fn a_landed_frame_merges_into_the_resident_the_ladder_serves() {
     engine::test_quiesce_ring();
 }
 
+/// A merge that finds no batch to ride must **reset and begin** the command
+/// buffer its entry hands it before recording into it.
+///
+/// A CB `begin_entry` returns is retired, not recording: its last entry ended
+/// and submitted it, and every other transfer rail in the engine
+/// (`read_target_inner`, the guest writeback, the storage flush) reaches
+/// `begin_slot_recording` before its first command. This rail's driver accepts
+/// recording into it anyway, which is exactly why this cannot be asserted by
+/// the copy's *bytes* — and exactly how the defect this pins reached the real
+/// machine: `fp20` and `b2` died inside the NVIDIA driver at the first such
+/// copy, eight attempts out of eight, with the merge's own staging block the
+/// last thing in the log.
+///
+/// So the assertion is the counter at the one call that establishes the state:
+/// an entry claimed from the ring must move it by one, and a merge that
+/// recorded into the slot's CB without the reset leaves it where it was.
+#[test]
+fn a_merge_with_no_batch_to_ride_begins_its_own_entry() {
+    use reims_vgpu::backend::vulkan::engine::{LandedFrame, LandedFrameMerge, LandedFrameOrder};
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_204,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    // 1. A resident to merge into. The draw is not the point; the slot it
+    //    leaves behind is.
+    let draw = batch_req(
+        &vert,
+        &frag,
+        &identity,
+        false,
+        ScissorResource {
+            x: 0,
+            y: 0,
+            width: W,
+            height: H,
+        },
+    );
+    match engine::execute_draw_request(engine_device(), &draw) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("target draw: {msg}");
+        }
+    }
+
+    // 2. Quiesce: the batch that draw opened is submitted and every slot
+    //    retired, so the merge below finds no batch and a slot whose CB is in
+    //    the state the defect recorded into.
+    engine::test_quiesce_ring();
+    let frame: Vec<u8> = (0..(W as usize) * (H as usize))
+        .flat_map(|i| {
+            let t = (i % 251) as u8;
+            [t, t.wrapping_add(1), t.wrapping_add(2), 0xff]
+        })
+        .collect();
+    let before = engine::test_entry_record_begins();
+    assert_eq!(
+        engine::merge_landed_frame_into_resident(
+            &identity,
+            LandedFrame {
+                width: W,
+                height: H,
+                order: LandedFrameOrder::Bgra8,
+                bytes: &frame,
+            },
+        ),
+        LandedFrameMerge::Copied {
+            bytes: u64::from(W) * u64::from(H) * 4
+        },
+    );
+    assert_eq!(
+        engine::test_entry_record_begins(),
+        before + 1,
+        "the merge recorded on an entry of its own, so it reset and began that \
+         slot's command buffer exactly once"
+    );
+
+    // 3. And the entry it began is the one that carried the copy: the bytes
+    //    out of the resident are the landing's, read back through the same
+    //    exchange every guest-visible consumer takes.
+    let px = engine::read_target(&identity)
+        .expect("read_target over the merged resident")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
+    for texel in [0usize, 1, (W * H / 2) as usize, (W * H - 1) as usize] {
+        let i = texel * 4;
+        assert_eq!(
+            [px[i], px[i + 1], px[i + 2], px[i + 3]],
+            [frame[i + 2], frame[i + 1], frame[i], frame[i + 3]],
+            "texel {texel} of the merged image"
+        );
+    }
+    engine::test_quiesce_ring();
+}
+
+/// A merge that finds an open batch records its copy into that batch's own
+/// command buffer and flushes it once, rather than cutting the batch short to
+/// pay for a submission of its own.
+///
+/// This is the arm `read_target_inner` takes for the same reason, and the
+/// reason is ordering as much as cost: the copy has to land after the draws
+/// already recorded, and appending is what puts it there in the same
+/// submission. The count that pins it is the same one the fresh-entry test
+/// asserts the other way round — riding a batch opens no entry, so nothing
+/// resets a CB — and the batch's own flush is where both draws and copy end up.
+#[test]
+fn a_merge_rides_the_open_batch_instead_of_cutting_it_short() {
+    use reims_vgpu::backend::vulkan::engine::{LandedFrame, LandedFrameMerge, LandedFrameOrder};
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_205,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let before = engine::counter_snapshot();
+    let draw = batch_req(
+        &vert,
+        &frag,
+        &identity,
+        false,
+        ScissorResource {
+            x: 0,
+            y: 0,
+            width: W,
+            height: H,
+        },
+    );
+    match engine::execute_draw_request(engine_device(), &draw) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("batch opener: {msg}");
+        }
+    }
+    let opened = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(opened.batch_opens, 1, "the draw opened a batch");
+    assert_eq!(opened.batch_flushes, 0, "and nothing has consumed it yet");
+
+    let frame: Vec<u8> = (0..(W as usize) * (H as usize))
+        .flat_map(|i| {
+            let t = (i % 251) as u8;
+            [t, t.wrapping_add(1), t.wrapping_add(2), 0xff]
+        })
+        .collect();
+    let begins = engine::test_entry_record_begins();
+    assert_eq!(
+        engine::merge_landed_frame_into_resident(
+            &identity,
+            LandedFrame {
+                width: W,
+                height: H,
+                order: LandedFrameOrder::Bgra8,
+                bytes: &frame,
+            },
+        ),
+        LandedFrameMerge::Copied {
+            bytes: u64::from(W) * u64::from(H) * 4
+        },
+    );
+    assert_eq!(
+        engine::test_entry_record_begins(),
+        begins,
+        "the copy rode the batch's recording command buffer, so no entry was begun"
+    );
+    let after = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        after.batch_flushes, 1,
+        "one submission, and it is the batch's own"
+    );
+    assert_eq!(
+        after.batch_flush_draws, 1,
+        "carrying the draw it was opened for; the copy is not a draw"
+    );
+
+    // The read is what waits the submission; the copy was recorded after the
+    // draw in the same CB, so the landing is what the surface holds.
+    let px = engine::read_target(&identity)
+        .expect("read_target after the merge's flush")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
+    for texel in [0usize, (W * H / 2) as usize, (W * H - 1) as usize] {
+        let i = texel * 4;
+        assert_eq!(
+            [px[i], px[i + 1], px[i + 2], px[i + 3]],
+            [frame[i + 2], frame[i + 1], frame[i], frame[i + 3]],
+            "texel {texel} of the merged image"
+        );
+    }
+    engine::test_quiesce_ring();
+}
+
 /// The merge's absent-image arm needs no device at all: an identity nothing has
 /// ever rendered into has no copy to make current, and the fail-closed answer
 /// is the one the ladder already had.

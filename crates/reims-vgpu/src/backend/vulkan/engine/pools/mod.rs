@@ -547,6 +547,18 @@ pub(crate) struct ResourcePools {
     /// owes. Entries rotate through slots; a slot is reused only after its
     /// fence retires (begin_entry blocks on the oldest when the ring is full).
     slots: Vec<CmdSlot>,
+    /// How many entries this device has put a slot's command buffer back into
+    /// the recording state for — one per [`Self::begin_slot_recording`].
+    ///
+    /// The count a rail test reads to prove a recorder took the reset. A CB
+    /// `begin_entry` hands back is *retired*, not recording, and recording into
+    /// it anyway is a Vulkan state violation this host's software driver
+    /// tolerates and its discrete one faults on (the R47 merge's fp20/b2
+    /// rounds). A CB cannot be asked for its state, and the fault is a driver
+    /// crash rather than a decoder error, so the invariant is counted at the
+    /// one call that establishes it: a recorder that skipped the reset shows
+    /// up as a submission whose entry was never begun.
+    entry_record_begins: u64,
     /// Slot the current (or most recently begun) entry records into.
     cur: usize,
     /// Submitted-but-unretired slot count. While nonzero, destroying any GPU
