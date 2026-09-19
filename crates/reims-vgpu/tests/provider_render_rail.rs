@@ -25399,6 +25399,403 @@ fn a_targets_frame_keeps_the_class_own_refusals_by_name() {
     );
 }
 
+/// The texel grid a pass-entry snapshot test seeds its attachment with, in the
+/// attachment's own order (E-TX1: the byte order is the *name's*), one distinct
+/// texel per position.
+///
+/// Distinct rather than constant because the reading is "the snapshot is a
+/// function of the attachment's entry bytes": a fixture whose texels were all
+/// equal could not tell a copy of them from a copy of anything else.
+fn snapshot_entry_texels(extent: (u32, u32)) -> Vec<Vec<u8>> {
+    let mut texels = Vec::new();
+    for y in 0..extent.1 {
+        for x in 0..extent.0 {
+            texels.push(vec![
+                u8::try_from((x * 16) % 256).unwrap_or(0),
+                u8::try_from((y * 32) % 256).unwrap_or(0),
+                0x20,
+                0xff,
+            ]);
+        }
+    }
+    texels
+}
+
+/// The record census v43 reads as `texture_source_order`: a draw that samples
+/// the very attachment it writes, beginning from that attachment's prior
+/// contents (`load=Load`, R23's byte arm) and — for `publishes == false` —
+/// keeping its frame in the provider's image (`skip=resident store=1`).
+///
+/// The bind's *view* is the caller's own fact (E-TX1): `view_format` is what
+/// the declaration states, and the attachment is the `format` the request
+/// declares — the census's own pair is `MTL_FORMAT_BGRA8_UNORM` beside
+/// `B8G8R8A8_UNORM`.
+fn self_sampled_request(
+    stages: &Stages,
+    identity: &engine::TargetIdentity,
+    format: u16,
+    view_format: ash::vk::Format,
+    publishes: bool,
+) -> DrawRequest {
+    let (width, height) = PRODUCTION_EXTENT;
+    let mut req = request_with_streams(format, &position_streams());
+    req.width = width;
+    req.height = height;
+    req.target_identity = Some(identity.clone());
+    req.load_from_target = true;
+    req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+    if !publishes {
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+    }
+    let declaration = stages.fragment_texture_declarations[0];
+    let mut image = image_resource_in(
+        declaration.binding,
+        Vec::new(),
+        (width, height),
+        view_format,
+    );
+    image.source = SampledSource::Target(identity.clone());
+    req.sampled_images.push(image);
+    req.samplers
+        .push(sampled_sampler_resource(declaration.sampler_binding));
+    req
+}
+
+/// The inputs the census's self-sampling records arrive with: the caller's own
+/// copy of the attachment's previous contents (R23's channel), and the walk's
+/// promise that the frame stays in the provider's image for a reader that can
+/// name it — R42's `chain_keeps_frame`, which is what `skip=resident` states.
+///
+/// `successor` is the pair the record *after* this one probed (`R42c`): a
+/// mapper-ref-texture surface's identity can move under a packet, so the keeper
+/// re-states the promise against the pair its own identity mints before it
+/// commits the frame — the same equality the census's `skip=resident` records
+/// pass, since a relayed successor loads the very image this one stores.
+///
+/// The pair is the rail's own mint for the identity
+/// ([`provider_render::resident_attachment`]), which is also the pair the
+/// declaration names, so the test cannot state a promise about another image.
+fn inputs_self_snapshot<'a>(
+    stages: &'a Stages,
+    source: &'a [u8],
+    successor: (u64, u64),
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        chain_keeps_frame: true,
+        chain_resident_successor: Some(successor),
+        resident_source_bytes: Some(source),
+        ..inputs_held(stages, RenderChainRole::SoleOrTail)
+    }
+}
+
+/// The pair one test identity's frames are kept under, as the walk states it.
+fn snapshot_attachment_pair(identity: &engine::TargetIdentity) -> (u64, u64) {
+    let resident = provider_render::resident_attachment(identity);
+    (resident.allocation.get(), resident.view.get())
+}
+
+/// E-TX15: the self-sampling shape the census froze leaves for the provider once
+/// the device declares the pass-entry snapshot arm.
+///
+/// Three readings on one Lavapipe device, all on the census's own shape
+/// (`fmt=0x50`, `load=Load`, `skip=resident store=1`, 8x4) and its own texel
+/// order:
+///
+/// * the shape is **admitted**: the submission reaches the provider, the frame
+///   stays in its image, and the two readings a census takes of that boundary
+///   move apart — the refusal's stays put and the arm's own rises;
+/// * the arm **reads the attachment's entry bytes**: the same draw, published so
+///   the frame comes back, lands byte for byte the frame the *same* bytes land
+///   through the byte arm ([`SampledSource::Bytes`]) — one set of bytes, two
+///   declarations of where they are;
+/// * the frame **follows the entry bytes**: re-seeding the attachment with
+///   another grid moves the frame, and the moved frame is again the byte arm's.
+#[test]
+fn a_pass_entry_snapshot_leaves_for_the_provider_when_the_device_declares_the_arm() {
+    let _guard = engine_test_session();
+    let _declared = provider_render::override_render_pass_entry_snapshot(Some(true));
+    let stages = sampled_stages();
+    let (width, height) = PRODUCTION_EXTENT;
+    let identity = engine::TargetIdentity::Surface {
+        id: 0x7d_00_40,
+        width,
+        height,
+        generation: 1,
+        format: ash::vk::Format::B8G8R8A8_UNORM,
+    };
+    let pair = snapshot_attachment_pair(&identity);
+    let entry = snapshot_entry_texels((width, height));
+    let bytes: Vec<u8> = entry.iter().flatten().copied().collect();
+    assert_eq!(
+        bytes.len(),
+        usize::try_from(u64::from(width) * u64::from(height) * 4).expect("the extent fits"),
+        "the entry grid is the attachment's own tightly packed extent"
+    );
+
+    // 1. The census's own shape: the frame stays in the provider's image, and
+    //    the boundary's two readings move against each other.
+    let refused_before = route_count("render_provider_out_of_class_texture_source_order");
+    let taken_before = route_count("render_provider_pass_entry_snapshot");
+    let delivered_before = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs_self_snapshot(&stages, &bytes, pair),
+        &self_sampled_request(
+            &stages,
+            &identity,
+            MTL_FORMAT_BGRA8_UNORM,
+            ash::vk::Format::B8G8R8A8_UNORM,
+            false,
+        ),
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(_) => {}
+        other => panic!(
+            "the self-sampling shape leaves for the provider once the device declares the \
+             pass-entry snapshot arm: {other:?}"
+        ),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered_before + 1,
+        "the record reached the provider rather than the engine"
+    );
+    assert_eq!(
+        route_count("render_provider_pass_entry_snapshot") - taken_before,
+        1,
+        "the arm the class took is counted under its own name"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_order") - refused_before,
+        0,
+        "the shape no longer falls to the engine's bucket"
+    );
+
+    // 2. The bytes the arm reads are the attachment's entry contents: the same
+    //    draw with a published store lands the frame the byte arm lands over
+    //    the same bytes. This record promises no frame of its own (its store is
+    //    the published arm), so the caller states the byte channel alone.
+    let snapshot = match provider_render::submit_render(
+        &inputs_held_with_source(&stages, RenderChainRole::SoleOrTail, &bytes),
+        &self_sampled_request(
+            &stages,
+            &identity,
+            MTL_FORMAT_BGRA8_UNORM,
+            ash::vk::Format::B8G8R8A8_UNORM,
+            true,
+        ),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the published store comes back through the completion: {other:?}"),
+    };
+    let byte_arm = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &sampled_request_in(
+            &stages,
+            entry.clone(),
+            (width, height),
+            ash::vk::Format::B8G8R8A8_UNORM,
+        ),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the byte arm is in class: {other:?}"),
+    };
+    assert_frames_equal(
+        "the entry snapshot against the same bytes through the byte arm",
+        &snapshot,
+        &byte_arm,
+    );
+
+    // 3. The frame follows the entry bytes: another grid, another frame — and
+    //    still the byte arm's own. Every texel moves, so the reading does not
+    //    depend on which texel the fixture's fixed sample point lands on.
+    let moved: Vec<Vec<u8>> = entry
+        .iter()
+        .map(|texel| vec![0xff - texel[0], 0xff - texel[1], texel[2] ^ 0x40, 0xff])
+        .collect();
+    let moved_bytes: Vec<u8> = moved.iter().flatten().copied().collect();
+    assert_ne!(moved_bytes, bytes, "the second grid is a different entry");
+    let moved_snapshot = match provider_render::submit_render(
+        &inputs_held_with_source(&stages, RenderChainRole::SoleOrTail, &moved_bytes),
+        &self_sampled_request(
+            &stages,
+            &identity,
+            MTL_FORMAT_BGRA8_UNORM,
+            ash::vk::Format::B8G8R8A8_UNORM,
+            true,
+        ),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the re-seeded record is in class too: {other:?}"),
+    };
+    let moved_byte_arm = match provider_render::submit_render(
+        &inputs_held(&stages, RenderChainRole::SoleOrTail),
+        &sampled_request_in(
+            &stages,
+            moved,
+            (width, height),
+            ash::vk::Format::B8G8R8A8_UNORM,
+        ),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the byte arm is in class: {other:?}"),
+    };
+    assert_ne!(
+        moved_snapshot, snapshot,
+        "the arm reads the attachment's entry bytes rather than anything else"
+    );
+    assert_frames_equal(
+        "the re-seeded snapshot against the same bytes through the byte arm",
+        &moved_snapshot,
+        &moved_byte_arm,
+    );
+}
+
+/// E-TX15's other half: the arm is a **shape** condition, so every shape its own
+/// rules exclude keeps the frozen refusal — the same slug, the same sentence and
+/// the same counter — even on a device that declares the bit.
+///
+/// Four shapes, and each is one of the contract's own four rules: a load that
+/// establishes no prior contents (a `Clear`), a view whose texel order is not
+/// the attachment's, a view of another extent, and — with the bit left out — the
+/// census shape itself.
+#[test]
+fn the_pass_entry_snapshot_arm_keeps_the_class_refusals_it_cannot_state() {
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = PRODUCTION_EXTENT;
+    let identity = engine::TargetIdentity::Surface {
+        id: 0x7d_00_41,
+        width,
+        height,
+        generation: 1,
+        format: ash::vk::Format::B8G8R8A8_UNORM,
+    };
+    let pair = snapshot_attachment_pair(&identity);
+    let entry = snapshot_entry_texels((width, height));
+    let bytes: Vec<u8> = entry.iter().flatten().copied().collect();
+    let refusal = |label: &str, inputs: &RenderRailInputs<'_>, req: &DrawRequest| {
+        match provider_render::submit_render(inputs, req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: the shape stays on the engine: {other:?}"),
+        }
+    };
+    let order_before = route_count("render_provider_out_of_class_texture_source_order");
+
+    // 1. A `Clear` load establishes the clear colour and nothing else: the
+    //    contract's own `RenderPassEntrySnapshotLoadUnsupported`, answered here
+    //    by the same sentence the shape carried before the arm existed.
+    {
+        let _declared = provider_render::override_render_pass_entry_snapshot(Some(true));
+        let mut cleared = self_sampled_request(
+            &stages,
+            &identity,
+            MTL_FORMAT_BGRA8_UNORM,
+            ash::vk::Format::B8G8R8A8_UNORM,
+            true,
+        );
+        cleared.load_from_target = false;
+        cleared.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Clear);
+        let (slug, detail) = refusal(
+            "cleared attachment",
+            &inputs_held(&stages, RenderChainRole::SoleOrTail),
+            &cleared,
+        );
+        eprintln!("door: {slug}\n  {detail}");
+        assert_eq!(
+            slug, "render_provider_out_of_class_texture_source_order",
+            "a clear's entry content is the clear colour, not the bytes the snapshot promises"
+        );
+        assert!(
+            detail.contains("RenderTextureAttachmentConflict")
+                && detail.contains("fallback arm, not its answer"),
+            "the refusal keeps the sentence the shape had before the arm existed: {detail}"
+        );
+
+        // 2. The bind's view names another texel order than the attachment's:
+        //    the snapshot *is* the attachment's texel grid, so the declaration
+        //    would sample bytes the attachment never held.
+        let other_order = self_sampled_request(
+            &stages,
+            &identity,
+            MTL_FORMAT_BGRA8_UNORM,
+            ash::vk::Format::R8G8B8A8_UNORM,
+            true,
+        );
+        let (slug, _detail) = refusal(
+            "another view spelling",
+            &inputs_held_with_source(&stages, RenderChainRole::SoleOrTail, &bytes),
+            &other_order,
+        );
+        assert_eq!(
+            slug, "render_provider_out_of_class_texture_source_order",
+            "a view of another texel order is not the attachment's own grid"
+        );
+
+        // 3. The bind's extent is not the attachment's: the same rule one field
+        //    over, and the refusal is the one the shape always had.
+        let mut other_extent = self_sampled_request(
+            &stages,
+            &identity,
+            MTL_FORMAT_BGRA8_UNORM,
+            ash::vk::Format::B8G8R8A8_UNORM,
+            true,
+        );
+        other_extent.sampled_images[0].width = width / 2;
+        other_extent.sampled_images[0].height = height;
+        let (slug, _detail) = refusal(
+            "another extent",
+            &inputs_held_with_source(&stages, RenderChainRole::SoleOrTail, &bytes),
+            &other_extent,
+        );
+        assert_eq!(
+            slug, "render_provider_out_of_class_texture_source_order",
+            "a view of another extent is not the attachment's own grid"
+        );
+    }
+
+    // 4. With the bit left out, the census shape keeps the refusal it had: the
+    //    frame is not read, nothing reaches the provider, and the arm's own
+    //    counter stays where it was.
+    let _absent = provider_render::override_render_pass_entry_snapshot(Some(false));
+    let taken_before = route_count("render_provider_pass_entry_snapshot");
+    let delivered_before = provider_render::provider_submissions();
+    let census = self_sampled_request(
+        &stages,
+        &identity,
+        MTL_FORMAT_BGRA8_UNORM,
+        ash::vk::Format::B8G8R8A8_UNORM,
+        false,
+    );
+    let (slug, detail) = refusal(
+        "undeclared arm",
+        &inputs_self_snapshot(&stages, &bytes, pair),
+        &census,
+    );
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_texture_source_order");
+    assert!(
+        detail.contains("fallback arm, not its answer"),
+        "the sentence the frozen boundary published is unchanged: {detail}"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered_before,
+        "a bit the frame leaves out hands the record to the engine, not to the provider"
+    );
+    assert_eq!(
+        route_count("render_provider_pass_entry_snapshot") - taken_before,
+        0,
+        "the arm's counter is charged only where the arm is what answered"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source_order") - order_before,
+        4,
+        "every shape the arm cannot state is still counted under the frozen bucket"
+    );
+}
+
 /// R24 composes with R22: a record whose *sampled* target the caller carried in
 /// is itself restatable as a production.
 ///

@@ -520,6 +520,38 @@ pub fn render_pixel_coordinate_sampler(
     Ok(decoded.supports_render_pixel_coordinate_sampler)
 }
 
+/// Whether this provider executes a render pass whose sampled declaration is
+/// the **pass-entry snapshot** of a colour attachment the same pass writes
+/// (`research/docs/23` §118, E-TX15).
+///
+/// The eleventh device answer this rail asks before the class gate, read out of
+/// the capability frame rather than the in-process snapshot for the same reason
+/// every answer beside it is: a bit the owner→provider frame cannot carry is a
+/// bit no remote owner would ever see. The section is the tail's second
+/// family's `0x00 0x09 <bool>`, so a frame written before the arm existed reads
+/// as undeclared — and the class then keeps the census's `texture_source_order`
+/// refusal, slug and sentence, byte for byte.
+///
+/// What the bit answers is the one fact the class cannot read off the request:
+/// whether the provider can take the attachment's bytes *on the device, before
+/// the pass opens*, and hand them to the sampled declaration as that
+/// attachment's own identity. A declaration that names the attachment's view is
+/// `RenderTextureAttachmentConflict` in the contract — "anything but a race" —
+/// unless the provider states that its execution order resolves the read before
+/// the pass (`TextureSource::PassEntrySnapshot`,
+/// `metal-api-vulkan`'s `AttachmentSnapshot`). The arm's own shape rules (the
+/// identity pair of *this* pass's colour attachment, the attachment's format
+/// and extent restated, a load arm that keeps prior contents, one plain
+/// single-sample 2D view) are the class's, and `false` keeps the refusal for
+/// every one of them.
+pub fn render_pass_entry_snapshot(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_pass_entry_snapshot)
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///
