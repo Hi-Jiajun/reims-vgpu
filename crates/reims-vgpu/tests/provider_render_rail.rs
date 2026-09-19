@@ -15910,9 +15910,13 @@ fn the_sparse_declaration_rules_stay_refusals_by_name() {
     );
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_texture_count");
+    // The count and the reading the device states are pinned one test below
+    // (`a_thirteen_texture_stage_is_weighed_on_the_stages_own_axis`, E-TC1): the
+    // ceiling this list crosses is the live one, so the sentence's own number is
+    // asserted there rather than restated here as a literal.
     assert!(
-        detail.contains("8") && detail.contains("9"),
-        "the sentence names the cap and the count: {detail}"
+        detail.contains(&wide.fragment_texture_declarations.len().to_string()),
+        "the sentence names the count: {detail}"
     );
 
     // 4. The declaration the draw never bound: the request's own copy sits at
@@ -15926,6 +15930,191 @@ fn the_sparse_declaration_rules_stay_refusals_by_name() {
         detail.contains("[[texture(3)]]"),
         "the sentence names the declaration the draw did not fill: {detail}"
     );
+}
+
+/// The thirteen-declaration shape (E-TC1): the reviewed vertex stage beside a
+/// fragment stage whose own argument table declares **thirteen** sampled
+/// textures, one at each Metal index 0 through 12.
+///
+/// The shape is the census's own: the preview round behind E-TC1 read 42 class
+/// exits under `render_provider_out_of_class_texture_count`, every one of them
+/// this list (`/mnt/c/tmp/reims-vgpu-fail.log`). The declarations are the
+/// *production* walk over the fixture's own translation, which is the fact the
+/// runtime hands the rail.
+fn thirteen_texture_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_thirteen_textures.air",
+        "reims_thirteen_textures_frag",
+    )
+}
+
+/// One texture per declaration, bound at the Metal index the declaration
+/// states, each carrying texture `k`'s own payload (`k + 1` in red): the
+/// thirteen readings the fixture's body sums.
+fn thirteen_texture_request(
+    stages: &Stages,
+    moved: Option<usize>,
+    extent: (u32, u32),
+) -> DrawRequest {
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    let texels = (extent.0 * extent.1) as usize;
+    for (position, declaration) in stages.fragment_texture_declarations.iter().enumerate() {
+        let payload = if moved == Some(position) {
+            vec![vec![0u8, 0, 0, 255]; texels]
+        } else {
+            vec![
+                vec![
+                    u8::try_from(position + 1).expect("thirteen payloads"),
+                    0,
+                    0,
+                    255
+                ];
+                texels
+            ]
+        };
+        req.sampled_images
+            .push(image_resource(declaration.binding, payload, extent));
+        req.samplers
+            .push(sampled_sampler_resource(declaration.sampler_binding));
+    }
+    req
+}
+
+/// The per-stage sampled-texture window (E-TC1).
+///
+/// The class gate weighs a fragment stage's own declaration list against the
+/// device's answer, and the two fail-closed arms are the readings of the wire:
+///
+/// * a frame that carries **no** per-stage section is a provider written before
+///   the axis existed, so the thirteen keep the census's own sentence — the
+///   pre-increment statement of the contract's bound, word for word — and are
+///   charged to the same bucket;
+/// * a frame whose device answers a **narrower** window than the list refuses it
+///   by name, naming the window it is above;
+/// * the device's own answer admits the shape, and the provider's frame is the
+///   thirteen payloads summed (`0x5b`, with the first and the last argument's
+///   readings in the channels beside it), byte for byte the engine's own frame.
+#[test]
+fn a_thirteen_texture_stage_is_weighed_on_the_stages_own_axis() {
+    let _guard = engine_test_session();
+    let stages = thirteen_texture_stages();
+    assert_eq!(
+        stages.fragment_texture_declarations.len(),
+        13,
+        "the module declares one sampled texture per Metal index 0 through 12"
+    );
+    assert_eq!(
+        stages
+            .fragment_texture_declarations
+            .iter()
+            .map(|declaration| declaration.index)
+            .collect::<Vec<_>>(),
+        (0..13).collect::<Vec<_>>(),
+        "and the indexes are the argument table's own, in canonical order"
+    );
+    let (width, height) = extent();
+
+    // The absent-section arm: the reading every provider written before the
+    // axis existed gives, and the census's own sentence for the shape.
+    {
+        let _missing = provider_render::override_render_texture_per_stage_ceiling(Some(0));
+        let reason = match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &thirteen_texture_request(&stages, None, (width, height)),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => reason,
+            other => panic!(
+                "a frame with no per-stage section states a window this rail cannot read: {other:?}"
+            ),
+        };
+        eprintln!("door (no per-stage section): {reason}");
+        assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_texture_count",
+            "the older reading answers under the bucket it always did"
+        );
+        assert_eq!(
+            reason.detail(),
+            "a fragment stage that declares 13 sampled textures stays on the engine: the \
+             canonical contract states 8 (`MAX_RENDER_TEXTURES`), and a longer list is refused by \
+             name (`render_texture_limit`) rather than executed with the rest dropped",
+            "and its sentence is the census's own, word for word"
+        );
+    }
+
+    // The narrowing arm: a device whose window is narrower than one stage's own
+    // list. Twelve is one below the census's thirteen, so this is the shape such
+    // a device states — and the one this rail has to refuse by name rather than
+    // hand over and take a decline back.
+    {
+        let _narrow = provider_render::override_render_texture_per_stage_ceiling(Some(12));
+        let reason = match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &thirteen_texture_request(&stages, None, (width, height)),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => reason,
+            other => panic!(
+                "a stage above the device's own window is not a shape this rail admits: {other:?}"
+            ),
+        };
+        eprintln!("door (narrow window): {reason}");
+        assert_eq!(
+            reason.slug(),
+            "render_provider_out_of_class_texture_count",
+            "the narrowing arm answers under the same bucket"
+        );
+        let detail = reason.detail();
+        assert!(
+            detail.contains("declares 13 sampled textures"),
+            "the sentence names the count: {detail}"
+        );
+        assert!(
+            detail.contains("executes at most 12"),
+            "and the window it is above: {detail}"
+        );
+    }
+
+    // The device's own arm: the shape leaves for the provider and both rails
+    // land the thirteen payloads.
+    let provider = provider_pixels(
+        "thirteen sampled textures",
+        &stages,
+        &thirteen_texture_request(&stages, None, (width, height)),
+    );
+    assert_uniform_frame(
+        "thirteen sampled textures (provider)",
+        &provider,
+        width,
+        height,
+        [0x5b, 0x01, 0x0d, 0xff],
+    );
+    let moved = provider_pixels(
+        "thirteen sampled textures, texture 7 zeroed",
+        &stages,
+        &thirteen_texture_request(&stages, Some(7), (width, height)),
+    );
+    assert_uniform_frame(
+        "thirteen sampled textures, texture 7 zeroed (provider)",
+        &moved,
+        width,
+        height,
+        [0x53, 0x01, 0x0d, 0xff],
+    );
+    assert_frames_differ(
+        "one payload's own bytes move the thirteen-declaration frame",
+        &provider,
+        &moved,
+    );
+    if let Some(engine) = engine_pixels(
+        "thirteen sampled textures",
+        &stages,
+        thirteen_texture_request(&stages, None, (width, height)),
+    ) {
+        assert_frames_equal("thirteen sampled textures, both rails", &provider, &engine);
+        eprintln!("thirteen sampled textures: both rails land the same frame");
+    }
 }
 
 /// The self-contained engine draws the y-asymmetric fixture the way Metal's clip

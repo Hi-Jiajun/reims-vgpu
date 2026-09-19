@@ -2624,6 +2624,33 @@ struct EntrySnapshotArm {
 // answers behind one more name without shrinking the surface — the same call
 // [`narrow_class`] documents for its own list.
 #[allow(clippy::too_many_arguments)]
+/// The ceiling this class applies to a fragment stage's declarations when the
+/// frame carries no per-stage window (E-TC1).
+///
+/// The number is the canonical contract's *own* pre-increment statement — the
+/// bound `metal_api_core::provider::MAX_RENDER_TEXTURES` held before E-TC1 moved
+/// that constant onto one stage's axis and raised it to sixteen. It is
+/// deliberately a frozen copy rather than the live constant: the arm it answers
+/// is the reading every provider written before the axis existed gives, so the
+/// refusal it produces has to be that reading's own sentence. The census's
+/// `render_provider_out_of_class_texture_count` bucket has answered with
+/// "the canonical contract states 8 (`MAX_RENDER_TEXTURES`)" since the
+/// increment that stated eight, and a wider live constant silently moving that
+/// number would move a sentence the census compares across rounds — the same
+/// reason R46's merged arm keeps R9q's sentence for the frame it is reading.
+const MAX_RENDER_TEXTURES_WITHOUT_THE_WINDOW: usize = 8;
+
+/// The count rule's own candidate test (E-TC1).
+///
+/// The rule's device half is read before the gate, so it is asked for exactly
+/// the population the rule can answer about: a request whose fragment stage
+/// declares no `[[texture(n)]]` argument at all is admitted with an empty list
+/// whatever the window says, so it never reaches this question and never puts
+/// the rail's provider in place.
+fn texture_count_candidate(inputs: &RenderRailInputs<'_>) -> Option<()> {
+    (!inputs.fragment_texture_declarations.is_empty()).then_some(())
+}
+
 fn sampled_textures<'a>(
     // The inputs' *inner* lifetime, not only the borrow of them: R24's arm hands
     // the caller's frame to the trace the same way the request's own bytes
@@ -2683,6 +2710,14 @@ fn sampled_textures<'a>(
     // the caller's candidate test answering no — keeps the census's refusal
     // sentence and slug for the shape, byte for byte.
     entry_snapshot: Option<EntrySnapshotArm>,
+    // The device's own answer to the count rule's question (E-TC1), read by
+    // [`submit_render`] out of the provider's capability frame exactly when the
+    // request declares a sampled texture ([`texture_count_candidate`]) — the
+    // gate below is pure and reads no device answer of its own. `None` is the
+    // frame that carries no per-stage section: the reading every provider
+    // written before the axis existed gives, whose refusal is the census's own
+    // sentence byte for byte.
+    render_texture_count_ceiling: Option<usize>,
 ) -> Result<NarrowSampling<'a>, OutOfClass> {
     if req.color_input {
         return Err(OutOfClass::new(
@@ -2692,21 +2727,54 @@ fn sampled_textures<'a>(
              no input attachment",
         ));
     }
-    // The canonical contract states one render texture (`MAX_RENDER_TEXTURES`),
-    // and both the registration and the pass refuse a longer list by name
-    // (`RenderTextureLimitExceeded`), so a wider statement is a shape this
+    // The count rule's own axis (E-TC1). Metal's `[[texture(n)]]` index space is
+    // one per stage, and the canonical contract's ceiling says so too:
+    // `MAX_RENDER_TEXTURES` is the most declarations **one stage** may state,
+    // and the pass's list — the fragment stage's own declarations, the only
+    // texture list the contract states today — is weighed against the device's
+    // own window beside it. The pass and the registration refuse a longer list
+    // by name (`render_texture_limit`), so a wider statement is a shape this
     // class answers before the provider is asked.
-    if inputs.fragment_texture_declarations.len() > MAX_RENDER_TEXTURES {
-        return Err(OutOfClass::owned(
-            "render_provider_out_of_class_texture_count",
-            format!(
-                "a fragment stage that declares {} sampled textures stays on the engine: the \
-                 canonical contract states {MAX_RENDER_TEXTURES} (`MAX_RENDER_TEXTURES`), and a \
-                 longer list is refused by name (`render_texture_limit`) rather than executed \
-                 with the rest dropped",
-                inputs.fragment_texture_declarations.len(),
-            ),
-        ));
+    //
+    // Two arms, and they are the two readings of the same wire. A frame that
+    // states the device's window (`Some(ceiling)`) answers with that window:
+    // the contract's sixteen is a review ceiling, so a device may state a
+    // narrower one, and a stage above it is a shape admission refuses by name
+    // rather than one the provider would execute. A frame that carries no
+    // section (`None`) is a provider written before the axis existed, and its
+    // reading is the one this bucket has always answered with: the pre-increment
+    // statement of the contract's own bound, `MAX_RENDER_TEXTURES_WITHOUT_THE_WINDOW`
+    // — the number that constant held when the sentence was written — so a
+    // thirteen-declaration stage keeps the census's slug and its sentence, word
+    // for word.
+    let declared_textures = inputs.fragment_texture_declarations.len();
+    match render_texture_count_ceiling {
+        Some(ceiling) if declared_textures > ceiling => {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_count",
+                format!(
+                    "a fragment stage that declares {declared_textures} sampled textures stays on \
+                     the engine: the canonical contract states at most {MAX_RENDER_TEXTURES} \
+                     sampled textures per stage, and this device's own capability answer executes \
+                     at most {ceiling} — a stage above that window is a shape admission refuses \
+                     by name (`render_texture_limit`) rather than one the provider would \
+                     execute",
+                ),
+            ));
+        }
+        None if declared_textures > MAX_RENDER_TEXTURES_WITHOUT_THE_WINDOW => {
+            return Err(OutOfClass::owned(
+                "render_provider_out_of_class_texture_count",
+                format!(
+                    "a fragment stage that declares {declared_textures} sampled textures stays on \
+                     the engine: the canonical contract states \
+                     {MAX_RENDER_TEXTURES_WITHOUT_THE_WINDOW} (`MAX_RENDER_TEXTURES`), and a \
+                     longer list is refused by name (`render_texture_limit`) rather than executed \
+                     with the rest dropped",
+                ),
+            ));
+        }
+        _ => {}
     }
     if let Some(refused) = inputs.texture_interface_refusals.first() {
         return Err(OutOfClass::owned(
@@ -5773,6 +5841,102 @@ fn declared_render_texture_support(
         step: decline.step,
         detail: decline.detail,
     })
+}
+
+/// The ceiling one *stage's* own sampled-texture list is admitted under
+/// (E-TC1).
+///
+/// `None` is the frame that carries no per-stage section — the reading every
+/// provider written before E-TC1 gives, and what
+/// [`declared_render_texture_support`]'s own decode states for it — and the
+/// class gate answers that arm with the census's `texture_count` sentence, byte
+/// for byte. `Some(ceiling)` is the device's own answer, which is
+/// `min(MAX_RENDER_TEXTURES, the device's `maxPerStageDescriptorSampledImages`)`
+/// on the canonical side (`metal-api-vulkan`'s `render_texture_window` /
+/// `per_stage`): the review ceiling is sixteen there, so a device may state a
+/// *narrower* window and the number is a reading rather than a constant.
+///
+/// Read out of the capability *frame* rather than out of the snapshot beside
+/// it, exactly as [`declared_render_texture_support`] reads the shape's own
+/// bits: a window the frame cannot carry is a window no remote owner would ever
+/// see. The read happens only for a request whose own statement declares a
+/// sampled texture ([`texture_count_candidate`]), so the draws that declare
+/// none reach the rail no earlier than they did.
+pub fn declared_render_texture_per_stage_ceiling() -> Result<Option<usize>, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match RENDER_TEXTURE_PER_STAGE_ANSWER.load(Ordering::Relaxed) {
+            RENDER_TEXTURE_PER_STAGE_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.max_render_textures_per_stage = answer;
+                declared
+            }
+        }
+    };
+    let support =
+        provider_wire::render_texture_support(rail.provider.device_epoch(), &capabilities)
+            .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+                step: decline.step,
+                detail: decline.detail,
+            })?;
+    Ok(support
+        .declares_per_stage_ceiling()
+        .then_some(support.per_stage as usize))
+}
+
+/// The device's own answer for the render-texture per-stage ceiling (E-TC1),
+/// and the state the test instrument below puts it in: `u32::MAX` cannot be a
+/// window (a stage's list is a one-byte count on the wire and the review
+/// ceiling is sixteen), so the sentinel is unambiguous beside the zero a
+/// *missing* section decodes to.
+const RENDER_TEXTURE_PER_STAGE_DEVICE: u32 = u32::MAX;
+
+/// Whether the per-stage ceiling is read from the device's own frame
+/// ([`RENDER_TEXTURE_PER_STAGE_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static RENDER_TEXTURE_PER_STAGE_ANSWER: AtomicU32 = AtomicU32::new(RENDER_TEXTURE_PER_STAGE_DEVICE);
+
+/// A test's own answer for the render-texture per-stage ceiling, restored when
+/// it drops (E-TC1).
+///
+/// The rail reads the number out of the provider's capability frame, and a test
+/// that has to see either fail-closed arm cannot make an admitted device stop
+/// declaring the window: `Some(0)` states the *missing* section (the older
+/// reading) and `Some(n)` states a narrower window. While this guards an
+/// answer, the capability question is asked of a snapshot carrying it —
+/// written, encoded and decoded through the same frame — so the arm a test sees
+/// is the arm such a frame gives, and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`StageBufferPerStageCeilingOverride`] is one: this changes a *decision* and
+/// not an observation, so a test that unwound through a failed assertion would
+/// otherwise leave the next shape in the same binary answering from a device
+/// that is not its own.
+pub struct RenderTexturePerStageCeilingOverride {
+    previous: u32,
+}
+
+impl Drop for RenderTexturePerStageCeilingOverride {
+    fn drop(&mut self) {
+        RENDER_TEXTURE_PER_STAGE_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the render-texture per-stage ceiling as `declared` until the returned
+/// guard drops, or as the device's own answer for `None` (E-TC1).
+pub fn override_render_texture_per_stage_ceiling(
+    declared: Option<u32>,
+) -> RenderTexturePerStageCeilingOverride {
+    let answer = declared.unwrap_or(RENDER_TEXTURE_PER_STAGE_DEVICE);
+    RenderTexturePerStageCeilingOverride {
+        previous: RENDER_TEXTURE_PER_STAGE_ANSWER.swap(answer, Ordering::Relaxed),
+    }
 }
 
 /// The runtime-sampler half of the same device answer (R36).
@@ -11411,6 +11575,22 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // E-TC1: the count rule's own device answer, asked *before* the gate for
+    // exactly the population the rule can answer about
+    // ([`texture_count_candidate`]): a request whose fragment stage declares no
+    // sampled texture is admitted with an empty list whatever the window says,
+    // so it keeps the path it had and never puts the rail's provider in place.
+    let render_texture_count_ceiling = match texture_count_candidate(inputs) {
+        None => None,
+        Some(()) => match declared_render_texture_per_stage_ceiling() {
+            Ok(ceiling) => ceiling,
+            // The same fail-closed direction as every answer above: a provider
+            // that cannot answer is not a provider this rail may widen the
+            // class for, so the draw is declined rather than run on a rail the
+            // class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The texel space (2026-09-19, census v43's `texture_state` axis): the
     // eighth answer this rail asks *before* the gate, and the only one with two
     // halves. The request's own half is the candidate
@@ -11559,6 +11739,7 @@ fn submit_render_inner(
         render_texture_sampled_lanes,
         render_texture_one_dimension_window,
         render_texture_volume_window,
+        render_texture_count_ceiling,
         attachment_landing_view,
         kept_frame_landing,
         render_pixel_coordinate_sampler,
@@ -13875,6 +14056,13 @@ fn narrow_class<'a>(
     // beside it is. `provider_wire::VolumeSupport::NONE` states neither lane nor
     // window, which is the pre-increment device's whole answer.
     render_texture_volume_window: provider_wire::VolumeSupport,
+    // The device's own answer to the count rule's question (E-TC1), read by the
+    // caller out of the same capability frame and under its own candidate test
+    // ([`texture_count_candidate`]), exactly as the answers beside it are.
+    // `None` is the frame that carries no per-stage section: the reading every
+    // provider written before the axis existed gives, whose refusal is the
+    // census's own sentence word for word.
+    render_texture_count_ceiling: Option<usize>,
     attachment_landing_view: bool,
     kept_frame_landing: bool,
     // Whether this draw's provider executes the texel space **and** this
@@ -14984,6 +15172,10 @@ fn narrow_class<'a>(
             format,
             loads_prior_contents: !matches!(load, NarrowLoad::Clear(_)),
         }),
+        // E-TC1: the device's own per-stage window, read above under the count
+        // rule's own candidate test. `None` is the frame that carries no
+        // section, which keeps the census's sentence for the wider list.
+        render_texture_count_ceiling,
     )?;
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
