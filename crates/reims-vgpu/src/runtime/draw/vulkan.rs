@@ -1728,6 +1728,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
                             mid,
                             texture_ref,
                             "ref_texture_view",
+                            // The ladder above these pages is the mapper-ref
+                            // texture one, and a multiplanar view is not one of
+                            // its bindings: the copy it would serve is not this
+                            // bind's source, so this call has nothing to say
+                            // about it.
+                            "",
                             crate::runtime::scanout::SampledFieldWindow {
                                 width: view.width,
                                 height: view.height,
@@ -9107,12 +9113,42 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // And what it held: a whole-surface bind reads the
                             // mapping's own geometry, which is the shape every
                             // full-screen compositor layer on this rail takes.
+                            //
+                            // Read beside it, the copy the rung *above* these
+                            // pages holds for the same mapping. The ladder's
+                            // own counters cannot answer this per mapping, and
+                            // they are not the same question: `t11rung_resident`
+                            // says the rung was taken, while the pair below says
+                            // whether the image it served still holds the
+                            // surface's own content. A resident stamped behind
+                            // the mapping's epoch is an image this surface has
+                            // already moved past — the sampling rung consults
+                            // `content_ready` alone, so nothing else on this
+                            // rail reports the difference.
+                            let resident = state
+                                .mappings
+                                .get(&mid)
+                                .map(|m| {
+                                    let identity =
+                                        crate::backend::vulkan::present_identity::surface_identity(
+                                            state, mid, m.width, m.height,
+                                        );
+                                    format!(
+                                        " resident={:?} mapping_epoch={}",
+                                        crate::backend::vulkan::engine::resident_content_state(
+                                            &identity
+                                        ),
+                                        m.surface_content_epoch,
+                                    )
+                                })
+                                .unwrap_or_default();
                             crate::runtime::scanout::note_sampled_surface_field(
                                 state,
                                 &*host,
                                 mid,
                                 texture_ref,
                                 route,
+                                &resident,
                             );
                         }
                         (rw, rh, src)
