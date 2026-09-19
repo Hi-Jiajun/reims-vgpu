@@ -347,6 +347,38 @@ pub fn render_vertex_count_above_triangle(
     Ok(decoded.supports_render_vertex_count_above_triangle)
 }
 
+/// Whether the provider whose snapshot this is executes a fragment module that
+/// stores **more colour locations than the pass attaches** (2026-09-20, the
+/// third door behind census v46's `stage_buffer_footprint` bucket).
+///
+/// The fifteenth reading of the same one-snapshot rule
+/// ([`render_vertex_count_above_triangle`] is the fourteenth), and the one the
+/// class gate needs for the shape census v46's remaining LPF pipeline has: its
+/// fragment stage stores three colour locations while the draw attaches one.
+/// Vulkan defines what the provider does with the extra stores — a fragment
+/// output whose location has no attachment behind it is discarded — so the
+/// shape is executable; the only thing left to ask is whether *this* provider's
+/// registration gate admits it. A provider that does not declare the face
+/// refuses the registration by name (`render_stage_reflection_mismatch`), and a
+/// draw the class handed such a provider is a draw no rail answered — the census
+/// red line `draws_skipped_after_engine_refusal`.
+///
+/// `false` is the fail-closed reading, and it is what a frame written before
+/// the face existed decodes to: the bit is the escape family's own next tagged
+/// section (`0x00 0x0E`), so a decoder that predates the tag answers
+/// [`WireDecline`] rather than a value, and one that carries the tag reads
+/// `false` out of a frame that ends before it. A device that does not state the
+/// bit is a device that keeps the census's slug and sentence for the shape —
+/// which is exactly the native rail's answer, whose reviewed-module table
+/// selects a stage by the colour format list's exact shape.
+pub fn render_fragment_output_superset(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_fragment_output_superset)
+}
+
 /// The three facts one provider's frame states about its one-dimensional
 /// sampled window, one value each.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
