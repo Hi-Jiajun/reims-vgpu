@@ -11548,6 +11548,7 @@ fn the_runtime_sampler_declarations_are_what_the_module_says() {
             }]
             .into(),
             statics: Vec::new().into(),
+            outside_family_statics: Vec::new().into(),
             sample_sites: RenderSampleSites::Paired,
         },
         "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
@@ -12009,6 +12010,7 @@ fn the_mixed_sampler_family_declarations_are_what_the_module_says() {
                 }]
                 .into(),
                 statics: vec![1].into(),
+                outside_family_statics: Vec::new().into(),
                 sample_sites: RenderSampleSites::Paired,
             },
             "{label}: one runtime `[[sampler(0)]]` argument, one AIR static sampler, and one \
@@ -13570,6 +13572,7 @@ fn a_fetched_and_a_sampled_texture_are_declared_apart_and_both_land() {
             }]
             .into(),
             statics: Vec::new().into(),
+            outside_family_statics: Vec::new().into(),
             sample_sites: RenderSampleSites::Paired,
         },
         "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
@@ -13808,6 +13811,7 @@ fn the_sparse_declarations_are_what_the_module_says() {
             }]
             .into(),
             statics: Vec::new().into(),
+            outside_family_statics: Vec::new().into(),
             sample_sites: RenderSampleSites::Paired,
         },
         "the stage binds one runtime `[[sampler(0)]]` argument and carries no AIR static sampler"
@@ -24878,5 +24882,320 @@ fn a_preserving_gva_tails_own_window_leaves_for_the_provider_and_lands_the_same_
          engine's preserving arm byte for byte, and the registered page holds the published \
          frame; a window over the older page and a swapped two-run declaration both move the \
          frame's undrawn half"
+    );
+}
+
+/// The shape census v39's four lost draws carry (R45): the R10 sampled
+/// fixture's own body with its sampler state moved to `coord::pixel`
+/// (`render_frag_pixel_sampler.air`), the state the translation lowers with
+/// shader-side fetches rather than a sampler.
+///
+/// The lowering is why the shape is reachable at all: the module's one texture
+/// is *fetched* in the emitted words, so this rail's declaration states no
+/// sampler for it — while the reflection still reports the AIR `constexpr
+/// sampler` the fetch was lowered from, whose state
+/// (`coordinates: Pixel`) is outside the family on that one axis. One AIR
+/// sampler against zero sampled declarations is exactly the count the
+/// registration refuses and the class gate used to hand over.
+fn pixel_sampler_stages() -> Stages {
+    sampled_fragment_stages("render_frag_pixel_sampler.air", "reims_pixel_sampler_frag")
+}
+
+/// The pairing's own positive control (R45): one fragment stage that carries two
+/// AIR `constexpr samplers` beside the two sampled textures that read through
+/// them, one each — the counts the registration compares, agreeing
+/// (`render_frag_two_static_textures.air`).
+fn two_static_texture_stages() -> Stages {
+    sampled_fragment_stages(
+        "render_frag_two_static_textures.air",
+        "reims_two_static_textures_frag",
+    )
+}
+
+/// The two-texture static pair's request (R45): one `rgba8_unorm` texture and
+/// one sampler at *each* declaration's own device binding, with the state the
+/// module's own AIR sampler names for that texture — nearest for the first,
+/// linear for the second, both clamped.
+fn two_static_textures_request(
+    stages: &Stages,
+    nearest_texels: Vec<Vec<u8>>,
+    linear_texels: Vec<Vec<u8>>,
+    extent: (u32, u32),
+) -> DrawRequest {
+    use reims_vgpu::protocol::sampler as mtl;
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = extent.0;
+    req.height = extent.1;
+    for (declaration, (texels, filter)) in stages.fragment_texture_declarations.iter().zip([
+        (nearest_texels, mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST),
+        (linear_texels, mtl::MTL_SAMPLER_MIN_MAG_FILTER_LINEAR),
+    ]) {
+        req.sampled_images
+            .push(image_resource(declaration.binding, texels, extent));
+        req.samplers.push(family_sampler_resource(
+            declaration.sampler_binding,
+            filter,
+            mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        ));
+    }
+    req
+}
+
+/// R45, census v39 (the red line): a fragment stage that carries one more AIR
+/// `constexpr sampler` than its sampled half reads stays on the engine by name,
+/// and the engine really draws it.
+///
+/// The four draws v39 lost were this shape: the class gate paired the stage's
+/// AIR samplers only against the declarations its per-texture walk reached, so a
+/// sampler no texture reads through never met the family table — while the
+/// canonical rail's registration weighs *every* AIR sampler the stage carries
+/// before it pairs one, and refused this module at registration
+/// (`render_stage_unsupported_interface`, "an AIR sampler with pixel
+/// coordinates is outside the reviewed family", beside the counting rule's own
+/// `render_stage_reflection_mismatch`). A refusal is a decline rather than a
+/// fallback, so the draw was skipped: `draws_skipped_after_engine_refusal` read
+/// 4 in census v39 and 0 in every round before it.
+///
+/// Three readings, and each is falsifiable on its own:
+///
+/// - the production walks really report one AIR sampler against zero
+///   declarations (the pixel-coordinate read is lowered to a fetch, so the
+///   texture's declaration states no sampler), with the sampler's own state
+///   outside the family on the coordinates axis — so the fixture states the
+///   shape rather than a shape *near* it;
+/// - the class answers it by name, with the counts and the axis in the sentence,
+///   and the provider is never asked (a submitted request is the drop's first
+///   half);
+/// - the engine draws this module and lands the texel its one sample reads, which
+///   is the half the red line lost.
+#[test]
+fn the_air_sampler_a_pixel_coordinate_read_leaves_unpaired_stays_on_the_engine_by_name() {
+    let _guard = engine_test_session();
+    let stages = pixel_sampler_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+
+    // The shape, from the production walks: one AIR static sampler, one
+    // declaration that states no sampler at all (the pixel-coordinate read is a
+    // fetch), and the sampler's state outside the family on the coordinates
+    // axis alone.
+    assert_eq!(
+        stages.sampler_family.statics.len(),
+        1,
+        "the module's `!air.sampler_states` root lists one AIR sampler: {:?}",
+        stages.sampler_family.statics
+    );
+    assert_eq!(
+        stages.fragment_texture_declarations.len(),
+        1,
+        "one `[[texture(0)]]` argument is sampled"
+    );
+    assert!(
+        matches!(
+            stages.fragment_texture_declarations[0].sampler,
+            RenderSamplerState::Fetched
+        ),
+        "the pixel-coordinate read is lowered to a texel fetch, which states no sampler: {:?}",
+        stages.fragment_texture_declarations[0].sampler
+    );
+    assert_eq!(
+        stages
+            .sampler_family
+            .outside_family_statics
+            .iter()
+            .map(|sampler| (sampler.index, sampler.axis))
+            .collect::<Vec<_>>(),
+        vec![(0, "its coordinates are pixel coordinates")],
+        "the AIR sampler is outside the family on the coordinates axis"
+    );
+
+    // The class answer: by name, with both counts and the axis, and without
+    // asking the provider — a submission here is the drop's first half.
+    let deliveries = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs(&stages, RenderChainRole::SoleOrTail),
+        &fetched_request(&stages, texels.clone(), (width, height)),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("R45 door: {}\n  {}", reason.slug(), reason.detail());
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_texture_static_sampler_unpaired"
+            );
+            assert!(
+                reason.detail().contains("1 AIR static samplers")
+                    && reason
+                        .detail()
+                        .contains("0 sampled textures reading through one"),
+                "the sentence names both counts: {}",
+                reason.detail()
+            );
+            assert!(
+                reason
+                    .detail()
+                    .contains("its coordinates are pixel coordinates")
+                    && reason.detail().contains("Metal index 0"),
+                "the sentence names the unpaired sampler and the axis that read it: {}",
+                reason.detail()
+            );
+        }
+        other => panic!(
+            "a stage carrying an AIR sampler no texture pairs with stays on the engine: {other:?}"
+        ),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        deliveries,
+        "an out-of-class shape never reaches the provider"
+    );
+
+    // The engine draws it: the shape is kept, not dropped.
+    let engine = engine_pixels(
+        "pixel sampler",
+        &stages,
+        fetched_request(&stages, texels, (width, height)),
+    );
+    let Some(engine) = engine else {
+        return;
+    };
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    // The fixture's coordinates are texel `(6, 3)`'s centre in a
+    // pixel-coordinate reading, which is the same texel the R10 sibling samples
+    // by its normalized centre.
+    assert_uniform_frame(
+        "pixel sampler (engine)",
+        &engine,
+        width,
+        height,
+        [
+            16 * read_x as u8,
+            64 * read_y as u8,
+            8 * (read_x + read_y) as u8,
+            255,
+        ],
+    );
+}
+
+/// R45: the pairing the increment must keep admitting — two AIR static samplers
+/// beside the two sampled textures that read through them, one each.
+///
+/// The refusal's own control, and the reason the rule is read as a *pairing*
+/// rather than as a count: a walk that answered "this stage carries more than
+/// one AIR sampler" would refuse this module too, and it is the shape the
+/// registration admits (`static_samplers.len() == static_read`). Both halves are
+/// separately observable in the attachment — red is the first texture's texel
+/// `(6, 3)` read through the nearest state, blue the second's `(2, 3)` read
+/// through the linear one — so moving either texture's texel moves its own
+/// channel, and the canonical rail's frame is the engine's byte for byte.
+#[test]
+fn the_two_static_textures_that_pair_one_to_one_land_their_own_texels_and_agree_with_the_engine() {
+    let _guard = engine_test_session();
+    let stages = two_static_texture_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let (nearest_texel, linear_texel) = (3 * width as usize + 6, 3 * width as usize + 2);
+    let marked = [255u8, 0, 255, 255];
+
+    assert_eq!(
+        stages.sampler_family.statics.len(),
+        2,
+        "the module carries two AIR static samplers"
+    );
+    assert!(
+        stages.sampler_family.outside_family_statics.is_empty(),
+        "both Air states are inside the family: {:?}",
+        stages.sampler_family.outside_family_statics
+    );
+    assert_eq!(
+        stages.fragment_texture_declarations.len(),
+        2,
+        "two `[[texture(i)]]` arguments are sampled"
+    );
+    assert!(
+        stages
+            .fragment_texture_declarations
+            .iter()
+            .all(|declaration| matches!(declaration.sampler, RenderSamplerState::Policy(_))),
+        "both textures read through the module's own AIR state: {:?}",
+        stages
+            .fragment_texture_declarations
+            .iter()
+            .map(|declaration| declaration.sampler)
+            .collect::<Vec<_>>()
+    );
+
+    let request = |nearest: Vec<Vec<u8>>, linear: Vec<Vec<u8>>| {
+        two_static_textures_request(&stages, nearest, linear, (width, height))
+    };
+    let base = provider_pixels(
+        "two static textures",
+        &stages,
+        &request(texels.clone(), texels.clone()),
+    );
+    assert_uniform_frame(
+        "two static textures",
+        &base,
+        width,
+        height,
+        [16 * 6, 0, 16 * 2, 255],
+    );
+    let Some(engine) = engine_pixels(
+        "two static textures",
+        &stages,
+        request(texels.clone(), texels.clone()),
+    ) else {
+        return;
+    };
+    assert_frames_equal("two static textures", &base, &engine);
+
+    // Each texture's own texel: blue is the linear half's, so a walk that
+    // paired the two samplers by position against the wrong texture would land
+    // another texel here.
+    let mut nearest_moved = texels.clone();
+    nearest_moved[nearest_texel] = marked.to_vec();
+    let nearest_frame = provider_pixels(
+        "the nearest half's texel moved",
+        &stages,
+        &request(nearest_moved, texels.clone()),
+    );
+    assert_uniform_frame(
+        "the nearest half's texel moved",
+        &nearest_frame,
+        width,
+        height,
+        [255, 0, 16 * 2, 255],
+    );
+    assert_frames_differ(
+        "the nearest half's texel moved the frame",
+        &base,
+        &nearest_frame,
+    );
+
+    let mut linear_moved = texels.clone();
+    linear_moved[linear_texel] = marked.to_vec();
+    let linear_frame = provider_pixels(
+        "the linear half's texel moved",
+        &stages,
+        &request(texels.clone(), linear_moved),
+    );
+    assert_uniform_frame(
+        "the linear half's texel moved",
+        &linear_frame,
+        width,
+        height,
+        [16 * 6, 0, 255, 255],
+    );
+    assert_frames_differ(
+        "the linear half's texel moved the frame",
+        &base,
+        &linear_frame,
+    );
+    eprintln!(
+        "R45 two static textures: attachment {width}x{height} — red is the nearest half's texel \
+         (6, 3) and blue the linear half's (2, 3), moving either moved its own channel, and \
+         provider and engine agree byte for byte; {} AIR samplers against {} declarations is the \
+         pairing the registration admits",
+        stages.sampler_family.statics.len(),
+        stages.fragment_texture_declarations.len(),
     );
 }

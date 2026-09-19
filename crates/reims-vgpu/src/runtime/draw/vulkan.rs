@@ -11419,6 +11419,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .collect::<Vec<_>>()
                         .into(),
                     statics: resolved.sampler_family.statics.clone(),
+                    // R45: the AIR samplers whose own state is outside the
+                    // family, in the same Metal numbering — the relocation
+                    // moves device bindings, and these are Metal indices, so
+                    // the list travels unchanged like the pairing below.
+                    outside_family_statics: resolved.sampler_family.outside_family_statics.clone(),
                     // The pairing is a fact of the module's own sample sites,
                     // not of the device binding band the relocation moves, so
                     // the answer travels unchanged (R37).
