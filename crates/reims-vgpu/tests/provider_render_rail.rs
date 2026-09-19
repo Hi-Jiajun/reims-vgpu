@@ -18295,6 +18295,417 @@ fn an_index_stream_in_a_registered_window_leaves_without_a_copy() {
     );
 }
 
+/// R47: an affine stage-buffer proof is evaluated over the index view the draw
+/// actually binds — the staged bytes, or the one registered window a zero-copy
+/// index bind was cut from.
+///
+/// fp19's shape is the reading this increment answers: a draw whose *vertex*
+/// stage declares an affine `[[buffer(n)]]` argument (the R46 pair's
+/// `positions[vertex_id]`, seven declarations beside the fragment half's six)
+/// arrives with a `BufferContent::GuestRuns` index view, because the draw path
+/// resolves an index buffer through the same zero-copy rail a vertex stream
+/// takes (R11). The proof had no count to evaluate and held the whole family
+/// under `stage_buffer_footprint` — 94 rows of that round, 25 of them
+/// byte-identical to the count rule's own v39 shapes. The bytes were readable
+/// all along: the window is the one the index stream itself travels as, so the
+/// reader this rail already owns hands the proof `host_va + head` for
+/// `bytes_len` bytes — the range the borrowed lease resolves to and the R18
+/// copy arm states.
+///
+/// Three readings, one battery:
+///
+/// - the draw reaches the provider and its frame is the engine's own frame byte
+///   for byte, with the pair's thirteen declarations unchanged;
+/// - the proof is *falsifiable over the window's own bytes*: raising the highest
+///   index the owner's mapping holds moves the count the gate proves past the
+///   positions bind, and the same draw answers `stage_buffer_short` by name with
+///   no submission — a count read from anywhere but this window would not move;
+/// - zeroing that mapping instead leaves the count inside the bind and
+///   degenerates the triangle, which is the reading that says the provider drew
+///   the owner's own bytes rather than a copy this rail made.
+#[test]
+fn an_affine_stage_buffer_is_proved_over_the_window_a_zero_copy_index_view_names() {
+    use reims_vgpu::backend::provider_compute::{device_epoch, host_import_alignment};
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let stages = per_stage_ceiling_stages();
+    assert!(
+        matches!(
+            stages.vertex_stage_buffer_declarations[0].footprint,
+            StageBufferFootprint::Affine { .. }
+        ),
+        "the fixture's first vertex declaration is the affine positions reach: {:#?}",
+        stages.vertex_stage_buffer_declarations[0]
+    );
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "this device must advertise VK_EXT_external_memory_host for the no-copy arm"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let guest = || {
+        let anchor = import
+            .slice(0, page as u64)
+            .expect("the first granule is inside the import");
+        GuestRef::new(std::sync::Arc::clone(&import), anchor)
+            .expect("the slice came from this import")
+    };
+    let import_id = import.id().get();
+    let base = owner.pointer as usize;
+    // The three indices the draw reads, written into the owner's own mapping.
+    owner.as_mut_slice()[..INDEX_BYTES.len()].copy_from_slice(&INDEX_BYTES);
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: base as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    // The index bind as the draw path builds it: one host run over the owner's
+    // mapping, the three `u32` indices at its start, and the provider-shaped
+    // window the registration ledger derived on the run.
+    let indices = || engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            base,
+            2 * page as u64,
+            0,
+            INDEX_BYTES.len() as u64,
+        )
+        .expect("the bind's own bytes are inside the mapping")]),
+        source_offset: 0,
+        total_len: INDEX_BYTES.len() as u64,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+            window_offset: 0,
+            guest: guest(),
+            window: Some(registered),
+        }])),
+        direct_image: None,
+    };
+
+    // The pair's own payloads, exactly as the R46 battery states them: the
+    // affine positions argument carries the screen triangle, the six offsets
+    // are zero, and the fragment half's six `float4`s sum into the colour.
+    let ordinary = 20.0f32 / 255.0f32;
+    let fragment_declarations = stages.fragment_stage_buffer_declarations.len();
+    let payloads: Vec<BufferContent> = (0..fragment_declarations)
+        .map(|_| {
+            let mut bytes = Vec::with_capacity(16);
+            for _ in 0..4 {
+                bytes.extend_from_slice(&ordinary.to_ne_bytes());
+            }
+            BufferContent::Bytes(std::sync::Arc::new(bytes))
+        })
+        .collect();
+    let mut vertex: Vec<BufferContent> = vec![BufferContent::Bytes(std::sync::Arc::new(f32x2(
+        &PER_STAGE_SCREEN,
+    )))];
+    for _ in 1..stages.vertex_stage_buffer_declarations.len() {
+        vertex.push(BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])));
+    }
+    let binds = per_stage_binds(&vertex, &payloads);
+    let request = |content: BufferContent| -> DrawRequest {
+        let mut req = per_stage_request(&vertex, &payloads);
+        req.indexed = Some(IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            content,
+        });
+        req
+    };
+    // The engine's own frame for the same request, before anything is
+    // registered on the owner rail: the engine's device context is created
+    // lazily on its first draw and that creation resets the owner rail, so the
+    // registration below has to follow it. The two modules are the ones the
+    // seam hands the engine — translated by this crate's own translator, with
+    // the buffer band's collision relocation (`buf_collide`) the production
+    // seam applies to the fragment half.
+    let cached = |stage| {
+        reims_vgpu::runtime::m2v_cache::translate_cached_reflected(
+            match stage {
+                metal2vulkan::passes::Stage::Vertex => stages.air.0.as_slice(),
+                metal2vulkan::passes::Stage::Fragment => stages.air.1.as_slice(),
+                metal2vulkan::passes::Stage::Kernel => unreachable!("render stages only"),
+            },
+            stage,
+            0,
+        )
+        .expect("the fixture translates")
+    };
+    let engine_frame = || -> Option<Vec<u8>> {
+        let mut req = request(BufferContent::GuestRuns(indices()));
+        req.vert_spirv = std::sync::Arc::new(
+            (*cached(metal2vulkan::passes::Stage::Vertex)
+                .variant(false, false)
+                .words)
+                .clone(),
+        );
+        req.frag_spirv = std::sync::Arc::new(
+            (*cached(metal2vulkan::passes::Stage::Fragment)
+                .variant(false, true)
+                .words)
+                .clone(),
+        );
+        engine_pixels_prepared("affine stage buffer over a window index", &req)
+    };
+    let Some(engine) = engine_frame() else {
+        return;
+    };
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: base,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x40_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+
+    let delivered = provider_render::provider_submissions();
+    let provider = |label: &str| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(BufferContent::GuestRuns(indices())),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: an affine stage buffer proved over the index window the draw binds \
+                 reaches the canonical provider: {other:?}"
+            ),
+        }
+    };
+
+    let reviewed = provider("affine stage buffer, window index");
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
+    assert_texel_count("affine stage buffer, window index", &reviewed);
+    eprintln!(
+        "window index affine: provider submissions {delivered} -> {}, alignment {alignment}, \
+         window {page} byte(s) of registration {import_id}",
+        provider_render::provider_submissions(),
+    );
+    assert_frames_equal(
+        "affine stage buffer over a window index, both rails",
+        &reviewed,
+        &engine,
+    );
+
+    // Reading one: the count is the window's own. An index that names vertex 4
+    // puts the affine reach at `8 + 4 * 8 = 40` bytes over the 24-byte positions
+    // bind, so the gate answers the short-bind bucket by name — and no
+    // submission follows a refusal.
+    owner.as_mut_slice()[..INDEX_BYTES.len()].copy_from_slice(&[
+        0, 0, 0, 0, //
+        1, 0, 0, 0, //
+        4, 0, 0, 0, //
+    ]);
+    let refused_before = provider_render::provider_submissions();
+    match provider_render::submit_render(
+        &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+        &request(BufferContent::GuestRuns(indices())),
+    ) {
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            eprintln!("door: {reason}");
+            assert_eq!(
+                reason.slug(),
+                "render_provider_out_of_class_stage_buffer_short",
+                "the count the window states is what the proof is weighed against: {reason}"
+            );
+            assert!(
+                reason.detail().contains("reaches 40 byte(s)")
+                    && reason.detail().contains("binds 24 byte(s)"),
+                "the sentence names both extents, and 40 is `base + size + (5 - 1) * stride`: {}",
+                reason.detail()
+            );
+        }
+        other => panic!("a count past the positions bind stays on the engine: {other:?}"),
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        refused_before,
+        "a refused proof never reaches the provider"
+    );
+
+    // Reading two: the provider drew the owner's own bytes. Every index becomes
+    // zero, the triangle degenerates, and the attachment keeps the clear's
+    // bytes — a rail that had bounded the proof on a copy, or on a count of its
+    // own, would be unmoved by this.
+    owner.as_mut_slice()[..INDEX_BYTES.len()].fill(0);
+    let degenerated = provider("window index, indices rewritten to zero");
+    let (width, _) = extent();
+    for (x, y) in [(0, 0), (width - 1, 0)] {
+        assert_eq!(
+            texel_at(&degenerated, x, y),
+            [64, 128, 191, 255],
+            "a texel the degenerate draw does not cover keeps the clear sentinel ({x}, {y})"
+        );
+    }
+    assert_frames_differ(
+        "the owner's own index bytes decide what this proof and frame are about",
+        &reviewed,
+        &degenerated,
+    );
+}
+
+/// R47's fail-closed half: an index view this rail has no source for keeps the
+/// draw on the engine **by name**, with no submission behind it.
+///
+/// The two facts are the two the index stream itself answers
+/// (`index_staging`): a gather no one registered window covers — the reading
+/// the ledger leaves when it derived no window at all — and a window whose
+/// bytes the owner rail will not hand back. The second is the one R47 adds to
+/// this bucket: the proof needs the bytes the *view* reads, and a registration
+/// that does not hold them is a count nothing states. Answered rather than
+/// skipped, because the alternative is not a guess but a lost draw: the owner
+/// plan would refuse the same window later, and a provider decline on an
+/// in-class draw is a frame nobody lands.
+#[test]
+fn an_affine_stage_buffer_keeps_the_engine_when_the_index_window_cannot_be_read() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+    use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
+    use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
+
+    let _guard = engine_test_session();
+    let stages = per_stage_ceiling_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    assert!(
+        alignment > 0,
+        "the refusal half needs the no-copy device too"
+    );
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let owner = AlignedHost::new(2 * page, page);
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let slice = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = || {
+        GuestRef::new(std::sync::Arc::clone(&import), slice)
+            .expect("the slice came from this import")
+    };
+    let base = owner.pointer as usize;
+    // The window the ledger would have derived — with an import the owner rail
+    // was deliberately never handed, which is the registration that cannot
+    // answer for these bytes.
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: base as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let gather = |pages: Vec<GuestWindowRun>| -> engine::GuestRunSource {
+        engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                base,
+                2 * page as u64,
+                0,
+                INDEX_BYTES.len() as u64,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: INDEX_BYTES.len() as u64,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(pages)),
+            direct_image: None,
+        }
+    };
+    let ordinary = 20.0f32 / 255.0f32;
+    let payloads: Vec<BufferContent> = (0..stages.fragment_stage_buffer_declarations.len())
+        .map(|_| {
+            let mut bytes = Vec::with_capacity(16);
+            for _ in 0..4 {
+                bytes.extend_from_slice(&ordinary.to_ne_bytes());
+            }
+            BufferContent::Bytes(std::sync::Arc::new(bytes))
+        })
+        .collect();
+    let mut vertex: Vec<BufferContent> = vec![BufferContent::Bytes(std::sync::Arc::new(f32x2(
+        &PER_STAGE_SCREEN,
+    )))];
+    for _ in 1..stages.vertex_stage_buffer_declarations.len() {
+        vertex.push(BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])));
+    }
+    let binds = per_stage_binds(&vertex, &payloads);
+    let request = |source: &engine::GuestRunSource| -> DrawRequest {
+        let mut req = per_stage_request(&vertex, &payloads);
+        req.indexed = Some(IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            content: BufferContent::GuestRuns(source.clone()),
+        });
+        req
+    };
+    let delivered = provider_render::provider_submissions();
+    let staging_before = route_count("render_provider_out_of_class_index_staging");
+    let answer = |label: &str, source: &engine::GuestRunSource| -> (String, String) {
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(source),
+        ) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                (reason.slug().to_owned(), reason.detail().to_owned())
+            }
+            other => panic!("{label}: an index view with no source is out of class: {other:?}"),
+        }
+    };
+
+    // The ledger derived no window for this run: the gather is not one
+    // registered window, which is the shape this bucket has always answered.
+    let unwindowed = gather(vec![GuestWindowRun {
+        window_offset: 0,
+        guest: guest(),
+        window: None,
+    }]);
+    let (slug, detail) = answer("index run without a window", &unwindowed);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_index_staging");
+    assert!(
+        detail.contains("not one registered window"),
+        "the sentence is the index stream's own: {detail}"
+    );
+
+    // The window exists, and the registration that names it does not hold the
+    // bytes: the proof of an affine footprint may not be bounded on the count
+    // this rail cannot read, so the draw keeps the engine under the same bucket
+    // with the owner rail's own refusal quoted.
+    let unreadable = gather(vec![GuestWindowRun {
+        window_offset: 0,
+        guest: guest(),
+        window: Some(registered),
+    }]);
+    let (slug, detail) = answer("index window the owner rail cannot read", &unreadable);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_index_staging");
+    assert!(
+        detail.contains("cannot be read out of the registration that names it")
+            && detail.contains("owner_unregistered_region"),
+        "the sentence names the read and the owner rail's own refusal: {detail}"
+    );
+
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "a refused index view never reaches the provider"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_index_staging"),
+        staging_before + 2,
+        "both facts are charged to the index stream's own bucket"
+    );
+}
+
 /// R18: the index half of the same answer — a dust-sized stream, read once, and
 /// the arm where the extra copy costs least.
 ///
