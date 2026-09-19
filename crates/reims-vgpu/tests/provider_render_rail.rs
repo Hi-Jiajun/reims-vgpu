@@ -1064,6 +1064,15 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // handoff admits a packet.
         chain_keeps_frame: false,
         chain_loads_resident: false,
+        // R42c: no promise travels with a relayed load unless a test states the
+        // pair the walk carried from the record before it — the shapes
+        // [`inputs_relay`]'s surface battery drives. `None` is fail-closed: the
+        // class refuses a mapper-ref-texture surface's relayed load whose token
+        // is unstated, exactly as it refused every one of them before R42c.
+        chain_resident_attachment: None,
+        // R42c: the promise the *keeper* is admitted against, stated by the same
+        // battery for the record whose frame the walk would keep.
+        chain_resident_successor: None,
         // R23: no previous contents are handed over unless a test reads them
         // out of the engine's own registry and states them here — the shape
         // [`inputs_held_with_source`] drives.
@@ -1220,6 +1229,30 @@ fn inputs_relay<'a>(
         chain_keeps_frame: keeps,
         chain_loads_resident: loads,
         ..inputs_held(stages, role)
+    }
+}
+
+/// R42c: [`inputs_relay`] with the promise both ends of a relay link are
+/// admitted against stated, as the walk states them for a mapper-ref-texture
+/// surface target.
+///
+/// `attachment` is the pair the frame this record begins from is kept under
+/// (stated by a loading record) and `successor` is the pair the record *after*
+/// this one promised to load its frame under (stated by the record whose frame
+/// is kept). Both are `None` for the shapes [`inputs_relay`] drives — the
+/// pre-R42c answer, and every shape in this file whose target is not a surface.
+fn inputs_relay_surface<'a>(
+    stages: &'a Stages,
+    role: RenderChainRole,
+    keeps: bool,
+    loads: bool,
+    attachment: Option<(u64, u64)>,
+    successor: Option<(u64, u64)>,
+) -> RenderRailInputs<'a> {
+    RenderRailInputs {
+        chain_resident_attachment: attachment,
+        chain_resident_successor: successor,
+        ..inputs_relay(stages, role, keeps, loads)
     }
 }
 
@@ -3516,12 +3549,18 @@ fn half_of(width: u32) -> u32 {
 /// drives both rails through their own identities is driving the same guest
 /// target through both.
 fn surface_identity(id: u32) -> engine::TargetIdentity {
+    surface_identity_at(id, 1)
+}
+
+/// The same surface one mapping generation later — the guest's own re-map, and
+/// the one event that mints another image under a relayed load (R42c).
+fn surface_identity_at(id: u32, generation: u64) -> engine::TargetIdentity {
     let (width, height) = extent();
     engine::TargetIdentity::Surface {
         id,
         width,
         height,
-        generation: 1,
+        generation,
         format: ash::vk::Format::R8G8B8A8_UNORM,
     }
 }
@@ -4204,6 +4243,302 @@ fn the_relay_keeps_no_frame_where_the_load_is_the_seed_windows_runs() {
             "nothing wrote the guest's pages for a record that publishes its frame"
         );
     }
+}
+
+/// R42c: the relay link on the one namespace whose identity can move under a
+/// packet — a mapper-ref-texture **surface**, whose identity carries the
+/// mapping's own generation.
+///
+/// R42 refused every relayed load on a surface by name, because the walk's
+/// promise is written against the image the record before it stored and a
+/// surface the guest re-maps mints another image under the load. The image is
+/// nameable: this rail mints one `(allocation, view)` pair per identity and
+/// never reuses one, so the pair the record before it *reported* is the
+/// surface's generation token — and the load is admitted exactly while the
+/// record's own identity still mints it. This drives the admitted link end to
+/// end, in the production capability state (`resident_frames_fetchable:
+/// false`), which is the only state in which the relay is what funds a kept
+/// frame.
+#[test]
+fn a_surface_relay_link_is_admitted_under_the_pair_the_walk_carried() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let identity = surface_identity(0x42_c0_01);
+    let attachment = provider_render::resident_attachment(&identity);
+    let promise = (attachment.allocation.get(), attachment.view.get());
+    let submissions_before = provider_render::provider_submissions();
+
+    // 1. The head: its frame has exactly one reader — the record after it — and
+    //    the walk proves it by having asked that record's own class first. That
+    //    probe reported this pair, which is what the keeper re-states here.
+    let head = resident_seed_request(&identity);
+    let head_inputs = inputs_relay_surface(
+        &stages,
+        RenderChainRole::Head,
+        true,
+        false,
+        None,
+        Some(promise),
+    );
+    assert_eq!(
+        provider_render::render_class_probe(&head_inputs, &head),
+        provider_render::RenderClassProbe::InClass,
+        "a surface head whose successor's probe named this image is in class"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before,
+        "the probe reaches no provider submission"
+    );
+    let stores_before = route_count("render_provider_resident_store");
+    let kept_before = route_count("render_provider_relay_surface_kept");
+    let frame = match provider_render::submit_render(&head_inputs, &head) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => frame,
+        other => panic!("the relay's surface head keeps its frame: {other:?}"),
+    };
+    assert_eq!(
+        frame.attachment, attachment,
+        "the frame stayed under the identity the promise named"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        1,
+        "the promise turns the published answer into a kept one on a surface target too"
+    );
+    assert_eq!(
+        route_count("render_provider_relay_surface_kept") - kept_before,
+        1,
+        "the keep is counted under the surface's own name, where the census reads it"
+    );
+
+    // 2. The record after it, in the shape the walk admitted: it begins from
+    //    that image — stated as the very pair the head reported — and publishes
+    //    what it composites, which is the frame the guest's own Store lands.
+    let chained = resident_load_request(&identity, true);
+    let loads_before = route_count("render_provider_resident_load");
+    let admitted_before = route_count("render_provider_relay_surface_admitted");
+    let published = match provider_render::submit_render(
+        &inputs_relay_surface(
+            &stages,
+            RenderChainRole::SoleOrTail,
+            false,
+            true,
+            Some(promise),
+            None,
+        ),
+        &chained,
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("a surface relay load whose token names this image is in class: {other:?}"),
+    };
+    assert_eq!(
+        route_count("render_provider_resident_load") - loads_before,
+        1,
+        "the record after it began from the provider's own image"
+    );
+    assert_eq!(
+        route_count("render_provider_relay_surface_admitted") - admitted_before,
+        1,
+        "the admitted surface relay link is counted where the refusal used to stand"
+    );
+    assert_texel_count("surface relay (provider)", &published);
+    assert_texel_near(
+        "surface relay: the last texel inside the rectangle",
+        texel_at(&published, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&published, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the frame the head kept: a relay that dropped it, or that \
+             read another image, lands another colour here",
+            height / 2,
+        );
+    }
+}
+
+/// R42c, the other side of the same equality: a token that names **another
+/// image** — the surface one mapping generation on — keeps R42's own answer,
+/// and the lookup that would have submitted the load never happens.
+///
+/// Two fail-closed halves: the moved generation (the token is another pair) and
+/// no token at all (the caller has not proved the promise). Both answer under
+/// the slug and sentence R42 gave this shape, so the census keeps reading one
+/// bucket, and neither reaches the provider — which is the whole difference
+/// from fp4/fp6, where the same movement was found by the canonical admission
+/// *after* the packet's remaining records were committed (1 402 and 1 668
+/// skipped draws).
+#[test]
+fn a_surface_relay_load_whose_token_names_another_image_keeps_its_name() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let identity = surface_identity(0x42_c0_02);
+    let moved = surface_identity_at(0x42_c0_02, 2);
+    let current = provider_render::resident_attachment(&identity);
+    let remapped = provider_render::resident_attachment(&moved);
+    assert_ne!(
+        (current.allocation.get(), current.view.get()),
+        (remapped.allocation.get(), remapped.view.get()),
+        "a re-map mints another image: this is what makes the pair a token"
+    );
+
+    let load = resident_load_request(&identity, true);
+    let submissions_before = provider_render::provider_submissions();
+    let admitted_before = route_count("render_provider_relay_surface_admitted");
+    let refused_before = route_count("render_provider_out_of_class_relay_surface");
+    for (label, token) in [
+        (
+            "the surface one generation on",
+            Some((remapped.allocation.get(), remapped.view.get())),
+        ),
+        ("no token at all", None),
+    ] {
+        let inputs = inputs_relay_surface(
+            &stages,
+            RenderChainRole::SoleOrTail,
+            false,
+            true,
+            token,
+            None,
+        );
+        assert_eq!(
+            provider_render::render_class_probe(&inputs, &load),
+            provider_render::RenderClassProbe::OutOfClass,
+            "a relayed surface load with {label} is not the class's"
+        );
+        match provider_render::submit_render(&inputs, &load) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_relay_surface",
+                    "the name R42 gave this shape, unchanged: {reason}"
+                );
+                assert!(
+                    reason
+                        .detail()
+                        .contains("identity generation can move under the packet"),
+                    "the sentence R42 gave this shape, unchanged: {reason}"
+                );
+            }
+            other => panic!("a relayed surface load with {label} is refused by name: {other:?}"),
+        }
+    }
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before,
+        "neither refusal reaches the provider: the movement is found before the submission, \
+         which is the one thing fp4 and fp6 could not say"
+    );
+    assert_eq!(
+        route_count("render_provider_relay_surface_admitted") - admitted_before,
+        0,
+        "a refused link is not counted as admitted"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_relay_surface") - refused_before,
+        4,
+        "each refused link answers twice (the walk's probe and the submission it stands for), \
+         under R42's own name"
+    );
+
+    // The control: the token is asked of the *surface* namespace, and no other
+    // identity's relayed load is touched by it. A GVA target's load states the
+    // same `load_from_target` shape and is answered exactly as it was.
+    let gva = gva_identity(0x42_c0_03, ash::vk::Format::R8G8B8A8_UNORM);
+    let elsewhere = provider_render::resident_attachment(&gva);
+    assert_eq!(
+        provider_render::render_class_probe(
+            &inputs_relay_surface(
+                &stages,
+                RenderChainRole::SoleOrTail,
+                false,
+                true,
+                Some((elsewhere.allocation.get(), elsewhere.view.get())),
+                None,
+            ),
+            &resident_load_request(&gva, true),
+        ),
+        provider_render::RenderClassProbe::InClass,
+        "a GVA relayed load does not answer to the surface's token"
+    );
+}
+
+/// R42c: keeping a frame is the moment the promise commits, so the keeper
+/// re-states it — and a successor's promise that names another image leaves the
+/// frame **published** rather than stranded.
+///
+/// This is the fail-closed half that costs nothing: the walk's promise is a
+/// prediction made before any record of the packet ran, so a surface the guest
+/// re-maps between that probe and this submission is answered the pre-R42 way
+/// (the frame travels back as bytes and the record after it begins from them)
+/// instead of leaving an image behind that the record after it can no longer
+/// name. Nothing is refused here and nothing is skipped — the one outcome R42's
+/// blanket refusal could not offer, because it closed the shape before the walk
+/// could make the frame reachable at all.
+#[test]
+fn a_surface_keeper_publishes_where_its_successor_named_another_image() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let identity = surface_identity(0x42_c0_04);
+    let moved = surface_identity_at(0x42_c0_04, 2);
+    let remapped = provider_render::resident_attachment(&moved);
+    let (width, height) = extent();
+
+    let head = resident_seed_request(&identity);
+    let stores_before = route_count("render_provider_resident_store");
+    let held_before = route_count("render_provider_publish_held_resident");
+    let kept_before = route_count("render_provider_relay_surface_kept");
+    let moved_before = route_count("render_provider_relay_surface_published_moved");
+    let inputs = inputs_relay_surface(
+        &stages,
+        RenderChainRole::Head,
+        true,
+        false,
+        None,
+        Some((remapped.allocation.get(), remapped.view.get())),
+    );
+    assert_eq!(
+        provider_render::render_class_probe(&inputs, &head),
+        provider_render::RenderClassProbe::InClass,
+        "the keeper is a shape the class answers; where its frame goes is the election"
+    );
+    let delivered = provider_render::provider_submissions();
+    match provider_render::submit_render(&inputs, &head) {
+        RenderRailOutcome::ProviderCompleted(out) => assert_eq!(
+            out.bytes.len(),
+            (u64::from(width) * u64::from(height) * 4) as usize,
+            "the frame comes back as bytes, at the attachment's own extent"
+        ),
+        other => panic!("a surface whose successor named another image publishes: {other:?}"),
+    }
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the record still reaches the canonical provider — this is not a refusal"
+    );
+    assert_eq!(
+        route_count("render_provider_resident_store") - stores_before,
+        0,
+        "no frame is kept for a promise the surface no longer mints"
+    );
+    assert_eq!(
+        route_count("render_provider_publish_held_resident") - held_before,
+        1,
+        "the answer is the published one the walk already knows how to consume"
+    );
+    assert_eq!(
+        route_count("render_provider_relay_surface_kept") - kept_before,
+        0,
+        "the frame is not kept: the surface no longer mints the image the promise named"
+    );
+    assert_eq!(
+        route_count("render_provider_relay_surface_published_moved") - moved_before,
+        2,
+        "the movement is counted under its own name, so a round can tell it from a refusal — \
+         once for the probe's own answer and once for the submission's, exactly as the refusal \
+         it replaces is counted"
+    );
 }
 
 /// R42: the probe and the submission are the same function, so they cannot

@@ -8269,6 +8269,46 @@ pub struct RenderRailInputs<'a> {
     /// [`Self::chain_keeps_frame`], and a record whose predecessor published
     /// its frame states neither.
     pub chain_loads_resident: bool,
+    /// The `(allocation, view)` pair the image this record begins from is kept
+    /// under — the promise a relayed load is admitted against (R42c).
+    ///
+    /// Stated exactly where [`Self::chain_loads_resident`] is, and read by the
+    /// class only for a **mapper-ref-texture surface** target, which is the one
+    /// identity namespace whose record can mint another image under a load
+    /// still in flight (the mapping's own generation moves with the guest's
+    /// re-map). The pair is a faithful token for that identity: this rail mints
+    /// one pair per [`TargetIdentity`] and never reuses one, so "the identity
+    /// still mints the pair the frame was kept under" and "the surface did not
+    /// move" are the same statement, and the comparison is one equality of two
+    /// scalars.
+    ///
+    /// * the **probe** states the pair the record *before* this one resolved to
+    ///   when its own probe answered (the walk's own record of that answer), and
+    ///   a probe that states none is refused: the promise is the whole reason
+    ///   the walk may keep anything for this record, so an unstated one is
+    ///   fail-closed rather than permissive;
+    /// * the **submission** states the pair the predecessor's own answer
+    ///   carried, which is also what `runtime::draw::vulkan` checks before the
+    ///   record is translated (the same equality, asked one layer up so a
+    ///   record whose identity moved never reaches the provider).
+    pub chain_resident_attachment: Option<(u64, u64)>,
+    /// The `(allocation, view)` pair the **next record of this packet**
+    /// promised to load this record's frame under (R42c).
+    ///
+    /// The mirror of [`Self::chain_resident_attachment`], stated for a record
+    /// whose frame is kept for the record after it:
+    /// [`Self::chain_keeps_frame`] is the walk's promise that the next record
+    /// will load this image, and the pair is the walk's own probe of that
+    /// record saying *which* image it will load. Keeping a frame is the last
+    /// moment before that promise commits, so a mapper-ref-texture surface
+    /// target re-states the promise here: the frame is kept only when this
+    /// record's own identity still mints the pair the next record named, and a
+    /// surface that moved between the walk and this submission is answered the
+    /// pre-R42 way — the frame is published and the next record begins from
+    /// those bytes — rather than keeping a frame the record after it can no
+    /// longer name. The check is an equality between values the caller already
+    /// holds; nothing is asked of the device and nothing is synchronized.
+    pub chain_resident_successor: Option<(u64, u64)>,
     /// The frame the record's own chain names, when the caller can read it out
     /// of the rail that holds it (R23).
     ///
@@ -12002,30 +12042,58 @@ fn narrow_class<'a>(
     // travels beside it and is counted under its own byte name rather than
     // inside the elision door's.
     let mut carried_seed_guest_window = false;
-    // R42: the relay's promise is about the image the record before it stored,
-    // and it holds only while the target's identity stands still for the
-    // packet's length. A mapper-ref-texture surface's identity carries the
-    // mapping's own *generation*, and the guest re-maps those surfaces while a
-    // packet's records are still to come: fp4 and fp6 both met that shape — the
-    // compositor's surface, at the boot's own mapping regeneration — three to
-    // four records whose trace the canonical admission refused
-    // (`resource_contract_invalid: unknown allocation`) and whose packets then
-    // lost their remaining draws (1 402 and 1 668
-    // `draws_skipped_after_engine_refusal`, against zero on the base round).
-    // A relayed *load* has no published form to fall back on, so the record is
-    // refused by name; the walk's own probe reads that as "keep nothing for
-    // this record", and the record before it publishes instead.
+    // R42's promise, re-validated (R42c): the frame this record begins from is
+    // the image the record before it stored, and that is true exactly while the
+    // mapper-ref-texture surface's own identity still mints the pair that frame
+    // was kept under. R42 wrote the promise against a surface whose generation
+    // the guest may advance between two records of one packet, so the *load*
+    // was refused by name whenever the surface was the target — a promise
+    // neither side could keep. The image is nameable after all: this rail mints
+    // one `(allocation, view)` pair per [`TargetIdentity`] and never reuses one,
+    // so the pair the caller carried from the record before it *is* the
+    // generation token, and the check is one equality against the pair this
+    // record's own identity mints right here.
+    //
+    // Fail-closed, and that is the whole rule: a caller that states no token
+    // has not proved the promise (the walk states one for every relayed load it
+    // probes, and the predecessor's own answer carries one for every
+    // submission), and a token that names another image is a surface that moved
+    // — fp4 and fp6 both met that shape at the boot's own mapping regeneration,
+    // three to four records whose trace the canonical admission refused
+    // (`resource_contract_invalid: unknown allocation`) after the packet's
+    // remaining records were already committed, 1 402 and 1 668
+    // `draws_skipped_after_engine_refusal` against zero on the base round. Both
+    // keep the class's own answer, sentence and slug unchanged: the record
+    // stays on the engine, the walk's probe reads that as "keep nothing for this
+    // record", and the record before it publishes instead.
+    //
+    // The check is scoped to the surface namespace because that is the one
+    // whose identity moves under a packet. Every other namespace's relay keeps
+    // the answer it had (R42's `chain_resident_identity_skew` guard in the seam
+    // is the same equality for those identities, asked before translation).
     if inputs.chain_loads_resident && relay_surface_target {
-        return Err(OutOfClass::new(
-            "render_provider_out_of_class_relay_surface",
-            "a relayed load from a mapper-ref-texture surface stays on the engine when the \
-             surface's own identity generation can move under the packet: the walk's promise is \
-             about the image the record before it stored, while a surface the guest re-maps \
-             between two records of one packet mints another identity — and so another image — \
-             under the load, which the canonical admission refuses by name \
-             (`resource_contract_invalid: unknown allocation`) after the packet's remaining \
-             records are already committed",
-        ));
+        let own = resident
+            .as_ref()
+            .map(|resident| (resident.allocation.get(), resident.view.get()));
+        if inputs.chain_resident_attachment.is_none() || inputs.chain_resident_attachment != own {
+            return Err(OutOfClass::new(
+                "render_provider_out_of_class_relay_surface",
+                "a relayed load from a mapper-ref-texture surface stays on the engine when the \
+                 surface's own identity generation can move under the packet: the walk's promise \
+                 is about the image the record before it stored, while a surface the guest \
+                 re-maps between two records of one packet mints another identity — and so \
+                 another image — under the load, which the canonical admission refuses by name \
+                 (`resource_contract_invalid: unknown allocation`) after the packet's remaining \
+                 records are already committed",
+            ));
+        }
+        // The population this increment moved, counted where the refusal above
+        // used to stand: one note per question asked about a surface relay
+        // (the walk's probe, and the submission the probe stood for), which is
+        // exactly the population `render_provider_out_of_class_relay_surface`
+        // counted before — so a reading of the two names side by side says how
+        // much of the bucket became in class rather than how much moved.
+        crate::runtime::drain::note_store_route("render_provider_relay_surface_admitted");
     }
     let load = if req.load_from_target {
         let Some(resident) = resident else {
@@ -12362,9 +12430,61 @@ fn narrow_class<'a>(
     // keep a frame whose attachment is the owner's registration. That flag is
     // `false` in production until R4b's byte channel lands, so R4b must keep
     // this rule when it flips it.
+    //
+    // R42c: the load-arm rule above is now the *whole* of that boundary — the
+    // surface's own namespace is no longer a second, blanket one. R42 kept no
+    // frame for a mapper-ref-texture surface at all, and its reason (the
+    // surface's generation can move under the packet) is answered where it is
+    // actually knowable: the load gate above re-validates the pair the frame is
+    // kept under, and the keeper re-states the promise here before it commits
+    // it. A surface record whose load is a run list still keeps nothing — like
+    // every other record whose attachment is the owner's registration — but a
+    // surface record whose load is this rail's own bytes, the guest's clear, or
+    // the frame the record before it kept names its attachment the way any
+    // other identity does, and for a surface that is the whole of the relay's
+    // population the census reads as `render_provider_out_of_class_relay_surface`
+    // (3 257 refusals in census v42, 22 of one window's 47 refused probes).
     let seed_is_guest_runs = matches!(load, NarrowLoad::GuestRuns(_));
+    // R42c: keeping a frame is the moment the promise commits, so the keeper
+    // re-states it against its own identity one last time. `chain_keeps_frame`
+    // is the walk's promise that the *next* record will load this image, and
+    // `chain_resident_successor` is that record's own probe saying which image
+    // it named — so a surface whose identity moved between the walk and this
+    // submission (the guest's own re-map, the one event R42 priced at 1 668
+    // abandoned draws) is not promised for: no frame is kept, the answer is the
+    // published one the walk already knows how to consume, and the record after
+    // it begins from those bytes instead of naming an image this record no
+    // longer stores. Fail-closed in the direction that cannot lose a draw: an
+    // unstated promise keeps nothing.
+    let relay_successor_promise = match (relay_surface_target, resident.as_ref()) {
+        (true, Some(resident)) => inputs
+            .chain_resident_successor
+            .is_some_and(|pair| pair == (resident.allocation.get(), resident.view.get())),
+        // The identity is the one thing a resident store cannot be named
+        // without; a record that names none is answered by the load gate's own
+        // refusal above rather than by a keep this election could not state.
+        (true, None) => false,
+        (false, _) => true,
+    };
     let relay_keeps_frame =
-        inputs.chain_keeps_frame && !relay_surface_target && !seed_is_guest_runs;
+        inputs.chain_keeps_frame && !seed_is_guest_runs && relay_successor_promise;
+    // The three answers a surface keeper can give, counted by name: the frame
+    // stays (the increment's own reading), the attachment is the owner's
+    // registration so no image of this rail can carry it (R42b's rule, the
+    // structural half of the population), or the surface no longer mints the
+    // image the record after it named (the movement R42 refused every surface
+    // for, answered here by publishing instead of by losing the packet). The
+    // counts only exist while the walk has stated a promise, so a packet it did
+    // not admit answers exactly as it did before.
+    if relay_surface_target && inputs.chain_keeps_frame {
+        crate::runtime::drain::note_store_route(if seed_is_guest_runs {
+            "render_provider_relay_surface_kept_on_engine_runs"
+        } else if relay_successor_promise {
+            "render_provider_relay_surface_kept"
+        } else {
+            "render_provider_relay_surface_published_moved"
+        });
+    }
     let keeps_frame =
         !seed_is_guest_runs && (inputs.resident_frames_fetchable || relay_keeps_frame);
     // Where this record's frame goes. A record that skipped its readback is one
