@@ -2397,6 +2397,375 @@ pub fn resident_sampled_content_replaced(identity: &TargetIdentity) -> bool {
         .is_some_and(|slot| slot.sampled_content_replaced)
 }
 
+/// Host channel order of a frame another rail landed in the guest's pages.
+///
+/// Named rather than a `bool` because the two orders are not a switch on the
+/// merge's own path: which one arrives is the landing rail's business, and the
+/// merge's job is to compare it with the image's own stored order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandedFrameOrder {
+    Bgra8,
+    Rgba8,
+}
+
+/// One four-byte colour frame a provider landing wrote into the guest's pages.
+///
+/// The bytes are tightly packed rows in [`Self::order`], the same shape the
+/// landing routes already carry for the host cache (`surface_cache::store_rows`
+/// reads exactly these). The merge either finds them already inside the image
+/// (the resident is the guest allocation itself) or uploads them.
+#[derive(Clone, Copy, Debug)]
+pub struct LandedFrame<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub order: LandedFrameOrder,
+    pub bytes: &'a [u8],
+}
+
+/// Why a landing could not be merged into this device's image under the same
+/// identity. Every arm leaves `sampled_content_replaced` standing, so the
+/// sampling ladder keeps the refusal it has today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandedFrameMergeMiss {
+    /// No registry slot for the identity: there is no image to make current,
+    /// and the ladder below reads the pages.
+    NoResident,
+    /// The slot exists but nothing has vouched for its pixels.
+    NotReady,
+    /// A multisampled image is not a frame a sampled bind reads.
+    Multisample,
+    /// The landing's geometry is not the image's.
+    Geometry,
+    /// The image does not store four-byte colour.
+    Format,
+    /// The landing's bytes are absent or shorter than its own geometry.
+    FrameBytes,
+    /// The upload itself could not be recorded or submitted.
+    Upload,
+}
+
+impl LandedFrameMergeMiss {
+    /// The name this refusal is counted under.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NoResident => "no_resident",
+            Self::NotReady => "not_ready",
+            Self::Multisample => "multisample",
+            Self::Geometry => "geometry",
+            Self::Format => "format",
+            Self::FrameBytes => "frame_bytes",
+            Self::Upload => "upload",
+        }
+    }
+}
+
+/// What merging one landed frame into this device's image under the same
+/// identity did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandedFrameMerge {
+    /// The image **is** the guest allocation the landing wrote, so the frame is
+    /// already in it and the merge cost no copy. The only arm that is correct
+    /// without bytes: a shared backing makes the landing's own write the
+    /// image's content.
+    Shared,
+    /// The frame was uploaded into the image.
+    Copied { bytes: u64 },
+    /// Nothing was merged; the caller keeps its refusal.
+    Missed(LandedFrameMergeMiss),
+}
+
+/// What one merge plan needs to know about the image it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LandedMergeTarget {
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    content_ready: bool,
+    guest_imported: bool,
+    /// The image's stored channel order, from `ResidentTargetSlot::scanout_order`.
+    bgra: bool,
+    /// Whether the image's declared format stores four-byte colour.
+    four_byte_color: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandedMergePlan {
+    Shared,
+    Upload { swap_rb: bool, bytes: u64 },
+}
+
+/// Whether the plan a landing merges under is a shared backing, an upload, or a
+/// refusal — decided without a device, so the fail-closed arms are unit-testable.
+///
+/// The order of the checks is the order of the questions: an image that is not
+/// this surface's at all (absent, unvouched, multisampled) is refused before
+/// its geometry is compared, and a shared backing is answered before the bytes
+/// are read, because a guest-imported image contains the landing by
+/// construction and needs none.
+fn landed_merge_plan(
+    target: LandedMergeTarget,
+    frame: &LandedFrame<'_>,
+) -> Result<LandedMergePlan, LandedFrameMergeMiss> {
+    if !target.content_ready {
+        return Err(LandedFrameMergeMiss::NotReady);
+    }
+    if target.sample_count != 1 {
+        return Err(LandedFrameMergeMiss::Multisample);
+    }
+    if frame.width != target.width || frame.height != target.height || frame.width == 0 {
+        return Err(LandedFrameMergeMiss::Geometry);
+    }
+    if target.guest_imported {
+        return Ok(LandedMergePlan::Shared);
+    }
+    if !target.four_byte_color {
+        return Err(LandedFrameMergeMiss::Format);
+    }
+    let needed = u64::from(frame.width)
+        .saturating_mul(u64::from(frame.height))
+        .saturating_mul(4);
+    if u64::try_from(frame.bytes.len()).unwrap_or(u64::MAX) < needed {
+        return Err(LandedFrameMergeMiss::FrameBytes);
+    }
+    Ok(LandedMergePlan::Upload {
+        swap_rb: (frame.order == LandedFrameOrder::Bgra8) != target.bgra,
+        bytes: needed,
+    })
+}
+
+/// Whether a resident's declared format stores four-byte colour, which is the
+/// only family a landed BGRA8/RGBA8 frame can be written into.
+fn landable_resident_format(format: ash::vk::Format) -> bool {
+    use ash::vk::Format;
+    matches!(
+        format,
+        Format::B8G8R8A8_UNORM
+            | Format::B8G8R8A8_SRGB
+            | Format::R8G8B8A8_UNORM
+            | Format::R8G8B8A8_SRGB
+    )
+}
+
+/// Merge a frame a provider landing wrote into the guest's pages back into this
+/// device's own image under the same identity, and clear the sampling-side
+/// refusal that landing recorded.
+///
+/// The failure mode this closes is one-sided by construction: the landing's
+/// frame is complete in the guest's pages and the host cache, while the image
+/// under the same identity still holds the frame the *engine* last drew. The
+/// sampling ladder binds that image in preference to every rung below it, so
+/// without this merge it must refuse the image outright (R46's
+/// `sampled_content_replaced`) — which serves every engine-drawn layer and none
+/// of the provider's. Merging makes the image the surface's current content
+/// again, and the ladder serves it with both.
+///
+/// # The entry this records on
+///
+/// The copy is a transfer command that is not part of any draw, so it needs an
+/// entry of its own — and an entry whose command buffer is *recording*. This
+/// merge claims its entry the way every other transfer rail in this file does,
+/// and for the same two reasons:
+///
+/// * an open batch is ridden rather than flushed, so the copy lands in the same
+///   submission as the draws it has to follow (`read_target_inner`'s
+///   `appended` arm, and its comment on why that is one submission and not
+///   two);
+/// * a CB a ring slot hands back is **retired, not recording** — `begin_entry`
+///   ends whatever pass the slot's last entry left and returns the CB for its
+///   *next* user to reset and begin. `begin_slot_recording` is that reset plus
+///   begin, and skipping it records into a command buffer in the executable
+///   state: a Vulkan state violation the software rail's driver tolerates and
+///   a real one faults on (this rail's `fp20`/`b2` rounds, 2026-09-19).
+///
+/// The staging slot is acquired **after** that decision, for the reason
+/// `copy_image_level0_to_host` states where it takes its own: `begin_entry`
+/// submits the open batch, so a slot acquired ahead of it is sealed into *that*
+/// submission's cleanup and returned to the free list under a copy this entry
+/// has not recorded yet.
+///
+/// Fail-closed on every miss: the refusal stands, and the ladder keeps reading
+/// the guest's pages exactly as it does today. A merge that cannot be recorded
+/// or submitted is [`LandedFrameMergeMiss::Upload`], never a silent success.
+pub fn merge_landed_frame_into_resident(
+    identity: &TargetIdentity,
+    frame: LandedFrame<'_>,
+) -> LandedFrameMerge {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ..
+    } = &mut *guard;
+    let Some(slot) = pools.registry_get(identity) else {
+        return LandedFrameMerge::Missed(LandedFrameMergeMiss::NoResident);
+    };
+    let target = LandedMergeTarget {
+        width: slot.width,
+        height: slot.height,
+        sample_count: slot.sample_count,
+        content_ready: slot.content_ready,
+        guest_imported: slot.memory.is_guest_imported(),
+        bgra: slot.scanout_order(),
+        four_byte_color: landable_resident_format(slot.format.declared()),
+    };
+    let plan = match landed_merge_plan(target, &frame) {
+        Ok(plan) => plan,
+        Err(miss) => return LandedFrameMerge::Missed(miss),
+    };
+    let LandedMergePlan::Upload { swap_rb, bytes } = plan else {
+        // The image is the allocation the landing wrote. There is nothing to
+        // copy and nothing to check: the landing's own write is the content.
+        pools.registry_clear_sampled_content_replaced(identity);
+        return LandedFrameMerge::Shared;
+    };
+    let Some((image, access, guest_imported)) = pools
+        .registry_get(identity)
+        .map(|slot| (slot.image, slot.access, slot.memory.is_guest_imported()))
+    else {
+        return LandedFrameMerge::Missed(LandedFrameMergeMiss::NoResident);
+    };
+    let ctx = match owner.ensure(counters) {
+        Ok(ctx) => ctx,
+        Err(_) => return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload),
+    };
+    unsafe {
+        if pools.ensure_init(ctx, counters).is_err() {
+            return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+        }
+    }
+    // The entry is claimed **before** the staging slot is acquired, and the
+    // copy rides the open batch when there is one — the two together are what
+    // make the recording legal and the slot's life as long as the copy that
+    // reads it. A `vkCommandBuffer` handed back by `begin_entry` is retired, not
+    // recording: recording into it without `begin_slot_recording` is the
+    // executable state's CB being written to, which the software rail's tests
+    // accept and a real driver's does not. And a slot acquired *ahead* of
+    // `begin_entry` is sealed into whatever batch that call flushes, so the
+    // fence of a submission this copy is not in returns it to the free list
+    // underneath the copy — `copy_image_level0_to_host` acquires its slots
+    // after the same flush for the same reason.
+    let appended = pools.batch_open_recording();
+    let (cb, fence) = match appended {
+        // A batch's CB is still recording and holds the draws this copy must
+        // follow; appending is what puts the copy in their own submission
+        // instead of paying a second one, exactly as the readback rail does.
+        Some(pair) => pair,
+        None => {
+            let (cb, fence) = match unsafe { pools.begin_entry(ctx, counters) } {
+                Ok(pair) => pair,
+                Err(_) => return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload),
+            };
+            let begun = unsafe {
+                pools.begin_slot_recording(
+                    ctx,
+                    cb,
+                    gpu_span::Kind::Store,
+                    VkOp::MergeResetCb,
+                    VkOp::MergeBeginCb,
+                )
+            };
+            if let Err(e) = begun {
+                crate::observe::fail(format!("vk_engine_merge_reset {e}"));
+                return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+            }
+            (cb, fence)
+        }
+    };
+    // A deferred draw may have left its render pass standing in this same
+    // command buffer, and both commands below are outside-pass commands.
+    unsafe { pools.close_open_pass(&ctx.device, cb) };
+    let staging = match unsafe { pools.acquire_staging(ctx, bytes, counters) } {
+        Ok(slot) => slot,
+        Err(_) => return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload),
+    };
+    let pixels = &frame.bytes[..bytes as usize];
+    let written = unsafe {
+        if swap_rb {
+            pools.write_staging_swap_rb(ctx, &staging, pixels)
+        } else {
+            pools.write_staging(ctx, &staging, pixels)
+        }
+    };
+    if written.is_err() {
+        return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+    }
+    // One barrier carries both halves of the transfer: the layout the image
+    // rests in (`access.layout()`, whatever the last rail to touch it left) to
+    // the one the copy writes in, and the source scope that orders this write
+    // after that touch. `GENERAL` doubles as the sampled read's own layout
+    // under the unified colour layout, so the copy both lands the frame and
+    // leaves the image where the ladder's barrier expects to find it.
+    let next = pools::ResidentAccess::transfer_write(guest_imported);
+    let (src_stage, src_access) = access.source_scope();
+    unsafe {
+        let barrier = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(access.layout())
+            .new_layout(next.layout())
+            .image(image)
+            .subresource_range(color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            src_stage,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            feedback_transition_dependency(access.layout()),
+            &[],
+            &[],
+            &barrier,
+        );
+        let copy = [ash::vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(color_subresource_layers())
+            .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(ash::vk::Extent3D {
+                width: target.width,
+                height: target.height,
+                depth: 1,
+            })];
+        ctx.device
+            .cmd_copy_buffer_to_image(cb, staging.buffer, image, next.layout(), &copy);
+    }
+    if appended.is_some() {
+        // The batch's own flush ends and submits the CB, and seals the cleanup
+        // this copy's staging slot is in — one submission for the draws and the
+        // copy together, which is the whole reason to ride the batch.
+        if unsafe { pools.batch_flush(ctx, counters) }.is_err() {
+            return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+        }
+    } else {
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
+        let end = unsafe { ctx.device.end_command_buffer(cb) }
+            .map_err(|e| VkCall::new(VkOp::MergeEndCb, e));
+        if let Err(e) = end {
+            crate::observe::fail(format!("vk_engine_merge {e}"));
+            return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+        }
+        let command_buffers = [cb];
+        let token = match unsafe { ctx.submit_guest_work(&command_buffers, fence) } {
+            Ok(token) => token,
+            Err(e) => {
+                crate::observe::fail(format!(
+                    "vk_engine_merge {}",
+                    VkCall::new(VkOp::MergeSubmit, e)
+                ));
+                return LandedFrameMerge::Missed(LandedFrameMergeMiss::Upload);
+            }
+        };
+        let sealed = pools.seal_entry(Vec::new(), Vec::new());
+        unsafe { pools.finish_entry_async(&ctx.device, sealed, token) };
+    }
+    // Once the submission exists, the image's own record says a transfer wrote
+    // it and the sampling-side refusal is answered. Both are registry writes
+    // under the same engine lock, so no draw can bind the image in between.
+    pools.registry_note_access(identity, next);
+    pools.registry_clear_sampled_content_replaced(identity);
+    LandedFrameMerge::Copied { bytes }
+}
+
 #[cfg(test)]
 mod resident_content_backing_tests {
     use super::*;
@@ -2419,6 +2788,175 @@ mod resident_content_backing_tests {
             classify_resident_content(false, false),
             ResidentContentBacking::NotReady
         );
+    }
+}
+
+/// The merge's decisions, one input at a time and without a device: these are
+/// the arms that decide whether a provider landing becomes the image's content
+/// or keeps the ladder's refusal, so every one of them is worth a stated
+/// answer rather than an argument at a call site.
+#[cfg(test)]
+mod landed_frame_merge_tests {
+    use super::*;
+
+    fn target() -> LandedMergeTarget {
+        LandedMergeTarget {
+            width: 4,
+            height: 2,
+            sample_count: 1,
+            content_ready: true,
+            guest_imported: false,
+            bgra: true,
+            four_byte_color: true,
+        }
+    }
+
+    fn frame(bytes: &[u8], order: LandedFrameOrder) -> LandedFrame<'_> {
+        LandedFrame {
+            width: 4,
+            height: 2,
+            order,
+            bytes,
+        }
+    }
+
+    /// The shared-backing arm is the one that needs no bytes: a guest-imported
+    /// image *is* the allocation the landing wrote, so the frame is already in
+    /// it. It is answered before the byte length is even read, which is why an
+    /// empty slice is not a refusal there.
+    #[test]
+    fn a_guest_backed_image_holds_the_landing_without_a_copy() {
+        let shared = LandedMergeTarget {
+            guest_imported: true,
+            ..target()
+        };
+        assert_eq!(
+            landed_merge_plan(shared, &frame(&[], LandedFrameOrder::Bgra8)),
+            Ok(LandedMergePlan::Shared)
+        );
+    }
+
+    /// An image nothing vouched for, and a multisampled one, are refused before
+    /// their geometry is compared: neither is a frame a sampled bind reads.
+    #[test]
+    fn an_unvouched_or_multisampled_image_is_refused_whatever_the_frame_is() {
+        let unready = LandedMergeTarget {
+            content_ready: false,
+            ..target()
+        };
+        assert_eq!(
+            landed_merge_plan(unready, &frame(&[0u8; 32], LandedFrameOrder::Bgra8)),
+            Err(LandedFrameMergeMiss::NotReady)
+        );
+        let multisample = LandedMergeTarget {
+            sample_count: 4,
+            ..target()
+        };
+        assert_eq!(
+            landed_merge_plan(multisample, &frame(&[0u8; 32], LandedFrameOrder::Bgra8)),
+            Err(LandedFrameMergeMiss::Multisample)
+        );
+    }
+
+    /// The frame's geometry is the image's or there is no merge: a rectangle
+    /// off by one texel would corrupt every row after it, and the fail-closed
+    /// answer costs only the fallback the ladder already had.
+    #[test]
+    fn the_landing_geometry_must_be_the_images_own() {
+        let bytes = [0u8; 32];
+        let short = LandedFrame {
+            width: 3,
+            ..frame(&bytes, LandedFrameOrder::Bgra8)
+        };
+        assert_eq!(
+            landed_merge_plan(target(), &short),
+            Err(LandedFrameMergeMiss::Geometry)
+        );
+        let tall = LandedFrame {
+            height: 3,
+            ..frame(&bytes, LandedFrameOrder::Bgra8)
+        };
+        assert_eq!(
+            landed_merge_plan(target(), &tall),
+            Err(LandedFrameMergeMiss::Geometry)
+        );
+    }
+
+    /// The channel order is the one bit of the upload that can silently swap
+    /// red and blue, so the plan states it rather than letting the copy assume
+    /// the two rails agree.
+    #[test]
+    fn the_landing_order_against_the_images_own_decides_the_swap() {
+        let bytes = [0u8; 32];
+        let upload = |order| match landed_merge_plan(target(), &frame(&bytes, order)) {
+            Ok(plan) => plan,
+            Err(miss) => panic!("{miss:?}"),
+        };
+        assert_eq!(
+            upload(LandedFrameOrder::Bgra8),
+            LandedMergePlan::Upload {
+                swap_rb: false,
+                bytes: 32
+            }
+        );
+        assert_eq!(
+            upload(LandedFrameOrder::Rgba8),
+            LandedMergePlan::Upload {
+                swap_rb: true,
+                bytes: 32
+            }
+        );
+    }
+
+    /// Four-byte colour is the only family the landing's bytes describe; an
+    /// eight-bit single-channel or a half-float image is not one a BGRA8 frame
+    /// can be written into without a conversion this rail does not perform.
+    #[test]
+    fn a_non_four_byte_image_refuses_the_landing_by_format() {
+        let narrowed = LandedMergeTarget {
+            four_byte_color: false,
+            ..target()
+        };
+        assert_eq!(
+            landed_merge_plan(narrowed, &frame(&[0u8; 32], LandedFrameOrder::Bgra8)),
+            Err(LandedFrameMergeMiss::Format)
+        );
+    }
+
+    /// A frame shorter than its own geometry is refused rather than read past
+    /// its end, and the empty slice the kept-frame arm carries is the same
+    /// answer.
+    #[test]
+    fn bytes_shorter_than_the_landing_are_refused() {
+        assert_eq!(
+            landed_merge_plan(target(), &frame(&[0u8; 31], LandedFrameOrder::Bgra8)),
+            Err(LandedFrameMergeMiss::FrameBytes)
+        );
+        assert_eq!(
+            landed_merge_plan(target(), &frame(&[], LandedFrameOrder::Bgra8)),
+            Err(LandedFrameMergeMiss::FrameBytes)
+        );
+    }
+
+    /// Every miss has a name of its own, because the census reads the fallback
+    /// by that name and a shared slug would hide which rail failed.
+    #[test]
+    fn every_miss_names_itself() {
+        let names = [
+            LandedFrameMergeMiss::NoResident,
+            LandedFrameMergeMiss::NotReady,
+            LandedFrameMergeMiss::Multisample,
+            LandedFrameMergeMiss::Geometry,
+            LandedFrameMergeMiss::Format,
+            LandedFrameMergeMiss::FrameBytes,
+            LandedFrameMergeMiss::Upload,
+        ];
+        for (i, miss) in names.iter().enumerate() {
+            assert!(!miss.slug().is_empty());
+            for other in &names[i + 1..] {
+                assert_ne!(miss.slug(), other.slug(), "two misses share a slug");
+            }
+        }
     }
 }
 
@@ -5882,6 +6420,19 @@ pub fn test_quiesce_ring() {
         return;
     };
     let _ = unsafe { pools.retire_all(ctx, counters) };
+}
+
+/// Test hook: how many entries this device has reset **and** begun a slot
+/// command buffer for — see [`pools::ResourcePools::entry_record_begins`].
+///
+/// A rail test reads this around a transfer it expects to record on an entry
+/// of its own, because the defect that count catches is *invisible* on a
+/// software driver: recording into a command buffer `begin_entry` handed back
+/// (retired, not recording) is a state violation the driver tolerates and a
+/// discrete one faults on. A recorder that took a slot and never reset it
+/// leaves the count where it was — that is the assertion.
+pub fn test_entry_record_begins() -> u64 {
+    lock_engine().pools.entry_record_begins()
 }
 
 /// Recreate budget remaining / count (for tests).

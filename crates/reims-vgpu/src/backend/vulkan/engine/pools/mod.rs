@@ -547,6 +547,18 @@ pub(crate) struct ResourcePools {
     /// owes. Entries rotate through slots; a slot is reused only after its
     /// fence retires (begin_entry blocks on the oldest when the ring is full).
     slots: Vec<CmdSlot>,
+    /// How many entries this device has put a slot's command buffer back into
+    /// the recording state for — one per [`Self::begin_slot_recording`].
+    ///
+    /// The count a rail test reads to prove a recorder took the reset. A CB
+    /// `begin_entry` hands back is *retired*, not recording, and recording into
+    /// it anyway is a Vulkan state violation this host's software driver
+    /// tolerates and its discrete one faults on (the R47 merge's fp20/b2
+    /// rounds). A CB cannot be asked for its state, and the fault is a driver
+    /// crash rather than a decoder error, so the invariant is counted at the
+    /// one call that establishes it: a recorder that skipped the reset shows
+    /// up as a submission whose entry was never begun.
+    entry_record_begins: u64,
     /// Slot the current (or most recently begun) entry records into.
     cur: usize,
     /// Submitted-but-unretired slot count. While nonzero, destroying any GPU
@@ -2013,6 +2025,15 @@ pub(crate) enum ResidentAccess {
     /// A transfer read it: a present blit, a guest-page readback, a GPU seed
     /// copy, or this draw's own copy-on-sample snapshot.
     TransferRead(vk::ImageLayout),
+    /// A transfer command wrote it: this device's own merge of a frame another
+    /// rail landed in the guest's pages back into the image under the same
+    /// identity.
+    ///
+    /// The write is not a render pass, so no colour-attachment scope covers it —
+    /// the third transfer variant rather than a reuse of [`Self::TransferRead`],
+    /// whose source scope is `TRANSFER_READ` and would leave the merge's
+    /// `TRANSFER_WRITE` unordered against the next sampled read.
+    TransferWrite(vk::ImageLayout),
 }
 
 impl ResidentAccess {
@@ -2063,6 +2084,8 @@ impl ResidentAccess {
     ///   before a read is not a hazard.
     /// - `ShaderRead` and `TransferRead` are reads. Read-after-read needs no
     ///   availability operation.
+    /// - `TransferWrite` is the merge's own transfer write, which the entry's
+    ///   `TRANSFER | TRANSFER_WRITE` half names exactly.
     /// - `Untouched` is `UNDEFINED`: there is a real transition and the layouts
     ///   cannot match, so this never decides it — it answers `false` anyway,
     ///   because "nothing has touched it" must never read as "covered".
@@ -2079,7 +2102,8 @@ impl ResidentAccess {
             Self::ColorWrite(_)
             | Self::ColorFeedback(_)
             | Self::ShaderRead(_)
-            | Self::TransferRead(_) => true,
+            | Self::TransferRead(_)
+            | Self::TransferWrite(_) => true,
         }
     }
 
@@ -2093,15 +2117,34 @@ impl ResidentAccess {
         })
     }
 
+    /// Layout for a transfer write, preserving host access for imported linear
+    /// images while ordinary images use the dedicated transfer layout.
+    ///
+    /// The caller that merges a landed frame has no render pass to leave the
+    /// image in one, so the destination it names here is also the layout the
+    /// next sampled read starts from — `GENERAL` where the unified colour
+    /// layout is on (and on every imported image), the dedicated transfer
+    /// layout otherwise, which the sampled rail's own barrier then moves.
+    pub(crate) fn transfer_write(host_accessible: bool) -> Self {
+        Self::TransferWrite(
+            if host_accessible || crate::backend::vulkan::engine::caches::unified_color_layout() {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL
+            },
+        )
+    }
+
     /// Where the image is — the `old_layout` a barrier over it must name.
     pub(crate) fn layout(self) -> vk::ImageLayout {
         match self {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
             Self::GuestBacking => vk::ImageLayout::PREINITIALIZED,
             Self::ColorWrite(layout) => layout,
-            Self::ColorFeedback(layout) | Self::ShaderRead(layout) | Self::TransferRead(layout) => {
-                layout
-            }
+            Self::ColorFeedback(layout)
+            | Self::ShaderRead(layout)
+            | Self::TransferRead(layout)
+            | Self::TransferWrite(layout) => layout,
         }
     }
 
@@ -2148,6 +2191,10 @@ impl ResidentAccess {
             Self::TransferRead(_) => (
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::TRANSFER_READ,
+            ),
+            Self::TransferWrite(_) => (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_WRITE,
             ),
         }
     }

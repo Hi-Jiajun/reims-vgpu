@@ -393,6 +393,7 @@ impl ResourcePools {
             scatter_dsets: Vec::new(),
             scatter_dset_free: Vec::new(),
             slots: Vec::new(),
+            entry_record_begins: 0,
             cur: 0,
             in_flight: 0,
             graveyard: Vec::new(),
@@ -1299,8 +1300,19 @@ impl ResourcePools {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(begin_op, e)))?;
+        // Counted here rather than at the reset, so a reset the begin refused
+        // does not read as an entry that reached the recording state.
+        self.entry_record_begins = self.entry_record_begins.saturating_add(1);
         unsafe { self.gpu_span_arm(ctx, cb, kind) };
         Ok(())
+    }
+
+    /// How many entries have reset **and** begun a slot command buffer: the
+    /// count a rail test holds a recorder to. See
+    /// [`ResourcePools::entry_record_begins`] for why the state it names cannot
+    /// be asked of the CB itself.
+    pub(crate) fn entry_record_begins(&self) -> u64 {
+        self.entry_record_begins
     }
 
     /// Reset the current slot's timestamp pair and write the top one, so the
