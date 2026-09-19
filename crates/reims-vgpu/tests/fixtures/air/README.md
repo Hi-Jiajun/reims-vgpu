@@ -69,3 +69,15 @@ normalized, so the module *does* read through its sampler, the class weighs the 
 draw stays on the engine by name. One axis (the sampler word's bits 9-10) is the only difference
 between the two, which is what makes "read through" the fact that moves both readings; both are
 re-assembled from their `.ll` with `llvm-as` 22.1.8 like every other fixture here.
+
+`render_frag_half_truncated.{ll,air}` is the R51 fixture: the census v48 LPF pipeline's own
+narrowing shape, where a float is narrowed to `half` and its bits read back through an `i16`
+shift, so the finished module declares `OpCapability Float16` beside `OpCapability Int16` — the
+pair the canonical provider admits exactly on a device created with `shaderFloat16` and
+`shaderInt16`, which E publishes as the capability frame's own `0x00 0x10 <bool>` section
+(E-SH1). The module's texel is a function of that path (it compares the truncated `i16` against
+the value its own arithmetic states, landing `4080c0ff` when they agree and `ff80c000` when they
+do not), so the frame is a reading of the path rather than a constant. The `.ll` body is this
+corpus's own, re-assembled from it with `llvm-as` 22.1.8 like every other fixture here; the
+canonical side's sibling fixtures are `metal-api-emulator`'s
+`render_half_truncated_rgba8.frag.ll` and its `_off` twin.

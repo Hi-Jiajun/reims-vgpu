@@ -196,6 +196,26 @@ fn two_outputs_stages() -> Stages {
     stages
 }
 
+/// The half-truncating fragment entry (2026-09-20, census v48's LPF pipeline).
+const HALF_CAPABILITY_FRAGMENT_ENTRY: &str = "reims_half_truncated_frag";
+
+/// The 16-bit shader capability pair's shape: the reviewed one-stream vertex
+/// module beside a fragment stage whose own translation declares
+/// `OpCapability Float16` beside `OpCapability Int16` — the narrowing the census
+/// LPF stage carries (a float narrowed to `half`, its bits read back through an
+/// `i16` shift).
+///
+/// The module's texel is a function of that path: it compares the truncated
+/// `i16` against the value its own arithmetic states (`half(64/255) == 0x3404`,
+/// `lshr 1` => `0x1a02`), so an eight-bit attachment reads back `40 80 c0 ff`
+/// when the path ran and `ff 80 c0 00` when it did not.
+fn half_capability_stages() -> Stages {
+    let mut stages = reviewed_stages();
+    stages.air.1 = fixture("render_frag_half_truncated.air");
+    stages.fragment_entry = HALF_CAPABILITY_FRAGMENT_ENTRY;
+    stages
+}
+
 /// The two-stream shape: position at location 0 and an offset at location 1,
 /// each its own stream and each read by the vertex stage.
 fn two_stream_stages() -> Stages {
@@ -2655,6 +2675,133 @@ fn a_fragment_that_stores_more_than_the_pass_attaches_follows_the_providers_fram
             before,
             "the refusal happens before the provider is asked"
         );
+    }
+}
+
+/// The module's own SPIR-V capabilities (2026-09-20, census v48's LPF
+/// pipeline).
+///
+/// Census v48's remaining LPF pipeline narrows a float to `half` and reads its
+/// bits back through an `i16` shift, so its translated module declares
+/// `OpCapability Float16` beside `OpCapability Int16` — a pair Vulkan admits
+/// exactly on a device created with `shaderFloat16` and `shaderInt16`, and the
+/// one thing the provider's own capability frame answers. The three readings
+/// below are the arm's whole statement:
+///
+/// * with the pair declared, the class hands the draw over and both rails land
+///   the same frame — the texel the module's own narrowing path computes;
+/// * with the frame ending before the pair, the class keeps the draw on the
+///   engine under this door's own slug and sentence, **without** making a
+///   submission: the provider would refuse the registration by name
+///   (`render_stage_capability_unavailable`), and a draw the class handed such
+///   a provider is a draw no rail answered (the census red line
+///   `draws_skipped_after_engine_refusal`);
+/// * a module that declares neither capability of the pair (the reviewed solid
+///   stage) never asks the frame at all, so the face's presence moves no other
+///   shape.
+#[test]
+fn a_module_that_declares_the_16_bit_pair_follows_the_providers_frame() {
+    let _guard = engine_test_session();
+    let stages = half_capability_stages();
+    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+    // The texel the fixture's own narrowing path computes, in every pixel of
+    // the attachment: `half(64/255)`/`half(128/255)`/`half(192/255)` round back
+    // inside the same eight-bit step as the reviewed stage's own texel.
+    let expected: Vec<u8> = [0x40, 0x80, 0xc0, 0xff]
+        .iter()
+        .copied()
+        .cycle()
+        .take((extent().0 * extent().1 * 4) as usize)
+        .collect();
+    // The texel a rail lands when the narrowing path did not run: the module's
+    // comparison takes its other arm, which is what keeps the first reading
+    // falsifiable.
+    let without_the_path: Vec<u8> = [0xff, 0x80, 0xc0, 0x00]
+        .iter()
+        .copied()
+        .cycle()
+        .take(expected.len())
+        .collect();
+    assert_ne!(expected, without_the_path);
+
+    {
+        let _declared = provider_render::override_render_half_capabilities(Some(true));
+        let frame = provider_pixels("half capabilities", &stages, &req);
+        assert_texel_count("half capabilities", &frame);
+        assert_frames_equal(
+            "half capabilities against the fixture's own texel",
+            &frame,
+            &expected,
+        );
+        // The engine arm takes its request by value, exactly as the reviewed
+        // cases' do; the two requests are the same shape, so the comparison is
+        // between two rails and not between two fixtures.
+        let Some(engine) = engine_pixels(
+            "half capabilities",
+            &stages,
+            narrow_request(MTL_FORMAT_RGBA8_UNORM),
+        ) else {
+            return;
+        };
+        assert_frames_equal("half capabilities against the engine", &frame, &engine);
+        eprintln!(
+            "the 16-bit shader capability pair lands [{}] in every one of its {} texels, on both \
+             rails",
+            frame
+                .chunks_exact(4)
+                .next()
+                .map(|texel| texel
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>())
+                .unwrap_or_default(),
+            frame.len() / 4
+        );
+    }
+
+    {
+        let _undeclared = provider_render::override_render_half_capabilities(Some(false));
+        let before = provider_render::provider_submissions();
+        match provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &req) {
+            RenderRailOutcome::NotInNarrowClass(reason) => {
+                eprintln!(
+                    "16-bit shader capability pair, undeclared frame: {}\n  {}",
+                    reason.slug(),
+                    reason.detail()
+                );
+                assert_eq!(
+                    reason.slug(),
+                    "render_provider_out_of_class_module_capability",
+                    "the module keeps this door's own bucket when the provider does not contain \
+                     the pair"
+                );
+                assert!(
+                    reason.detail().contains("shaderFloat16")
+                        && reason.detail().contains("shaderInt16"),
+                    "the sentence names the pair the frame does not answer for: {}",
+                    reason.detail()
+                );
+            }
+            other => panic!(
+                "a provider whose subset does not contain the pair cannot receive the draw: \
+                 {other:?}"
+            ),
+        }
+        assert_eq!(
+            provider_render::provider_submissions(),
+            before,
+            "the refusal happens before the provider is asked"
+        );
+    }
+
+    // A module that declares neither capability never asks the frame: the same
+    // undeclared frame executes the reviewed solid stage, so this door moves
+    // exactly one population.
+    {
+        let _undeclared = provider_render::override_render_half_capabilities(Some(false));
+        let reviewed = reviewed_stages();
+        let frame = provider_pixels("reviewed solid stage, pair undeclared", &reviewed, &req);
+        assert_texel_count("reviewed solid stage, pair undeclared", &frame);
     }
 }
 

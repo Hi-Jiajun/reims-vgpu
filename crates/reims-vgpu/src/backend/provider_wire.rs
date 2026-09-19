@@ -406,6 +406,37 @@ pub fn render_fragment_output_superset(
     Ok(decoded.supports_render_fragment_output_superset)
 }
 
+/// Whether the provider whose snapshot this is executes a module that declares
+/// the 16-bit shader capability pair (2026-09-20, census v48's LPF pipeline).
+///
+/// The sixteenth reading of the same one-snapshot rule
+/// ([`render_fragment_output_superset`] is the fifteenth), and the one the
+/// class gate needs for the shape census v48's remaining LPF pipeline has: its
+/// fragment module narrows a float to `half` and reads the bits back through an
+/// `i16` shift, which the pinned translator emits as
+/// `OpCapability Float16` beside `OpCapability Int16`. Vulkan admits those two
+/// exactly on a device created with `shaderFloat16` and `shaderInt16`, so the
+/// shape is executable; what the frame answers is whether *this* provider's
+/// SPIR-V subset contains them. A provider that does not is one whose
+/// registration refuses the module by name
+/// (`render_stage_capability_unavailable`), and a draw the class handed such a
+/// provider is a draw no rail answered — the census red line
+/// `draws_skipped_after_engine_refusal`.
+///
+/// `false` is the fail-closed answer, and it is what a frame written before the
+/// section existed decodes to: the section is the escape family's own next
+/// tagged block (`0x00 0x10`), so a decoder that predates the tag answers
+/// [`WireDecline`] rather than a value, and one that carries the tag reads
+/// `false` out of a frame that ends before it. A device that does not state the
+/// bit is a device that keeps its own refusal by name for the module.
+pub fn render_half_capabilities(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<bool, WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok(decoded.supports_render_half_capabilities)
+}
+
 /// The three facts one provider's frame states about its one-dimensional
 /// sampled window, one value each.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
