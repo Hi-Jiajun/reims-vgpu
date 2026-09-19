@@ -6482,6 +6482,98 @@ pub fn override_render_texture_one_dimension_window(
     }
 }
 
+/// The device's own answer for the layout-free count above the milestone's
+/// three vertices, and the states the test instrument below can put it in.
+const VERTEX_COUNT_ABOVE_TRIANGLE_DEVICE: u8 = 0;
+const VERTEX_COUNT_ABOVE_TRIANGLE_NOT_DECLARED: u8 = 1;
+const VERTEX_COUNT_ABOVE_TRIANGLE_DECLARED: u8 = 2;
+
+/// Whether the layout-free count is read from the device's own frame
+/// ([`VERTEX_COUNT_ABOVE_TRIANGLE_DEVICE`], what production runs) or from an
+/// answer a test stated.
+static VERTEX_COUNT_ABOVE_TRIANGLE_ANSWER: AtomicU8 =
+    AtomicU8::new(VERTEX_COUNT_ABOVE_TRIANGLE_DEVICE);
+
+/// A test's own answer for the layout-free count, restored when it drops.
+///
+/// The same guard shape as [`RenderTextureOneDimensionWindowOverride`] and for
+/// the same two reasons — the rail reads the bit out of the provider's
+/// capability frame, and a test that has to see the fail-closed arm cannot make
+/// an admitted device stop stating it; a decision rather than an observation,
+/// so an unwound assertion must not leave the next shape answering from a
+/// device that is not its own.
+pub struct RenderVertexCountAboveTriangleOverride {
+    previous: u8,
+}
+
+impl Drop for RenderVertexCountAboveTriangleOverride {
+    fn drop(&mut self) {
+        VERTEX_COUNT_ABOVE_TRIANGLE_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the layout-free count as `declared` until the returned guard drops, or
+/// as the device's own answer for `None` (2026-09-19).
+///
+/// `Some(true)` states the widened arm, `Some(false)` the pre-increment device:
+/// a frame whose tail ends before the `0x00 0x0B` section, which is exactly what
+/// every census boot so far carried and exactly what the shape's fail-closed
+/// arm has to read.
+pub fn override_render_vertex_count_above_triangle(
+    declared: Option<bool>,
+) -> RenderVertexCountAboveTriangleOverride {
+    let answer = match declared {
+        None => VERTEX_COUNT_ABOVE_TRIANGLE_DEVICE,
+        Some(false) => VERTEX_COUNT_ABOVE_TRIANGLE_NOT_DECLARED,
+        Some(true) => VERTEX_COUNT_ABOVE_TRIANGLE_DECLARED,
+    };
+    RenderVertexCountAboveTriangleOverride {
+        previous: VERTEX_COUNT_ABOVE_TRIANGLE_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// The layout-free count above the milestone's three vertices, read out of the
+/// device's own capability frame (2026-09-19, census v45's `vertex_span`
+/// bucket).
+///
+/// The fourteenth reading of the one-snapshot rule
+/// ([`declared_render_texture_one_dimension_window`] is the thirteenth), and the
+/// one R39's span gate needs once the contract admits the count from three
+/// vertices up: the frame's `0x00 0x0B` section is what says whether this
+/// provider executes a layout-free draw whose count is above three, exactly as
+/// the one before it states the one-dimensional window.
+///
+/// `false` is the fail-closed answer, and it is what a frame written before the
+/// section existed decodes to: a decoder that predates the tag refuses the frame
+/// rather than reading a value, and one that carries the tag reads `false` out
+/// of a frame that ends before it. A device whose frame does not state the bit
+/// is a device that keeps the census's refusal, its slug and its sentence, for
+/// the shape.
+fn declared_render_vertex_count_above_triangle() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match VERTEX_COUNT_ABOVE_TRIANGLE_ANSWER.load(Ordering::Relaxed) {
+            VERTEX_COUNT_ABOVE_TRIANGLE_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_vertex_count_above_triangle =
+                    answer == VERTEX_COUNT_ABOVE_TRIANGLE_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_vertex_count_above_triangle(rail.provider.device_epoch(), &capabilities)
+        .map_err(|decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        })
+}
+
 /// The one-dimensional sampled window the device's own frame states
 /// (`research/docs/23` §119, census b10's `texture_shape` bucket).
 ///
@@ -10766,6 +10858,30 @@ fn submit_render_inner(
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
+    // The layout-free count above the milestone's three vertices (2026-09-19,
+    // census v45's `vertex_span` bucket): the thirteenth device answer this rail
+    // asks *before* the gate, on the same terms as the twelve above. The rule it
+    // lifts is R39's span door's own sentence — a `vertex_id`-shaped draw that
+    // names more than the milestone's three vertices — which the canonical
+    // contract admits from this increment on and one rail alone executes. The
+    // ask is gated on the request's own statement being that shape (no declared
+    // vertex attributes and a count above three), so no other record reaches the
+    // rail's provider any earlier than it did. A frame that leaves the bit out
+    // keeps the census's refusal, its slug and its sentence, at the same point
+    // in the same order.
+    let render_vertex_count_above_triangle = match req.vertex_attributes.is_empty()
+        && req.vertex_count > FULL_SCREEN_TRIANGLE_VERTICES
+    {
+        false => false,
+        true => match declared_render_vertex_count_above_triangle() {
+            Ok(declared) => declared,
+            // A provider that cannot be reached cannot answer the question the
+            // gate needs, and an unanswerable candidate is an in-class
+            // candidate: fail closed, exactly as the answers above do, rather
+            // than running the shape on a rail the class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(
@@ -10782,6 +10898,7 @@ fn submit_render_inner(
         kept_frame_landing,
         render_pixel_coordinate_sampler,
         render_pass_entry_snapshot,
+        render_vertex_count_above_triangle,
     ) {
         Err(reason) => {
             reason.note();
@@ -12912,8 +13029,9 @@ fn view_texture_type(kind: reims_vgpu_core::texture_shape::TextureKind) -> Textu
 ///   [`FULL_SCREEN_TRIANGLE_VERTICES`] vertices
 ///   (`ContractError::DrawVertexCountBelowMinimum`);
 /// - a pipeline that declares none — the `vertex_id` shape, whose positions the
-///   module generates — names exactly that many
-///   (`ContractError::DrawVertexCountMismatch`);
+///   module generates — names at least that many
+///   (`ContractError::DrawVertexCountMismatch` below the triangle's three,
+///   since the 2026-09-19 widening of census v45's `vertex_span` bucket);
 /// - every per-vertex stream covers `vertices * stride`
 ///   (`render_vertex_buffer_footprint_unsupported` on the Vulkan rail,
 ///   `render_vertex_footprint_unsupported` on the native one — one proof spelled
@@ -12931,15 +13049,46 @@ fn view_texture_type(kind: reims_vgpu_core::texture_shape::TextureKind) -> Textu
 /// (`runtime/draw/vulkan.rs`): a shape this gate let through and the provider
 /// refused would be a hard failure, not a fallback.
 ///
+/// The layout-free count's upper end is where the *provider* enters (2026-09-19,
+/// census v45's `vertex_span` bucket): the contract admits every count from
+/// three up, so a count above three is a shape admission accepts and one rail
+/// alone executes — the Vulkan rail, whose reviewed `vertex_id` module is a
+/// total function of the index. `vertex_count_above_triangle` is that rail's own
+/// answer, read out of its capability frame by the caller; `false` (every
+/// pre-increment frame, and the native rail today) keeps the census's sentence,
+/// its slug and its count for the shape.
+///
 /// `None` is a shape the provider executes; `Some` is this class's own sentence
 /// for one it would decline, which keeps the draw on the engine instead.
 fn nonindexed_vertex_span(
     vertex_streams: &[NarrowVertexStream<'_>],
     draw_count: u32,
+    vertex_count_above_triangle: bool,
 ) -> Option<OutOfClass> {
     const ROUTE: &str = "render_provider_out_of_class_vertex_span";
     if vertex_streams.is_empty() {
-        if draw_count == FULL_SCREEN_TRIANGLE_VERTICES {
+        // Below the triangle's three the contract refuses whatever the device
+        // is: the count is not a shape any rail can produce coverage from, and
+        // the refusal is its own sentence because the reason is not the
+        // device's window but the count's own floor.
+        if draw_count < FULL_SCREEN_TRIANGLE_VERTICES {
+            return Some(OutOfClass::owned(
+                ROUTE,
+                format!(
+                    "a non-indexed draw whose pipeline declares no vertex layout stays on the \
+                     engine when it names fewer than the {FULL_SCREEN_TRIANGLE_VERTICES} \
+                     vertices the canonical `vertex_id` shape carries: the contract refuses \
+                     such a pass by name (`DrawVertexCountMismatch`), and a refusal is a \
+                     decline rather than a fallback, so this class does not hand admission a \
+                     pass it can only lose (this draw names {draw_count})",
+                ),
+            ));
+        }
+        // The milestone's own count is the shape every device executes. A count
+        // above it is admitted by the contract and executed by the provider
+        // whose frame declares the widened arm, so the gate answers with the
+        // device's own reading instead of the census's sentence.
+        if draw_count == FULL_SCREEN_TRIANGLE_VERTICES || vertex_count_above_triangle {
             return None;
         }
         return Some(OutOfClass::owned(
@@ -13049,6 +13198,14 @@ fn narrow_class<'a>(
     // below weighs each sampled bind against the arm's own shape rules and
     // keeps the census's refusal for every one it cannot state.
     render_pass_entry_snapshot: bool,
+    // Whether this draw's provider executes a layout-free non-indexed draw
+    // whose count is above the milestone's three vertices (2026-09-19, census
+    // v45's `vertex_span` bucket). The contract admits the count from three up,
+    // so the widened arm is the provider's answer rather than the contract's;
+    // read by the caller out of the same capability frame and under its own
+    // candidate test, exactly as the twelve answers beside it are, and `false`
+    // keeps the census's sentence for the shape.
+    render_vertex_count_above_triangle: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
@@ -14468,7 +14625,11 @@ fn narrow_class<'a>(
     // or one of the two rails states; [`nonindexed_vertex_span`] holds them and
     // their names.
     if req.indexed.is_none() {
-        if let Some(refusal) = nonindexed_vertex_span(&vertex_streams, draw_count) {
+        if let Some(refusal) = nonindexed_vertex_span(
+            &vertex_streams,
+            draw_count,
+            render_vertex_count_above_triangle,
+        ) {
             return Err(refusal);
         }
     }
@@ -17545,54 +17706,94 @@ mod nonindexed_span_tests {
     #[test]
     fn the_span_door_answers_the_contracts_count_beside_the_streams_coverage() {
         let bytes = [0u8; 24];
-        let slug = |draw_count: u32, streams: &[NarrowVertexStream<'_>]| {
-            nonindexed_vertex_span(streams, draw_count).map(|refusal| refusal.slug())
+        // The third argument is the device's own answer to the widened arm
+        // (2026-09-19, census v45's `vertex_span` bucket): `false` is every
+        // frame written before the bit existed, and it is also the native
+        // rail's own reading.
+        let slug = |draw_count: u32, streams: &[NarrowVertexStream<'_>], widened: bool| {
+            nonindexed_vertex_span(streams, draw_count, widened).map(|refusal| refusal.slug())
         };
         const SPAN: Option<&str> = Some("render_provider_out_of_class_vertex_span");
 
         // A draw with a vertex layout owes at least the contract's own
         // full-screen triangle (`DrawVertexCountBelowMinimum`); exactly the
         // three the reviewed stream carries is the admitted shape.
-        assert_eq!(slug(3, &[stream(8, &bytes)]), None);
+        assert_eq!(slug(3, &[stream(8, &bytes)], false), None);
         for too_few in [0, 1, 2] {
             assert_eq!(
-                slug(too_few, &[stream(8, &bytes)]),
+                slug(too_few, &[stream(8, &bytes)], false),
                 SPAN,
                 "a layout-bearing draw that names {too_few} vertices is one the contract \
                  refuses, so it stays on the engine here"
             );
         }
 
-        // The layout-free `vertex_id` shape owes exactly that count
-        // (`DrawVertexCountMismatch`) — on both sides of it.
-        assert_eq!(slug(3, &[]), None);
-        for other in [0, 1, 2, 4, 6] {
+        // The layout-free `vertex_id` shape owes at least the milestone's three
+        // (`DrawVertexCountMismatch` below it, since the 2026-09-19 widening).
+        // The milestone's own count is admitted whoever the device is.
+        for widened in [false, true] {
+            assert_eq!(slug(3, &[], widened), None);
+            for below in [0, 1, 2] {
+                assert_eq!(
+                    slug(below, &[], widened),
+                    SPAN,
+                    "the layout-free shape names fewer than the triangle's \
+                     {FULL_SCREEN_TRIANGLE_VERTICES} vertices, and this one names {below}"
+                );
+            }
+        }
+        // A count *above* the milestone's three is the widened arm: admitted by
+        // the contract, executed by the provider whose frame declares it, and
+        // kept on the engine under the census's own sentence by every frame
+        // that ends before the `0x00 0x0B` section.
+        for above in [4, 5, 6, 24] {
             assert_eq!(
-                slug(other, &[]),
+                slug(above, &[], true),
+                None,
+                "a device that declares the widened count executes this draw's {above} vertices"
+            );
+            assert_eq!(
+                slug(above, &[], false),
                 SPAN,
-                "the layout-free shape names exactly {FULL_SCREEN_TRIANGLE_VERTICES} vertices, \
-                 and this one names {other}"
+                "a frame written before the bit existed keeps the census's refusal for {above}"
             );
         }
+        // The two refusals are two sentences: the floor's own, and the
+        // pre-increment device's. Neither replaces the other.
+        let below = nonindexed_vertex_span(&[], 2, true).expect("the floor refuses two vertices");
+        assert!(below.detail().contains("fewer than"));
+        assert!(
+            !below.detail().contains("exactly"),
+            "the floor's sentence is its own: {}",
+            below.detail()
+        );
+        let closed = nonindexed_vertex_span(&[], 6, false).expect("the closed frame refuses six");
+        assert!(closed.detail().contains("exactly"));
+        assert!(
+            closed.detail().contains("names 6"),
+            "the closed sentence keeps the count it measured: {}",
+            closed.detail()
+        );
 
         // Coverage, at the boundary and on both sides of it: `vertices * stride`
         // bytes is covered, one byte less is not, and the stride is the stream's
         // own rather than a constant of this module.
-        assert_eq!(slug(3, &[stream(8, &bytes[..24])]), None);
-        assert_eq!(slug(3, &[stream(8, &bytes[..23])]), SPAN);
-        assert_eq!(slug(3, &[stream(8, &bytes[..16])]), SPAN);
+        assert_eq!(slug(3, &[stream(8, &bytes[..24])], false), None);
+        assert_eq!(slug(3, &[stream(8, &bytes[..23])], false), SPAN);
+        assert_eq!(slug(3, &[stream(8, &bytes[..16])], false), SPAN);
         assert_eq!(
-            slug(3, &[stream(16, &bytes[..24])]),
+            slug(3, &[stream(16, &bytes[..24])], false),
             SPAN,
             "the same bytes cover fewer vertices at a wider stride"
         );
-        assert_eq!(slug(4, &[stream(4, &bytes[..24])]), None);
+        assert_eq!(slug(4, &[stream(4, &bytes[..24])], false), None);
 
         // One short stream refuses the draw, and the sentence names which one —
         // the census reads the shape, and the shape here is a position in the
         // request's own fetch-table order.
         let streams = [stream(8, &bytes[..24]), stream(8, &bytes[..16])];
-        let refusal = nonindexed_vertex_span(&streams, 3).expect("the second stream is short");
+        let refusal =
+            nonindexed_vertex_span(&streams, 3, false).expect("the second stream is short");
         assert_eq!(refusal.slug(), "render_provider_out_of_class_vertex_span");
         assert!(
             refusal.detail().contains("binding 1"),
