@@ -2362,6 +2362,32 @@ impl ResourcePools {
         }
     }
 
+    /// Record that the frame a provider landing replaced the surface's content
+    /// with is now **in this image**, so the sampling ladder may serve it again.
+    ///
+    /// The clear half of [`Self::registry_mark_sampled_content_replaced`], and
+    /// the only writer besides the two that already make an image current (a
+    /// draw into the slot and a store that vouches for it). The merge that owns
+    /// this call has just written the landing's rectangle into the image, so
+    /// the statement the flag carried — "the surface moved past this image" —
+    /// is no longer true. `content_epoch` is deliberately left alone: the merge
+    /// states the pixels, not the LOAD elision's epoch agreement.
+    ///
+    /// Returns whether a slot was found; a rail with no slot has no image to
+    /// make current, and the ladder below reads the pages anyway.
+    pub(crate) fn registry_clear_sampled_content_replaced(
+        &mut self,
+        identity: &TargetIdentity,
+    ) -> bool {
+        match self.registry.get_mut(identity) {
+            Some(slot) => {
+                slot.sampled_content_replaced = false;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Record a non-writing touch of a resident: a draw sampled it, or a
     /// transfer read it out (present blit, guest-page readback, GPU seed
     /// source). The writing touches go through [`Self::registry_mark_ready_at`]
