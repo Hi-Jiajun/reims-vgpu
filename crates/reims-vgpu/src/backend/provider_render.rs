@@ -5815,6 +5815,103 @@ pub fn override_stage_buffer_namespace_split(
     }
 }
 
+/// The whole-binding half of the same device answer (R48, E-SB3).
+///
+/// One snapshot, two readings, exactly as [`declared_stage_buffer_namespace_split`]:
+/// the bit the *frame* carries is the one the class gate gets. What it answers
+/// is whether this provider executes a `[[buffer(N)]]` argument whose **reach
+/// the translation could not state** — `StageBufferFootprint::Unstated`, the
+/// reflection's `has_unbounded_access` or its "no range at all" — by binding
+/// the request's own window whole (`FootprintProof::BindingRange` on the
+/// contract's side).
+///
+/// The two answers land differently and both are stated in the walk's own
+/// words: `true` lets the declaration through under the arm the provider
+/// declares (its devices have `robustBufferAccess` enabled, which is the
+/// sentence the arm rests on), and `false` keeps R9d's refusal — the census's
+/// own bucket `render_provider_out_of_class_stage_buffer_footprint`, its
+/// sentence and its proof arithmetic — byte for byte. `false` is also what a
+/// frame written before the bit existed decodes to
+/// (`provider_wire::stage_buffer_binding_range`, the escape family's next
+/// presence tag), so this read can only ever widen the class by what the device
+/// states.
+fn declared_stage_buffer_binding_range() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match BINDING_RANGE_ANSWER.load(Ordering::Relaxed) {
+            BINDING_RANGE_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_stage_buffer_binding_range =
+                    answer == BINDING_RANGE_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::stage_buffer_binding_range(rail.provider.device_epoch(), &capabilities).map_err(
+        |decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        },
+    )
+}
+
+/// The device's own answer for the whole-binding capability (R48), and the
+/// states the test instrument below can put it in.
+const BINDING_RANGE_DEVICE: u8 = 0;
+const BINDING_RANGE_NOT_DECLARED: u8 = 1;
+const BINDING_RANGE_DECLARED: u8 = 2;
+
+/// Whether the whole-binding capability is read from the device's own frame
+/// ([`BINDING_RANGE_DEVICE`], what production runs) or from an answer a test
+/// stated.
+static BINDING_RANGE_ANSWER: AtomicU8 = AtomicU8::new(BINDING_RANGE_DEVICE);
+
+/// A test's own answer for the whole-binding capability, restored when it drops
+/// (R48).
+///
+/// The rail reads the bit out of the provider's capability frame, and a test
+/// that has to see the fail-closed arm cannot make an admitted device stop
+/// declaring the shape. While this guards an answer, the capability question is
+/// asked of a snapshot carrying it — written, encoded and decoded through the
+/// same frame — so the arm a test sees is the arm an old frame gives (`absent`
+/// reads as undeclared), and the reading is still the wire's.
+///
+/// A guard rather than a plain setter for the reason
+/// [`StageBufferNamespaceSplitOverride`] is one: this changes a *decision* and
+/// not an observation, so a test that unwound through a failed assertion would
+/// otherwise leave the next shape in the same binary answering from a device
+/// that is not its own.
+pub struct StageBufferBindingRangeOverride {
+    previous: u8,
+}
+
+impl Drop for StageBufferBindingRangeOverride {
+    fn drop(&mut self) {
+        BINDING_RANGE_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the whole-binding capability as `declared` until the returned guard
+/// drops, or as the device's own answer for `None` (R48).
+pub fn override_stage_buffer_binding_range(
+    declared: Option<bool>,
+) -> StageBufferBindingRangeOverride {
+    let answer = match declared {
+        None => BINDING_RANGE_DEVICE,
+        Some(false) => BINDING_RANGE_NOT_DECLARED,
+        Some(true) => BINDING_RANGE_DECLARED,
+    };
+    StageBufferBindingRangeOverride {
+        previous: BINDING_RANGE_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
 /// The gathered-extent half of the same device answer (R37).
 ///
 /// One snapshot, two readings, exactly as [`declared_stage_buffer_namespace_split`]:
@@ -7437,6 +7534,10 @@ fn footprint_name(proof: &FootprintProof) -> String {
     match proof {
         FootprintProof::Static { max_bytes } => format!("static bytes={max_bytes}"),
         FootprintProof::Affine { accesses } => format!("affine accesses={}", accesses.len()),
+        // The arm states no byte extent at all, so the name is the arm
+        // (`research/docs/23` §3.3, E-SB3): a reader of a refusal, a route or a
+        // cache key can tell it apart from the unbounded refusal beside it.
+        FootprintProof::BindingRange => "binding-range".to_owned(),
         FootprintProof::Unbounded => "unbounded".to_owned(),
     }
 }
@@ -7487,6 +7588,24 @@ fn folded_stage_buffer_pair(
 /// device's answer to give.
 fn stage_buffer_window_candidate(inputs: &RenderRailInputs<'_>) -> Option<()> {
     (!inputs.stage_buffer_statement().declared.is_empty()).then_some(())
+}
+
+/// The whole-binding arm's own candidate test (R48, E-SB3).
+///
+/// The arm's answer is a device one, so the class asks for it before the gate
+/// runs — and asks it for exactly the population the arm can answer about: a
+/// request whose declarations all state a reach this rail can weigh never
+/// reaches this question, because the gate's declaration walk answers each of
+/// them out of the request's own bind and index bytes. A declaration whose
+/// footprint is [`StageBufferFootprint::Unstated`] is the one shape that turns
+/// on the device's own word, and it is what this predicate looks for in both
+/// stages' declaration lists (the walk's own order).
+fn stage_buffer_binding_range_candidate(inputs: &RenderRailInputs<'_>) -> bool {
+    inputs
+        .vertex_stage_buffer_declarations
+        .iter()
+        .chain(inputs.fragment_stage_buffer_declarations.iter())
+        .any(|declaration| matches!(declaration.footprint, StageBufferFootprint::Unstated))
 }
 
 /// The sampled bind of another extent one request's declaration walk states, in
@@ -7801,6 +7920,7 @@ fn stage_buffer_gate<'a>(
     vertex_streams: usize,
     stage_buffer_namespace_split: bool,
     stage_buffer_per_stage_ceiling: Option<usize>,
+    stage_buffer_binding_range: bool,
 ) -> Result<NarrowStageBuffers<'a>, OutOfClass> {
     // The one statement this request's two stages make (R9m): `declared` is
     // what the contract, the pass's own views and the wire frame are built
@@ -7990,7 +8110,7 @@ fn stage_buffer_gate<'a>(
                 FootprintProof::Static {
                     max_bytes: *max_bytes,
                 },
-                *max_bytes,
+                Some(*max_bytes),
             ),
             StageBufferFootprint::Affine { accesses } => {
                 // A refusal of the index *view* itself (a gather no one
@@ -8035,8 +8155,21 @@ fn stage_buffer_gate<'a>(
                     FootprintProof::Affine {
                         accesses: accesses.clone(),
                     },
-                    required,
+                    Some(required),
                 )
+            }
+            // The whole-binding arm (R48, E-SB3): the translation stated no
+            // reach, and the device declared that it executes such a
+            // declaration by binding the request's own window whole. The
+            // contract says `FootprintProof::BindingRange`, which publishes no
+            // byte ceiling — so the pair below hands the bind's bytes over
+            // without a proof comparison, and the walk's `bind`/window/run-list
+            // rules beside it are what still hold the pairing to the request's
+            // own bytes. The arm is asked of the *device* and never assumed:
+            // the fall-through arm below is the census's own refusal, sentence
+            // and proof arithmetic included, byte for byte.
+            StageBufferFootprint::Unstated if stage_buffer_binding_range => {
+                (FootprintProof::BindingRange, None)
             }
             StageBufferFootprint::Unstated => {
                 return Err(OutOfClass::owned(
@@ -8072,18 +8205,25 @@ fn stage_buffer_gate<'a>(
             ));
         };
         let bind_bytes = u64::try_from(bind.content.len()).unwrap_or(u64::MAX);
-        if bind_bytes < max_bytes {
-            return Err(OutOfClass::owned(
-                "render_provider_out_of_class_stage_buffer_short",
-                format!(
-                    "a draw whose {} stage reaches {max_bytes} byte(s) of its [[buffer({})]] \
-                     argument stays on the engine: the request binds {bind_bytes} byte(s) there, \
-                     and the canonical contract proves the pass's view against the declared \
-                     extent rather than the other way round",
-                    stage.name(),
-                    declaration.index,
-                ),
-            ));
+        // The ceiling is `None` for the whole-binding arm alone: a declaration
+        // that states a reach is proven against the bind's bytes, and one that
+        // states none is executed against them whole — the two are the same
+        // request-side rule the contract states, read where the bind is in
+        // hand.
+        if let Some(max_bytes) = max_bytes {
+            if bind_bytes < max_bytes {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_stage_buffer_short",
+                    format!(
+                        "a draw whose {} stage reaches {max_bytes} byte(s) of its [[buffer({})]] \
+                         argument stays on the engine: the request binds {bind_bytes} byte(s) \
+                         there, and the canonical contract proves the pass's view against the \
+                         declared extent rather than the other way round",
+                        stage.name(),
+                        declaration.index,
+                    ),
+                ));
+            }
         }
         // A writable declaration is a landing (R9f): the provider publishes one
         // writeback per writable view, and this rail has to be able to place it
@@ -10447,6 +10587,11 @@ fn contract_fingerprint(contract: &RenderPipelineContract) -> String {
         match &binding.footprint {
             FootprintProof::Static { max_bytes } => out.push_str(&format!("{max_bytes:x};")),
             FootprintProof::Affine { .. } => out.push_str("affine;"),
+            // The whole-binding arm is its own key (`research/docs/23` §3.3,
+            // E-SB3): the declaration states no extent, so the key states the
+            // arm — two requests cannot collide with a static or affine one,
+            // and the provider's own registration is the same shape.
+            FootprintProof::BindingRange => out.push_str("binding-range;"),
             FootprintProof::Unbounded => out.push_str("unbounded;"),
         }
     }
@@ -10644,6 +10789,26 @@ fn submit_render_inner(
             // declined rather than run on a rail the class never named.
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
+    };
+    // R48 (E-SB3): the whole-binding arm's own device answer, asked *before*
+    // the declaration walk — the arm decides what the declaration *says*
+    // (`FootprintProof::BindingRange` versus the census's by-name refusal), so
+    // an answer read after the walk would arrive after the walk had already
+    // answered by name. Asked for exactly the population the arm can answer
+    // about ([`stage_buffer_binding_range_candidate`]): a request whose every
+    // declaration states a reach this rail can weigh never puts the rail's
+    // provider in place, and the ~99.9 % of draws that declare no
+    // `[[buffer(N)]]` argument at all reach it no earlier than they did.
+    let stage_buffer_binding_range = if stage_buffer_binding_range_candidate(inputs) {
+        match declared_stage_buffer_binding_range() {
+            Ok(declared) => declared,
+            // Same fail-closed direction as the two answers above: an
+            // unanswerable candidate is an in-class candidate, so the draw is
+            // declined rather than run on a rail the class never named.
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        }
+    } else {
+        false
     };
     // R37: the extent rule's own class condition, and the second device answer
     // this rail asks *before* the gate. The rule it lifts sits inside the
@@ -10889,6 +11054,7 @@ fn submit_render_inner(
         req,
         stage_buffer_namespace_split,
         stage_buffer_per_stage_ceiling,
+        stage_buffer_binding_range,
         render_texture_gathered_extent,
         render_texture_gathered_extent_no_copy,
         render_vertex_interface_superset,
@@ -13175,6 +13341,13 @@ fn narrow_class<'a>(
     req: &'a DrawRequest,
     stage_buffer_namespace_split: bool,
     stage_buffer_per_stage_ceiling: Option<usize>,
+    // Whether this draw's provider executes a `[[buffer(N)]]` declaration whose
+    // reach the translation could not state (R48, E-SB3). Read by the caller
+    // out of the same capability frame and under its own candidate test,
+    // exactly as the answers beside it are; the walk below states the arm's
+    // contract proof and keeps the census's refusal for it when the device
+    // never declared it.
+    stage_buffer_binding_range: bool,
     render_texture_gathered_extent: bool,
     render_texture_gathered_extent_no_copy: bool,
     render_vertex_interface_superset: bool,
@@ -14241,6 +14414,7 @@ fn narrow_class<'a>(
         canonical_vertex_stream_count(&req.vertex_attributes),
         stage_buffer_namespace_split,
         stage_buffer_per_stage_ceiling,
+        stage_buffer_binding_range,
     )?;
     // The sampled textures the fragment stage reads (v101, `research/docs/23`
     // §101): the class states the module's own declarations beside the draw's
