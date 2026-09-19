@@ -7088,6 +7088,96 @@ pub fn override_render_fragment_output_superset(
     }
 }
 
+/// The device's own answer for the 16-bit shader capability pair, and the
+/// states the test instrument below can put it in (2026-09-20).
+const HALF_CAPABILITIES_DEVICE: u8 = 0;
+const HALF_CAPABILITIES_NOT_DECLARED: u8 = 1;
+const HALF_CAPABILITIES_DECLARED: u8 = 2;
+
+/// Whether the 16-bit shader capability pair is read from the device's own
+/// frame ([`HALF_CAPABILITIES_DEVICE`], what production runs) or from an answer
+/// a test stated.
+static HALF_CAPABILITIES_ANSWER: AtomicU8 = AtomicU8::new(HALF_CAPABILITIES_DEVICE);
+
+/// A test's own answer for the 16-bit shader capability pair, restored when it
+/// drops.
+///
+/// The same guard shape as [`FragmentOutputSupersetOverride`] and for the same
+/// two reasons — the rail reads the bit out of the provider's own capability
+/// frame, and a test on a device that *does* answer for the pair (both the
+/// WSL Lavapipe and the RTX 5060 enable `shaderFloat16`/`shaderInt16`) still
+/// has to read the arm a device that does not answer leaves: the frame before
+/// the section, which is what every census boot so far carried.
+pub struct HalfCapabilitiesOverride {
+    previous: u8,
+}
+
+impl Drop for HalfCapabilitiesOverride {
+    fn drop(&mut self) {
+        HALF_CAPABILITIES_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the 16-bit shader capability pair as `declared` until the returned guard
+/// drops, or as the device's own answer for `None` (2026-09-20).
+///
+/// `Some(true)` states a device that enabled both features, `Some(false)` the
+/// pre-increment frame: a tail that ends before the `0x00 0x10` section.
+pub fn override_render_half_capabilities(declared: Option<bool>) -> HalfCapabilitiesOverride {
+    let answer = match declared {
+        None => HALF_CAPABILITIES_DEVICE,
+        Some(false) => HALF_CAPABILITIES_NOT_DECLARED,
+        Some(true) => HALF_CAPABILITIES_DECLARED,
+    };
+    HalfCapabilitiesOverride {
+        previous: HALF_CAPABILITIES_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// The 16-bit shader capability pair, read out of the device's own capability
+/// frame (2026-09-20, census v48's LPF pipeline).
+///
+/// The sixteenth reading of the one-snapshot rule
+/// ([`declared_render_fragment_output_superset`] is the fifteenth), and the one
+/// the class gate needs for the module census v48's remaining LPF pipeline
+/// carries: the pair `OpCapability Float16`/`Int16` is admitted by Vulkan
+/// exactly on a device created with `shaderFloat16` and `shaderInt16`, and the
+/// frame's one bit is that conjunction. A provider that does not state it
+/// refuses a module which declares the pair by name
+/// (`render_stage_capability_unavailable`), and a draw the class handed such a
+/// provider is a draw no rail answered — the census red line
+/// `draws_skipped_after_engine_refusal`.
+///
+/// `false` is the fail-closed answer, and it is what a frame written before the
+/// section existed decodes to: a decoder that predates the tag refuses the
+/// frame rather than reading a value, and one that carries the tag reads
+/// `false` out of a frame that ends before it. A device whose frame does not
+/// state the bit is a device that keeps its own refusal by name for the module.
+fn declared_render_half_capabilities() -> Result<bool, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The one thing that ever replaces the device's own snapshot is the test
+    // instrument below, and it replaces it *before* the frame is written, so
+    // what this function answers is always the frame's own reading of a
+    // snapshot — never a second opinion read beside it.
+    let capabilities = {
+        let declared = rail.provider.capabilities();
+        match HALF_CAPABILITIES_ANSWER.load(Ordering::Relaxed) {
+            HALF_CAPABILITIES_DEVICE => declared,
+            answer => {
+                let mut declared = declared;
+                declared.supports_render_half_capabilities = answer == HALF_CAPABILITIES_DECLARED;
+                declared
+            }
+        }
+    };
+    provider_wire::render_half_capabilities(rail.provider.device_epoch(), &capabilities).map_err(
+        |decline| ProviderRenderDecline::StageBufferWire {
+            step: decline.step,
+            detail: decline.detail,
+        },
+    )
+}
+
 /// The superset fragment interface, read out of the device's own capability
 /// frame (2026-09-20, the third door behind census v46's
 /// `stage_buffer_footprint` bucket).
@@ -7795,6 +7885,60 @@ fn fragment_output_superset_module(
         Some(stage.reflection().render_targets.len() > 1)
     })()
     .unwrap_or(true);
+    modules.insert(inputs.fragment_air.to_vec(), answer);
+    Ok(answer)
+}
+
+/// Whether this draw's own fragment module declares the 16-bit shader
+/// capability pair (2026-09-20, census v48's LPF pipeline).
+///
+/// The module half of the ask, and the one the class gate cannot read out of
+/// the request: the census's LPF fragment stage narrows a float to `half` and
+/// reads the bits back through an `i16` shift, which the pinned translator
+/// emits as `OpCapability Float16` beside `OpCapability Int16`. Whether *this*
+/// provider's SPIR-V subset contains them is the provider's own answer
+/// ([`declared_render_half_capabilities`], read out of the capability frame),
+/// so the two halves are read apart, exactly as the superset fragment
+/// interface's module half beside it is.
+///
+/// The reading is E's own walk over the module's translated words
+/// ([`TranslatedRenderStage::declared_shader_capabilities`]), which is the same
+/// translator the registration runs and the same vocabulary the gate's policy
+/// speaks — a module that does not translate even under the admitting policy
+/// (an unsupported shape, a capability the gate cannot express) answers
+/// `false`, because the capabilities of a module nothing can decode are not a
+/// question this walk answers and every other refusal keeps its own name. The
+/// answer is cached by the module's own bytes: the guest builds a handful of
+/// fragment modules per boot and draws with each of them tens of thousands of
+/// times, so the translation is paid once per module rather than once per draw.
+#[cfg(feature = "provider-render")]
+fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, ProviderRenderDecline> {
+    let provider_rail = rail().map_err(IntoRender::into_render)?;
+    let render_rail = render_rail();
+    let mut modules = render_rail.half_capability_modules.lock().map_err(|_| {
+        ProviderRenderDecline::PipelineCompile {
+            step: "half_capability_module",
+            detail: "the fragment module cache is poisoned".to_owned(),
+        }
+    })?;
+    if let Some(answer) = modules.get(inputs.fragment_air) {
+        return Ok(*answer);
+    }
+    let answer = (|| -> Option<bool> {
+        let entry = inputs.fragment_entry?;
+        let function = provider_rail
+            .device
+            .new_library_with_binary_air(inputs.fragment_air.to_vec())
+            .ok()?
+            .function(entry)
+            .ok()?;
+        Some(
+            TranslatedRenderStage::declared_shader_capabilities(RenderStage::Fragment, &function)
+                .ok()?
+                .declares_half(),
+        )
+    })()
+    .unwrap_or(false);
     modules.insert(inputs.fragment_air.to_vec(), answer);
     Ok(answer)
 }
@@ -11090,6 +11234,17 @@ struct RenderRail {
     /// is paid once per distinct fragment module because the guest builds few
     /// and draws with each of them many times.
     fragment_output_superset_modules: Mutex<HashMap<Vec<u8>, bool>>,
+    /// Whether one fragment module declares the 16-bit shader capability pair,
+    /// keyed by the module's own bytes (2026-09-20, census v48's LPF pipeline).
+    ///
+    /// The class gate has to answer "does this draw's module need a capability
+    /// this provider's SPIR-V subset does not contain" before the registration
+    /// runs, and the answer is a property of the *module*: the walk is E's own
+    /// ([`TranslatedRenderStage::declared_shader_capabilities`], the same
+    /// translator the registration runs), and it is paid once per distinct
+    /// fragment module because the guest builds few and draws with each of them
+    /// many times.
+    half_capability_modules: Mutex<HashMap<Vec<u8>, bool>>,
 }
 
 /// Cache key of one registered render pipeline: everything the registration
@@ -11725,6 +11880,29 @@ fn submit_render_inner(
         },
         Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
     };
+    // The 16-bit shader capability pair (2026-09-20, census v48's LPF
+    // pipeline): the sixteenth device answer this rail asks *before* the gate,
+    // and the second whose candidate is a fact about the *module* rather than
+    // the request. The module half decides whether the question is asked at all
+    // — a module that declares neither `Float16` nor `Int16` answers `false`
+    // here and never reaches the frame — and the device half is the provider's
+    // own capability answer for the pair. A provider that does not state it
+    // refuses such a module at registration by name
+    // (`render_stage_capability_unavailable`), which is a draw no rail
+    // answered: the census red line `draws_skipped_after_engine_refusal`. This
+    // is the door the census's own module meets once the volume lane and the
+    // sampler pairing beside it are open, and it is deliberately read *before*
+    // the superset fragment interface's answer is used, because a module the
+    // provider cannot translate at all is one no attachment list has an
+    // opinion about.
+    let render_half_capabilities = match half_capability_module(inputs) {
+        Ok(false) => true,
+        Ok(true) => match declared_render_half_capabilities() {
+            Ok(declared) => declared,
+            Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+        },
+        Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+    };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     let pass = match narrow_class(
@@ -11746,6 +11924,7 @@ fn submit_render_inner(
         render_pass_entry_snapshot,
         render_vertex_count_above_triangle,
         render_fragment_output_superset,
+        render_half_capabilities,
     ) {
         Err(reason) => {
             reason.note();
@@ -14093,6 +14272,15 @@ fn narrow_class<'a>(
     // fourteen answers above are read the same way, one value per question, and
     // `false` keeps the MRT door's slug and sentence for the shape.
     render_fragment_output_superset: bool,
+    // Whether this draw's fragment module may be handed to the provider for the
+    // capability question (2026-09-20, census v48's LPF pipeline): `true` when
+    // the module declares neither half of the 16-bit pair, and, for a module
+    // that does declare one, whether the provider's SPIR-V subset contains the
+    // pair — the frame's own one-bit answer, read by the caller before the gate
+    // and under its own candidate test, exactly as the sixteen answers beside
+    // it are. `false` is the by-name refusal below, which is what keeps a
+    // module the provider cannot translate from reaching the registration.
+    render_half_capabilities: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
@@ -15107,6 +15295,26 @@ fn narrow_class<'a>(
         return Err(OutOfClass::new(
             "render_provider_out_of_class_mrt",
             "MRT stays on the engine",
+        ));
+    }
+    // The module's own SPIR-V capabilities (2026-09-20, census v48's LPF
+    // pipeline). The draw's fragment module declares the 16-bit pair — a float
+    // narrowed to `half`, its bits read back through an `i16` shift — and
+    // Vulkan admits that pair exactly on a device created with `shaderFloat16`
+    // and `shaderInt16`. The canonical provider refuses a module it cannot
+    // translate at registration by name (`render_stage_capability_unavailable`),
+    // so a provider whose capability frame does not answer for the pair is one
+    // this class must not hand the draw to: it stays on the engine under this
+    // door's own slug and sentence, and no submission is made.
+    if !render_half_capabilities {
+        return Err(OutOfClass::new(
+            "render_provider_out_of_class_module_capability",
+            "a draw whose fragment module declares SPIR-V capabilities this provider's subset \
+             does not contain stays on the engine: the module narrows a float to `half` and reads \
+             its bits back, which Vulkan admits only on a device created with `shaderFloat16` and \
+             `shaderInt16`, and this provider's capability frame does not answer for the pair — \
+             handing it the draw would be a registration the provider refuses by name, which is a \
+             draw no rail answered",
         ));
     }
     if req.raster_sample_count > 1 || req.color_sample_count > 1 || req.multisample_resolve {
