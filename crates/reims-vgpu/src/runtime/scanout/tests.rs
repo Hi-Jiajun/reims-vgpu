@@ -1462,8 +1462,16 @@ fn the_element_reading_names_what_the_window_holds_and_admits_when_it_cannot() {
     let bpr = width * bpp;
     let base_off = 0u64;
     let span = u64::from(height) * u64::from(bpr);
-    let pages = (span + page - 1) / page;
+    let pages = span.div_ceil(page);
     let gpa0 = 0x4000_0000u64;
+    let window = SampledFieldWindow {
+        width,
+        height,
+        format: u32::from(MTL_FORMAT_BGRA8_UNORM),
+        base_off,
+        bpr,
+        bpp,
+    };
 
     // A uniform dark field, which is what an unwritten window reads as.
     let mut host = FakeHost::new();
@@ -1490,7 +1498,7 @@ fn the_element_reading_names_what_the_window_holds_and_admits_when_it_cannot() {
         }
     }
 
-    match field_element_patches(&host, width, height, base_off, bpr, bpp, &gpas, page) {
+    match field_element_patches(&host, window, &gpas, page) {
         FieldElements::Reading {
             report,
             first,
@@ -1514,18 +1522,34 @@ fn the_element_reading_names_what_the_window_holds_and_admits_when_it_cannot() {
     // One row short of the bottom controls: a different window, and the
     // reading is dropped rather than rescaled onto it.
     assert!(matches!(
-        field_element_patches(&host, width, height - 1, base_off, bpr, bpp, &gpas, page),
+        field_element_patches(
+            &host,
+            SampledFieldWindow {
+                height: height - 1,
+                ..window
+            },
+            &gpas,
+            page
+        ),
         FieldElements::NotThisWindow
     ));
     // One column short of the rightmost control, likewise.
     assert!(matches!(
-        field_element_patches(&host, width - 1, height, base_off, bpr, bpp, &gpas, page),
+        field_element_patches(
+            &host,
+            SampledFieldWindow {
+                width: width - 1,
+                ..window
+            },
+            &gpas,
+            page
+        ),
         FieldElements::NotThisWindow
     ));
     // The window, with pages this device cannot read: a gap in the record, and
     // the callers drop the whole line rather than print half an answer.
     assert!(matches!(
-        field_element_patches(&host, width, height, base_off, bpr, bpp, &[], page),
+        field_element_patches(&host, window, &[], page),
         FieldElements::Unreadable
     ));
 }

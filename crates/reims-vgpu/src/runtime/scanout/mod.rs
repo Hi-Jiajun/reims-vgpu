@@ -1416,14 +1416,18 @@ enum FieldElements {
 /// instrument that settled would report the frame it had just fixed.
 fn field_element_patches<M: HostMemory>(
     host: &M,
-    width: u32,
-    height: u32,
-    base_off: u64,
-    bpr: u32,
-    bpp: u32,
+    window: SampledFieldWindow,
     gpas: &[u64],
     page: u64,
 ) -> FieldElements {
+    let SampledFieldWindow {
+        width,
+        height,
+        base_off,
+        bpr,
+        bpp,
+        ..
+    } = window;
     let fits = FIELD_ELEMENT_RECTS.iter().all(|&(x, y, w, h)| {
         x.checked_add(w).is_some_and(|right| right <= width)
             && y.checked_add(h).is_some_and(|bottom| bottom <= height)
@@ -1701,16 +1705,15 @@ pub fn note_sampled_surface_field_window<M: HostMemory>(
     // reader of this record cannot tell a missing field from a missing
     // instrument, and "the controls are not there" is exactly what an absent
     // element half would be read as.
-    let (elements, element_pattern) =
-        match field_element_patches(host, width, height, base_off, bpr, bpp, &gpas, page) {
-            FieldElements::Reading {
-                report,
-                first,
-                pattern,
-            } => (format!(" elems=[{report}] elem_first=[{first}]"), pattern),
-            FieldElements::NotThisWindow => (String::new(), 0),
-            FieldElements::Unreadable => return,
-        };
+    let (elements, element_pattern) = match field_element_patches(host, window, &gpas, page) {
+        FieldElements::Reading {
+            report,
+            first,
+            pattern,
+        } => (format!(" elems=[{report}] elem_first=[{first}]"), pattern),
+        FieldElements::NotThisWindow => (String::new(), 0),
+        FieldElements::Unreadable => return,
+    };
     let (map_gen, epoch) = state
         .mappings
         .get(&mapping_id)
@@ -1909,8 +1912,16 @@ pub fn note_present_field_witness<M: HostMemory>(
     // and cannot be read drops the line whole rather than offering a background
     // reading that an absent element half would turn into "the controls are not
     // there".
+    let elements_window = SampledFieldWindow {
+        width,
+        height,
+        format: u32::from(format),
+        base_off,
+        bpr,
+        bpp,
+    };
     let (elements, element_pattern) =
-        match field_element_patches(host, width, height, base_off, bpr, bpp, &gpas, page) {
+        match field_element_patches(host, elements_window, &gpas, page) {
             FieldElements::Reading {
                 report,
                 first,
