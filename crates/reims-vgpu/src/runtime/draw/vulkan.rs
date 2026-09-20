@@ -11580,6 +11580,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // answers.
             #[cfg(feature = "provider-render")]
             let mut chain_source_miss = None;
+            let _seam_frame_chain = seam_span(crate::runtime::drain::FrameSpan::SeamFrameChain);
             #[cfg(feature = "provider-render")]
             let resident_source_frame = if chain_source_is_engine_resident {
                 match resources.target_identity.as_ref() {
@@ -11603,6 +11604,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             } else {
                 None
             };
+            drop(_seam_frame_chain);
             // R26: the same read, for the other naming of the same fact. The
             // frame the mapper-ref-texture LOAD elided onto lives in the
             // engine's registry under the identity the elision returned — the
@@ -11617,6 +11619,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // ready; those keep the class's refusal by name.
             #[cfg(feature = "provider-render")]
             let mut mapper_ref_source_miss = None;
+            let _seam_frame_surface = seam_span(crate::runtime::drain::FrameSpan::SeamFrameSurface);
             #[cfg(feature = "provider-render")]
             let surface_resident_source_frame = match mapper_ref_load_handover.as_ref() {
                 // The identity the elision named has to be the identity this
@@ -11659,6 +11662,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     None
                 }
             };
+            drop(_seam_frame_surface);
             // This record's place in the packet the exec loop is walking: the
             // store plan's `do_writeback` says where the frame goes, and
             // `continues_render_pass` says whether a record precedes it. Both
@@ -11685,6 +11689,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // own resident (R7b/R23's arms elect those), and a frame that
             // cannot travel as four-byte colour; the class then keeps the
             // record on the engine by name.
+            let _seam_frame_carry = seam_span(crate::runtime::drain::FrameSpan::SeamFrameCarry);
             let middle_source_frame =
                 if role == RenderChainRole::Middle && !resources.load_from_target {
                     chain_middle_source_frame(&resources)
@@ -11716,6 +11721,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     None
                 };
+            drop(_seam_frame_carry);
             drop(_seam_frames);
             // The preserving-window door's page walk: the seam's second
             // guest-memory walk, and the one place `gva_attachment_window` runs.
@@ -11805,8 +11811,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             #[cfg(feature = "provider-render")]
             let mut sampled_target_frame_store = Vec::new();
             #[cfg(feature = "provider-render")]
-            let sampled_target_frames =
-                sampled_target_frames(&resources, &mut sampled_target_frame_store);
+            let sampled_target_frames = {
+                let _seam_sample_frames =
+                    seam_span(crate::runtime::drain::FrameSpan::SeamSampleFrames);
+                sampled_target_frames(&resources, &mut sampled_target_frame_store)
+            };
             // R34: the route the class's one `resident_source` refusal is
             // charged under, for the record whose chain neither byte arm above
             // carried. The doors are this layer's own facts (each is set where

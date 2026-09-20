@@ -627,11 +627,48 @@ pub(crate) enum FrameSpan {
     /// bookkeeping, including the out-of-class line and shape latch that an
     /// engine-rail boot pays on every draw the class refuses.
     SeamAnswer = 32,
+    /// The four bars below divide [`Self::SeamFrames`] and [`Self::SeamInputs`]
+    /// at the calls that name different fixes, and are charged the same way —
+    /// on the encode, not on the walk's probe.
+    ///
+    /// # Why the first split was not enough
+    ///
+    /// The first eg1b round (300 s, 61 716 draws, guest import off) read the
+    /// seam as **322 µs of a 436.7 µs engine bar — 73.7 %** — with two bars
+    /// carrying it: `seam_frames_us_mean` 179.5 µs/draw (41.1 %) and
+    /// `seam_inputs_us_mean` 132.8 (30.4 %). Both are frame-sized work and
+    /// both are *inside one function*, but they are four different calls with
+    /// four different fixes, and the round cannot say which one to take.
+    ///
+    /// The pressure is real rather than academic: the same round read
+    /// `engine_delta target_reads=153 800` (2.5 per draw) against 233 GB of
+    /// target bytes, while only ~11 % of draws take either of the two
+    /// chain-frame doors — so most of that readback is somewhere inside these
+    /// four bars and none of them is named.
+    ///
+    /// `resident_chain_source_frame` — the chain's own resident, read out of
+    /// the registry for the byte arm. `read_target` plus the four-byte-colour
+    /// narrow, per draw that takes it.
+    SeamFrameChain = 33,
+    /// The mapper-ref-texture seed's own frame: the same read, under the
+    /// second naming of the same fact (R26), taken only for the record whose
+    /// frame lands in the mapping's guest pages.
+    SeamFrameSurface = 34,
+    /// `chain_middle_source_frame`, once for the middle arm and once for the
+    /// seed arm (R25/R32): a `to_vec` of the request's own `target_rgba8` with
+    /// an in-place channel swap when the two orders disagree — a full-frame
+    /// **memcpy** per draw, on every draw that carries one.
+    SeamFrameCarry = 35,
+    /// `sampled_target_frames`: the sampled GPU targets this caller can read
+    /// out for the record, one registry read per target the bind names (R24).
+    /// The only one of the four that scales with the *bind count* rather than
+    /// with the record.
+    SeamSampleFrames = 36,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::SeamAnswer as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::SeamSampleFrames as usize + 1;
 
 impl FrameSpan {
     /// The bar a [`crate::runtime::chain_phase::Phase`] ordinal names.
@@ -717,6 +754,10 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "seam_windows_us_mean",
     "seam_inputs_us_mean",
     "seam_answer_us_mean",
+    "seam_frame_chain_us_mean",
+    "seam_frame_surface_us_mean",
+    "seam_frame_carry_us_mean",
+    "seam_sample_frames_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.

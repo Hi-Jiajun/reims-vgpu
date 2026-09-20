@@ -3323,12 +3323,28 @@ fn each_seam_bar_is_charged_only_its_own_region() {
         (FrameSpan::SeamWindows, "seam_windows_us_mean", 5_000),
         (FrameSpan::SeamInputs, "seam_inputs_us_mean", 6_000),
         (FrameSpan::SeamAnswer, "seam_answer_us_mean", 7_000),
+        (FrameSpan::SeamFrameChain, "seam_frame_chain_us_mean", 8_000),
+        (
+            FrameSpan::SeamFrameSurface,
+            "seam_frame_surface_us_mean",
+            9_000,
+        ),
+        (
+            FrameSpan::SeamFrameCarry,
+            "seam_frame_carry_us_mean",
+            10_000,
+        ),
+        (
+            FrameSpan::SeamSampleFrames,
+            "seam_sample_frames_us_mean",
+            11_000,
+        ),
     ];
     let c = FrameProfileCensus::with_report_ms(15);
     assert!(c.note_present(1_000_000, 1_000, false).is_none());
     // One frame, one draw, one engine bar the seven are carved out of.
     c.note_draw(1_000);
-    c.note_span(FrameSpan::Engine as usize, 28_000_000);
+    c.note_span(FrameSpan::Engine as usize, 100_000_000);
     for (bar, _, us) in named {
         c.note_span(bar as usize, us * 1_000);
     }
@@ -3350,11 +3366,11 @@ fn each_seam_bar_is_charged_only_its_own_region() {
     }
     // Every seam bar is inside the engine bar, so the seven plus the two rails
     // are slices of one span rather than a second charge beside it.
-    let engine = 28_000u64;
+    let engine = 100_000u64;
     let charged: u64 = named.iter().map(|(_, _, us)| us / 1_000).sum();
     assert!(
         charged < engine,
-        "the seam's seven regions cannot be the whole engine bar in this fixture"
+        "the seam's regions cannot be the whole engine bar in this fixture"
     );
     // A phase ordinal can never reach a seam bar, so a chain phase cannot be
     // charged under one of these names.
