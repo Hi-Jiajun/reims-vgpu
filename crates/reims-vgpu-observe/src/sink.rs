@@ -124,6 +124,31 @@ pub fn fail_log_path() -> &'static str {
     FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
 }
 
+/// Append one always-on line to the fail log **from the calling thread**.
+///
+/// The product path hands lines to a background writer ([`writer`]) so no
+/// producer pays a `write(2)`. That indirection is exactly what a caller at
+/// process teardown cannot rely on: the line is queued, the process exits, and
+/// the queue dies with it. A reader then sees a log that ends earlier than the
+/// device did, which for a dump of what this boot wrote reads as "not written".
+///
+/// So this opens, writes and closes on the caller's own thread. It is a
+/// deliberately single-purpose entry point: a shutdown-time emitter with one
+/// line to lose, not a second write path for the sink.
+pub fn off_sync(msg: &str) {
+    use std::io::Write as _;
+
+    let t = elapsed_ms();
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fail_log_path())
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{msg} t={t}");
+}
+
 pub fn draw_log_path() -> &'static str {
     #[cfg(any(test, feature = "testing"))]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
