@@ -4405,18 +4405,23 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
         // the latches. Assembling it here from the latches alone is what let
         // this rail import on a host that had already refused the whole map.
         let align = crate::runtime::guest_ram_map::packed_alias_import_align(host, map_len)?;
-        let gpas = gva_mem::task_gva_page_gpas(
+        // One `Arc` for the three readers that need the list: the alias import,
+        // which keeps it as the guest coordinate of the host range it is about
+        // to bind (2026-09-20 — the read-side probe asks a packed bind which
+        // guest pages it read, and before this the alias could not answer), the
+        // packed resource below, and the map itself.
+        let gpas = std::sync::Arc::new(gva_mem::task_gva_page_gpas(
             host,
             &state.tasks,
             task_id,
             page_base,
             map_len,
             state.page_shift,
-        );
+        ));
         if gpas.len() as u64 != map_len / page {
             return None;
         }
-        let host_base = host.map_pages(&gpas, page as usize)?;
+        let host_base = host.map_pages(gpas.as_ref(), page as usize)?;
         // Cut in the *view's* coordinates, and cut here rather than below,
         // because `head` is about to be rebound. The RAMBlock arm below
         // replaces it with an offset measured from the import's `gpa_base`,
@@ -4479,8 +4484,19 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("zc_packed_alias_import");
                 crate::runtime::drain::note_store_route(packed_scatter_band(&gpas, page));
                 let import = std::sync::Arc::new(
-                    crate::runtime::guest_ram::GuestRamImport::new_host_allocation(
-                        host_base, map_len, align,
+                    // The alias's own guest pages travel with it (2026-09-20):
+                    // this host range *is* those pages, and the readers that
+                    // have to judge the bytes — the read-side probe's
+                    // `released_pages::note_read`, which asks one address per
+                    // page — can name them only if the import still knows them.
+                    // A range whose provenance stops at "some guest bytes" is
+                    // indistinguishable from one nobody bothered to name.
+                    crate::runtime::guest_ram::GuestRamImport::new_packed_alias(
+                        host_base,
+                        map_len,
+                        align,
+                        page,
+                        std::sync::Arc::clone(&gpas),
                     )
                     .ok()?,
                 );
@@ -4508,7 +4524,7 @@ pub(super) fn ensure_packed_resource<M: HostMemory + HostOps>(
             size: backing.size,
             head,
             import,
-            gpas: std::sync::Arc::new(gpas),
+            gpas,
             runs: std::sync::Arc::new(vec![run]),
             pages: std::sync::Arc::new(vec![crate::runtime::guest_ram_map::GuestWindowRun {
                 window_offset: 0,
@@ -12213,6 +12229,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 sampler_family: &sampler_family,
                 texture_interface_refusals: resolved.texture_interface_refusals.as_ref(),
                 stage_buffer_binds: &stage_buffer_binds,
+                // The read-side probe's census, for the one entry on the
+                // provider rail — a sampled bind whose texels are the guest's
+                // own pages. Handed over rather than reached for: the rail is a
+                // function of its inputs, and this is an input. `Some` on every
+                // boot; whether the probe looks at it is the operator switch's
+                // answer, not this field's.
+                read_guard: Some(&state.host_writes),
                 // R4b, probe-gated: the present tail a record states when it is
                 // the one whose frame the guest displays and that frame lands in
                 // a named mapping. `None` is the pre-R4b device.
