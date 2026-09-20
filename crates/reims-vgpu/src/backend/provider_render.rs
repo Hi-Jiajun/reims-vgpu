@@ -5975,11 +5975,14 @@ impl SampledGatherExit {
 /// **570 checked reads over 102 890 pages against 0 findings**. What none of
 /// them covered is the read this function names: a sampled texture whose bytes
 /// *are* the guest's pages, resolved here rather than by the draw path's buffer
-/// resolution. The census sizes it at 278 borrowed windows plus 280 repacked or
-/// staged copies in one 430 s boot
-/// (`render_provider_sampled_window_borrowed`, `…_rows_depadded`), so it is not
-/// a corner: it is the last GPU read family of any size that the probe could not
-/// see at all.
+/// resolution. The census sizes it at **99 168 borrowed windows** (nonzero in
+/// 278 of 285 windows) plus 264 staged and 6 246 repacked rows in one 430 s
+/// boot — `render_provider_sampled_window_borrowed`,
+/// `…_window_staged`, `…_rows_depadded`. It is not a corner: it is one of the
+/// largest read families of a boot, and the last one the probe could not see at
+/// all. (The import-read round sized this family at 9–21 from
+/// `sampled_guest_imports`, which is the *engine* rail's counter for its own
+/// GPU copies — a different rail, three orders of magnitude smaller.)
 ///
 /// # One entry, not one per arm
 ///
