@@ -72,6 +72,89 @@ fn the_relay_keeps_a_frame_only_for_the_image_its_successor_resolves() {
     );
 }
 
+/// G3-B/B-1's run rule, driven by the same probes the keep plan reads.
+///
+/// A run is the keep plan read as a *range*: the record `k` a plan keeps is one
+/// the run carries, and the run ends at the first record whose own frame
+/// nothing after it takes. The cases below are the shapes a packet can offer —
+/// a clean chain, a chain with a hole, two chains that name two images, the
+/// packet's own tail, and the shortest run there is — and the last one is the
+/// rule that keeps this increment off every packet it cannot carry.
+#[test]
+fn a_batch_carries_a_run_only_while_one_image_holds() {
+    let admitted = |attachment: Option<(u64, u64)>| draw::ChainHandoffProbe {
+        verdict: draw::ChainProbe::Admitted,
+        attachment,
+    };
+    let refused = |attachment: Option<(u64, u64)>| draw::ChainHandoffProbe {
+        verdict: draw::ChainProbe::Refused,
+        attachment,
+    };
+    let same = Some((0x7265_7369_0000_0007, 1));
+    let moved = Some((0x7265_7369_0000_0008, 1));
+    let run = |start: usize, probes: &[draw::ChainHandoffProbe]| {
+        let keep = chain_relay_keep_plan(probes);
+        render_batch_run(start, &keep, probes)
+    };
+
+    // Three records of one image: both keepers and the tail are one run.
+    let chain = [admitted(same), admitted(same), admitted(same)];
+    assert_eq!(
+        run(0, &chain),
+        Some(RenderBatchRun { origin: 0, end: 2 }),
+        "two keepers and the tail they publish through are one run"
+    );
+    // The shortest run: one keeper and the record that loads its frame. A
+    // packet of two records is batched, and a packet of one is not — that is
+    // the rule that keeps a lone record on the path it always ran.
+    assert_eq!(
+        run(0, &chain[..2]),
+        Some(RenderBatchRun { origin: 0, end: 1 }),
+        "two records of one image are a run of two"
+    );
+    assert_eq!(run(0, &chain[..1]), None, "a lone record is not a run");
+
+    // The hole: a record whose successor the class refuses keeps nothing, so a
+    // run that reached for it would be a trace with a pass nothing loads.
+    let holed = [admitted(same), refused(same), admitted(same)];
+    assert_eq!(run(0, &holed), None, "a refused successor ends the run");
+    // Two images filed together: the second run starts at the record that
+    // publishes the first, and the two cannot be one trace.
+    let two = [
+        admitted(same),
+        admitted(same),
+        admitted(moved),
+        admitted(moved),
+    ];
+    assert_eq!(
+        run(0, &two),
+        Some(RenderBatchRun { origin: 0, end: 1 }),
+        "the run stops at the record that loads another image"
+    );
+    assert_eq!(
+        run(2, &two),
+        Some(RenderBatchRun { origin: 2, end: 3 }),
+        "…and the two records after it are their own run, under the second image"
+    );
+    // A record the class answered nothing about names no image to build a run
+    // under, and one it never answered at all is the same answer one layer up.
+    assert_eq!(run(0, &[admitted(None), admitted(None)]), None);
+    assert_eq!(
+        run(
+            0,
+            &[
+                admitted(same),
+                draw::ChainHandoffProbe {
+                    verdict: draw::ChainProbe::Unavailable,
+                    attachment: same,
+                },
+            ],
+        ),
+        None,
+        "an unadmitted record is not a run's tail"
+    );
+}
+
 #[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
     assert_eq!(render_pass_chain_position(0, 1), (false, false));

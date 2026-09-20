@@ -11,6 +11,7 @@ pub mod vulkan;
 
 // The backend the process executes on, reached only through the trait: this
 // module names no rail.
+use crate::backend::provider_render::RenderBatch;
 use crate::backend::Backend as _;
 use crate::model::DeviceState;
 use crate::protocol::draw::DrawArgs;
@@ -5358,6 +5359,17 @@ fn finish_stream<M: HostMemory + HostOps>(
             probes.first().and_then(|probe| probe.attachment),
             probes.last().and_then(|probe| probe.attachment),
         );
+        // G3-B/B-1: the runs of records this packet may assemble into single
+        // traces, decided **here** and never after an assembly has begun.
+        //
+        // The class gate's per-record readings are populations the census
+        // divides, so a walk that parked a record and then changed its mind
+        // would count that record's route twice — which is why the admission
+        // is the probes' own answer (already taken, above) plus the keep plan
+        // (already computed, above) and nothing a park step returns. A record
+        // whose shape the walk cannot prove belongs to a run is a record that
+        // runs the path it ran before this increment.
+        let batch_enabled = render_batch_enabled();
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let Some(req) = requests.get_mut(di) else {
@@ -5374,6 +5386,141 @@ fn finish_stream<M: HostMemory + HostOps>(
             req.chain_resident_successor = probes
                 .get(di + 1)
                 .and_then(|successor| successor.attachment);
+            // G3-B/B-1: the batch under construction, when this record opens a
+            // run of kept records. Held here rather than in a scope of its own
+            // because a run outlives the record that opened it: the members of
+            // the run park across the loop's own iterations, and the tail —
+            // which is *not* a member yet — is what finishes it.
+            let mut batch = RenderBatch::new();
+            let batch_run = batch_enabled
+                .then(|| render_batch_run(di, &keep_frame, &probes))
+                .flatten();
+            // The run's own image: the pair every member's pass states, and the
+            // pair the run's trace is one image under. Read from the *run's*
+            // first admitted record rather than from the record that keeps
+            // nothing, because those two are the same pair by the run's
+            // construction (`render_batch_run`) and reading it here is what
+            // makes a member's fixup independent of the record before it.
+            let batch_identity = batch_run.and_then(|run| probes[run.origin].attachment);
+            // Where a run ends: one past its publishing tail. Records
+            // `di .. batch_tail` are members (they park and answer nothing),
+            // `batch_tail` is the tail itself (it parks and finishes the run,
+            // and its answer travels through the same arms a lone record's
+            // answer does), and `di > batch_tail` is not this run's business.
+            let batch_origin = batch_run.map(|run| run.origin).unwrap_or(di);
+            let batch_tail = batch_run.map(|run| run.end + 1).unwrap_or(di);
+            if batch_enabled && batch_identity.is_some() && di < batch_tail {
+                // A member of the run: it loads the frame the record before it
+                // keeps — which is the *run's* image, stated by that record's
+                // own probe — and keeps its own for the record after it. Nothing
+                // of this arm reads an answer, so nothing here can discover
+                // after the fact that the run was not the one to build.
+                let last = di + 2 == batch_tail;
+                // Which image this record's load names. The run states one
+                // image for every member of it, and the head is the one member
+                // whose frame comes from a *completed* submission rather than
+                // from a record of this run — so it keeps the pair the walk
+                // carried in, and every other member names the run's own.
+                // (The two are the same pair whenever the head's predecessor
+                // kept its frame, which is what its own probe proved.)
+                let identity = if di == batch_origin {
+                    provider_resident_attachment
+                } else {
+                    batch_identity
+                };
+                req.chain_loads_resident = true;
+                req.chain_resident_attachment = identity;
+                req.chain_resident_successor = probes
+                    .get(di + 1)
+                    .and_then(|successor| successor.attachment);
+                if last {
+                    note_render_batch_run(batch_tail - di);
+                }
+                // The same 570-line Store-routing chain the single-record path
+                // runs, reached through `park_draw_chain`: a tail parks *and
+                // finishes* the run, so the answer the run's one completion
+                // produced for it travels through every arm below unchanged.
+                let encode =
+                    crate::backend::selected().park_draw_chain(state, host, req, last, &mut batch);
+                // The `unified` half of the chain source, and the same `match`
+                // the record would run below: a member that stops naming the
+                // mapping's own pages is a *frame* the run would have to carry
+                // through the host bus between two passes of one trace, which
+                // is exactly the shape a batch exists not to have.
+                if !last {
+                    // The one shape a run cannot carry: a member whose frame
+                    // has nowhere to stay.
+                    //
+                    // A member states `StoreOp::Resident` and the record after
+                    // it states `LoadOp::Resident` for the same image, which is
+                    // the whole of what makes a run one trace instead of N
+                    // submissions. The engine reaches such a frame by one of
+                    // two routes — the mapper-ref-texture mapping's own pages
+                    // (`mapping_id != 0`), or the GVA target's registry resident
+                    // (`target_gva != 0`) — and a record that names neither has
+                    // no image the next member could load: its pass would
+                    // materialize the frame on the host instead, and the run
+                    // would be N passes in one trace with two trips across the
+                    // bus between them, which is the cost the run exists to
+                    // avoid and not a shape any counter would explain.
+                    //
+                    // The walk decides this from the record's own request rather
+                    // than from an answer, because the decision has to be made
+                    // *before* anything is parked: a run this arm does not elect
+                    // runs the per-record path it ran before this increment,
+                    // with that path's own counters intact.
+                    let color0 = req.colors.first();
+                    let reaches_its_frame = color0.is_some_and(|c| c.mapping_id != 0)
+                        || color0.is_some_and(|c| c.target_gva != 0);
+                    if !reaches_its_frame {
+                        // Refused before the run is committed to: the record
+                        // this arm stops on is one whose own pass would publish,
+                        // and every member before it has parked into a run that
+                        // is now given back.
+                        crate::runtime::drain::note_store_route(
+                            "render_provider_batch_member_refused",
+                        );
+                        crate::runtime::drain::note_store_route("render_provider_batch_failed");
+                        crate::runtime::drain::note_store_route_n(
+                            "render_provider_batch_failed_draws",
+                            u64::try_from(di + 1 - batch_origin).unwrap_or(1),
+                        );
+                        if crate::observe::first_sight(
+                            "render_provider_batch_member_refused",
+                            u64::from(pd.pipeline_ref),
+                        ) {
+                            crate::observe::fail(format!(
+                                "render_provider_batch_member_refused \
+                                 reason=run_member_reaches_no_image task={task_id} \
+                                 pipe={} di={di}/{} mid={} gva={:#x}",
+                                pd.pipeline_ref,
+                                draw_list.len(),
+                                color0.map(|c| c.mapping_id).unwrap_or(0),
+                                color0.map(|c| c.target_gva).unwrap_or(0),
+                            ));
+                        }
+                        batch.abandon();
+                        match encode {
+                            (EncodeStatus::Parked, _) => {}
+                            (status, _) => {
+                                debug_assert!(false, "a run's member parked nothing: {status:?}");
+                                out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
+                            }
+                        }
+                        break;
+                    }
+                    match encode {
+                        (EncodeStatus::Parked, _) => {}
+                        (status, _) => {
+                            debug_assert!(false, "a run's member parked nothing: {status:?}");
+                            batch.abandon();
+                            out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 // A resident mapper-ref-texture target carries attachment contents between
@@ -6083,6 +6230,137 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
     } else {
         MultiDrawChainSource::Missing
     }
+}
+
+/// The serial-pool budget one run's trace may spend (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// Mirrored from the emulator's `MAX_SERIAL_RESOURCES` rather than imported: the
+/// walk has to decide **before** the assembly exists, so the answer cannot be
+/// the assembly's own. When a run would carry more than this, the walk cuts the
+/// batch at the budget and counts the cut (`render_serial_pool_exhausted`)
+/// instead of handing the provider a trace it can only refuse — a shortened
+/// batch is a smaller win, and a refused one is a lost packet.
+const RENDER_BATCH_SERIAL_BUDGET: usize = 64;
+
+/// Where one run of kept records ends, and which record it began from.
+///
+/// The walk's own decision, taken from the very facts the probes produced and
+/// never from anything a park step answered — parking first and falling back
+/// afterwards would run the class gate's per-record counters twice for one
+/// record (`provider_chain_middle_probed`, `render_provider_out_of_class_*`),
+/// and the census reads those as populations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderBatchRun {
+    /// The first record of the run. Also the record whose predecessor is a
+    /// *completed* submission, which is the one member whose load is still
+    /// asked of the provider's own liveness.
+    origin: usize,
+    /// One past the run's last *keeping* record: `origin`'s frame is loaded by
+    /// `origin + 1`, and so on up to `end`, which is the run's publishing tail
+    /// because it is the first record whose own frame nothing in the packet
+    /// takes.
+    end: usize,
+}
+
+/// The run a batch may start at `start`, or `None` when one may not.
+///
+/// This is [`chain_relay_keep_plan`]'s own answer, read as a range. The plan
+/// says record `k` keeps its frame for `k + 1`; a *run* adds the two facts a
+/// single trace needs on top of that — every member was admitted with the same
+/// `(allocation, view)` pair, and every member before the tail has a successor
+/// inside the run — because one trace states one image.
+///
+/// `end == start + 1` is the shortest run there is: two records, the first
+/// keeping its frame and the second publishing it. A record whose successor the
+/// class refuses is never elected, so a run that would fall back is not built
+/// at all.
+fn render_batch_run(
+    start: usize,
+    keep: &[bool],
+    probes: &[draw::ChainHandoffProbe],
+) -> Option<RenderBatchRun> {
+    let admits = |index: usize| -> Option<(u64, u64)> {
+        let probe = probes.get(index)?;
+        match probe.verdict {
+            draw::ChainProbe::Admitted => probe.attachment,
+            // An unadmitted record is one the walk keeps nothing for, and an
+            // attachment-less one names no image a successor could load.
+            draw::ChainProbe::Refused | draw::ChainProbe::Unavailable => None,
+        }
+    };
+    let identity = admits(start)?;
+    if !keep.get(start).copied().unwrap_or(false) {
+        return None;
+    }
+    let mut end = start;
+    while end + 1 < probes.len() {
+        // The record after `end` has to be admitted under the run's own image
+        // and has to keep its own frame for the record after it — except for
+        // the one that publishes, which is where the run ends.
+        if admits(end + 1) != Some(identity) {
+            break;
+        }
+        if !keep[end + 1] {
+            end += 1;
+            break;
+        }
+        // The run would carry `end + 2 - start` records (the keepers, the one
+        // this step adds, and the tail the loop has not reached yet), which is
+        // the count the trace's serial pool is spent by. `report`'s plan
+        // reading compares the same number against the same budget, so a reader
+        // holding both windows sees one cut and one counter.
+        let carried = end + 2 - start;
+        if carried > RENDER_BATCH_SERIAL_BUDGET {
+            crate::runtime::drain::note_store_route("render_serial_pool_exhausted");
+            crate::runtime::drain::note_store_route_n(
+                "render_serial_pool_exhausted_draws",
+                u64::try_from(carried).unwrap_or(u64::MAX),
+            );
+            break;
+        }
+        end += 1;
+    }
+    // `end > start` is exactly "the run has a tail to publish through": a
+    // single kept record with no successor inside the packet is not a run, it
+    // is a record that publishes on its own, and that is the path it ran before
+    // this increment.
+    (end > start).then_some(RenderBatchRun { origin: start, end })
+}
+
+/// Whether `REIMS_VGPU_RENDER_BATCH` asked for runs of kept records to travel
+/// as one trace (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// The one name both rails read (E's `render_batch_enabled` is the other end):
+/// this side decides whether to *assemble* a run, and the canonical provider
+/// decides whether to *submit* one scope. Off by default, and read once — the
+/// control arm a round runs the pre-batch path with, so the two arms' frames
+/// are comparable byte for byte.
+fn render_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_RENDER_BATCH")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "on" | "ON" | "true" | "yes")
+        )
+    })
+}
+
+/// Count one run the walk assembled and the records it carried
+/// (`REIMS_VGPU_RENDER_BATCH`).
+///
+/// The pair beside [`report::note_render_batch_plan`]: the plan says how many
+/// records a run *would* carry, and this says how many actually travelled as
+/// one trace. A round reads the two together, because a run the plan elected
+/// and the walk did not assemble is a wiring answer rather than a workload one.
+fn note_render_batch_run(records: usize) {
+    crate::runtime::drain::note_store_route("render_provider_batch_runs");
+    crate::runtime::drain::note_store_route_n(
+        "render_provider_batch_draws",
+        u64::try_from(records).unwrap_or(u64::MAX),
+    );
 }
 
 fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingDraw) {

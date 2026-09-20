@@ -17318,6 +17318,17 @@ impl RenderBatch {
         &self.outcomes
     }
 
+    /// Take the last record's answer out of the run.
+    ///
+    /// [`park_and_finish_render`] moves rather than copies: a record's answer
+    /// carries the whole published frame on the writeback arm (8 MB at 1080p,
+    /// which is exactly the buffer this increment exists to stop moving twice),
+    /// and a `Clone` of it would be a second copy of a frame the walk is about
+    /// to hand to its own consumer.
+    pub fn take_last_outcome(&mut self) -> Option<RenderRailOutcome> {
+        self.outcomes.pop()
+    }
+
     /// Assemble one record into the run, submitting nothing.
     fn park(
         &mut self,
@@ -17404,24 +17415,45 @@ impl RenderBatch {
         match finish_narrow_records(&rail.provider, &records, assembly) {
             Ok(completions) => {
                 let records = completions.len();
-                self.outcomes = completions
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, completion)| match completion {
+                self.outcomes = Vec::with_capacity(completions.len());
+                let mut published_before_the_tail = 0_u64;
+                for (index, completion) in completions.into_iter().enumerate() {
+                    match completion {
                         RenderCompletion::Writeback(output) => {
                             // Only the run's publishing tail can have published a
                             // frame: every record before it states a resident
                             // store, and a resident store publishes nothing. A
                             // writeback anywhere else is a trace whose shape the
-                            // walk did not state.
-                            debug_assert_eq!(index + 1, records);
-                            RenderRailOutcome::ProviderCompleted(output)
+                            // walk did not state, and it is counted by name
+                            // before the answer is filed — a run whose member
+                            // published would otherwise read as a healthy one
+                            // with an extra frame nobody asked for.
+                            if index + 1 != records {
+                                published_before_the_tail += 1;
+                            }
+                            self.outcomes
+                                .push(RenderRailOutcome::ProviderCompleted(output));
                         }
                         RenderCompletion::Resident(frame) => {
-                            RenderRailOutcome::ProviderCompletedResident(frame)
+                            self.outcomes
+                                .push(RenderRailOutcome::ProviderCompletedResident(frame));
                         }
-                    })
-                    .collect();
+                    }
+                }
+                if published_before_the_tail > 0 {
+                    crate::runtime::drain::note_store_route(
+                        "render_provider_batch_member_published",
+                    );
+                    crate::runtime::drain::note_store_route_n(
+                        "render_provider_batch_member_published_draws",
+                        published_before_the_tail,
+                    );
+                    debug_assert!(
+                        false,
+                        "a run's member published {published_before_the_tail} frame(s) the run's \
+                         trace does not state"
+                    );
+                }
                 Ok(())
             }
             Err(decline) => {
@@ -17486,6 +17518,60 @@ pub fn park_render(
 /// tail is whatever its own arm answered.
 pub fn finish_render_batch(batch: &mut RenderBatch) -> Result<(), ProviderRenderDecline> {
     batch.finish()
+}
+
+/// G3-B/B-1 (wire): park one record of a run the walk has already proven, and
+/// answer the run's own completion for it — the whole of what a batch member's
+/// host-side answer is.
+///
+/// This is the walk's entry point, and the one arm [`park_render`] cannot state
+/// on its own: the park step and the finish step have to be *scheduled* by the
+/// caller, because the caller is the only thing that knows when the run is
+/// over. `finish` answers for the last record that joined, which is what the
+/// walk's own record needs on the one arm that is the trace's publishing tail.
+///
+/// A run whose last park was refused is given back here — [`RenderBatch`]'s own
+/// slots, never handed to the provider — so a refusal leaves no lease imported
+/// and no frame half-landed, exactly as the single-record arm's refusal does.
+pub fn park_and_finish_render(
+    inputs: &RenderRailInputs<'_>,
+    req: &DrawRequest,
+    batch: &mut RenderBatch,
+) -> Result<RenderRailOutcome, ProviderRenderDecline> {
+    match submit_render_inner(inputs, req, false, Some(batch)) {
+        RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted) => {}
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            batch.abandon();
+            return Err(ProviderRenderDecline::TraceAdmission {
+                detail: format!(
+                    "the run's publishing tail left the class it was probed into: {}",
+                    reason.detail()
+                ),
+            });
+        }
+        RenderRailOutcome::ProviderDeclined(decline) => {
+            batch.abandon();
+            return Err(decline);
+        }
+        // The park step submits nothing, so a completion cannot be reached.
+        RenderRailOutcome::ProviderCompleted(_)
+        | RenderRailOutcome::ProviderCompletedResident(_) => {
+            batch.abandon();
+            return Err(ProviderRenderDecline::TraceAdmission {
+                detail: "the park step answered with a completion it could not have made"
+                    .to_string(),
+            });
+        }
+    }
+    // The park step above ended its borrow, so the run's own completion is read
+    // here and moved out: the answers belong to the walk, and the batch keeps
+    // nothing that a second reader could take for a second submission.
+    finish_render_batch(batch)?;
+    batch
+        .take_last_outcome()
+        .ok_or_else(|| ProviderRenderDecline::TraceAdmission {
+            detail: "the run's completion answered fewer records than the run parked".to_string(),
+        })
 }
 
 /// The state one trace's records are assembled into, shared by every record of
