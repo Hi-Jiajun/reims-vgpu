@@ -320,6 +320,20 @@ pub enum GuestRamError {
     /// A guest physical address that this RAMBlock does not back. Includes a GPA
     /// inside the untrimmed block but below the granularity-aligned base.
     GpaOutsideImport { gpa: u64, gpa_base: u64, len: u64 },
+    /// A packed alias was handed a page size of zero, or one that is not a
+    /// power of two. The map is indexed by division, so a page size without an
+    /// index is not a map.
+    PackedPageSizeNotPowerOfTwo { page_size: u64 },
+    /// A packed alias's page map does not cover the allocation it was built
+    /// for. Every `page_size` bytes of the import have to be a named guest page
+    /// ([`GuestRamImport::gpa_at`] answers from the map), and a map that stops
+    /// short leaves the tail of the host range with a coordinate that is the
+    /// thing this constructor exists to state.
+    PackedPagesShort {
+        covered: u64,
+        len: u64,
+        page_size: u64,
+    },
 }
 
 impl Decline for GuestRamError {
@@ -340,6 +354,10 @@ impl Decline for GuestRamError {
             Self::SliceAlignedEndPastImport { .. } => "guest_ram_slice_aligned_end_past_import",
             Self::SliceForeignImport { .. } => "guest_ram_slice_foreign_import",
             Self::GpaOutsideImport { .. } => "guest_ram_gpa_outside_import",
+            Self::PackedPageSizeNotPowerOfTwo { .. } => {
+                "guest_ram_packed_page_size_not_power_of_two"
+            }
+            Self::PackedPagesShort { .. } => "guest_ram_packed_pages_short",
         }
     }
 
@@ -385,6 +403,18 @@ impl Decline for GuestRamError {
                 ("gpa", format!("{gpa:#x}")),
                 ("gpa_base", format!("{gpa_base:#x}")),
                 ("len", len.to_string()),
+            ],
+            Self::PackedPageSizeNotPowerOfTwo { page_size } => {
+                vec![("page_size", page_size.to_string())]
+            }
+            Self::PackedPagesShort {
+                covered,
+                len,
+                page_size,
+            } => vec![
+                ("covered", covered.to_string()),
+                ("len", len.to_string()),
+                ("page_size", page_size.to_string()),
             ],
         }
     }
@@ -442,6 +472,30 @@ pub struct GuestRamImport {
     /// The backend's import granularity — `minImportedHostPointerAlignment` on
     /// Vulkan, the host page size on Metal-direct.
     align: u64,
+    /// The guest page each page of this host range *is*, when this import is a
+    /// packed alias: a host allocation this process arranged by mapping the
+    /// guest's own pages into one contiguous range
+    /// ([`Self::new_packed_alias`]).
+    ///
+    /// `None` for a RAMBlock import, whose coordinate is the linear
+    /// [`Self::gpa_base`], and for a plain host allocation
+    /// ([`Self::new_host_allocation`]), which is memory this process owns and
+    /// which no guest page backs. Without it an alias is a host range whose
+    /// bytes came from the guest and which can no longer say *which* guest pages
+    /// they are — the reading [`Self::gpa_at`] exists to answer.
+    packed: Option<PackedPages>,
+}
+
+/// The guest pages one packed alias's host range is made of, in host order.
+#[derive(Clone, Debug)]
+struct PackedPages {
+    /// Bytes one entry covers: the guest's own page size when the alias was
+    /// assembled. Indexing is by division, so it is a power of two — the
+    /// constructor refuses anything else.
+    page_size: u64,
+    /// The guest page each entry *is*, ascending in host order, sharing the
+    /// caller's own page list rather than copying it.
+    pages: std::sync::Arc<Vec<u64>>,
 }
 
 impl GuestRamImport {
@@ -512,6 +566,9 @@ impl GuestRamImport {
             host_base: host_base as usize,
             len,
             align,
+            // A RAMBlock import states its coordinate linearly; it has no page
+            // map to keep.
+            packed: None,
         })
     }
 
@@ -551,7 +608,59 @@ impl GuestRamImport {
             host_base,
             len,
             align,
+            packed: None,
         })
+    }
+
+    /// Bound an already-packed host allocation **and the guest pages it is
+    /// made of**.
+    ///
+    /// This is [`Self::new_host_allocation`] with its provenance kept. A packed
+    /// alias is assembled by mapping a task's guest pages — in one task's
+    /// virtual order, so consecutive host pages name arbitrary guest pages —
+    /// into one contiguous host range, and the alias's whole value to a backend
+    /// is that it is bindable as one range. What that loses is *which* guest
+    /// pages the range is: the bytes are the guest's, the reader that would
+    /// judge them ([`crate::GuestRamImport::gpa_at`], and every check built on
+    /// it) has no coordinate to ask about, and the answer a host range with no
+    /// coordinate gives is indistinguishable from one whose pages the caller
+    /// simply did not name.
+    ///
+    /// `page_size` is the guest's own page size at the time of the map, which
+    /// is the unit `pages` is listed in: entry `i` covers
+    /// `i * page_size .. (i + 1) * page_size` of the allocation. `align` stays
+    /// the backend's *import* granularity, which is a different number on a
+    /// host whose import granule is not the guest's page — indexing is by
+    /// `page_size`, so the two do not have to agree.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::new_host_allocation`] refuses, plus a page size that
+    /// is not a power of two ([`GuestRamError::PackedPageSizeNotPowerOfTwo`])
+    /// and a map that does not cover the whole allocation
+    /// ([`GuestRamError::PackedPagesShort`]).
+    pub fn new_packed_alias(
+        host_base: usize,
+        len: u64,
+        align: u64,
+        page_size: u64,
+        pages: std::sync::Arc<Vec<u64>>,
+    ) -> Result<Self, GuestRamError> {
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return Err(GuestRamError::PackedPageSizeNotPowerOfTwo { page_size }.report());
+        }
+        let covered = (pages.len() as u64).saturating_mul(page_size);
+        if covered < len {
+            return Err(GuestRamError::PackedPagesShort {
+                covered,
+                len,
+                page_size,
+            }
+            .report());
+        }
+        let mut import = Self::new_host_allocation(host_base, len, align)?;
+        import.packed = Some(PackedPages { page_size, pages });
+        Ok(import)
     }
 
     /// This import's identity. Every [`GuestSlice`] it makes carries it.
@@ -575,6 +684,34 @@ impl GuestRamImport {
     /// Guest physical address of the first byte covered.
     pub fn gpa_base(&self) -> Option<u64> {
         self.gpa_base
+    }
+
+    /// The guest-physical byte `offset` bytes into this import lands on, when
+    /// this import can state one.
+    ///
+    /// The two shapes answer from their own coordinate and neither guesses: a
+    /// RAMBlock import from the linear [`Self::gpa_base`], and a packed alias
+    /// from the guest page its map names for this offset plus the offset inside
+    /// that page. `None` is an import with neither — a plain host allocation,
+    /// and every alias built before its pages were carried — and the honest
+    /// reading of that is "this range has no guest coordinate", not "these
+    /// bytes are somewhere in particular".
+    ///
+    /// An offset at or past [`Self::len`] answers `None` rather than a
+    /// coordinate past the import: the range is checked here so a caller cannot
+    /// get a GPA this import does not cover, which is the bound the whole
+    /// module exists to keep.
+    pub fn gpa_at(&self, offset: u64) -> Option<u64> {
+        if offset >= self.len {
+            return None;
+        }
+        if let Some(base) = self.gpa_base {
+            return base.checked_add(offset);
+        }
+        let packed = self.packed.as_ref()?;
+        let index = usize::try_from(offset / packed.page_size).ok()?;
+        let page = *packed.pages.get(index)?;
+        page.checked_add(offset % packed.page_size)
     }
 
     /// Bytes covered. Always a multiple of [`Self::align`].
@@ -1092,6 +1229,90 @@ mod tests {
             align,
         )
         .expect("region is aligned and non-empty")
+    }
+
+    /// # A packed alias's own guest coordinate
+    ///
+    /// The tests below are the two readings [`GuestRamImport::gpa_at`] has to
+    /// tell apart: an import that *has* a coordinate answers it (linearly for a
+    /// RAMBlock, out of its page map for an alias), and one that does not says
+    /// so rather than answering something.
+    #[test]
+    fn a_ramblock_import_answers_its_linear_guest_coordinate() {
+        let import = import(0x4000, 0x1000);
+        assert_eq!(import.gpa_base(), Some(0x1_0000_0000));
+        assert_eq!(import.gpa_at(0), Some(0x1_0000_0000));
+        assert_eq!(import.gpa_at(0x1234), Some(0x1_0000_1234));
+        assert_eq!(
+            import.gpa_at(0x4000),
+            None,
+            "the byte past the import is not a coordinate this import covers"
+        );
+    }
+
+    /// A packed alias that was handed the pages it was assembled from answers
+    /// each of them, in host order and without pretending the pages are
+    /// consecutive.
+    #[test]
+    fn a_packed_alias_answers_the_guest_page_each_of_its_pages_is() {
+        let pages = std::sync::Arc::new(vec![0x2_0000_0000u64, 0x1_0000_5000, 0x3_0000_1000]);
+        let alias =
+            GuestRamImport::new_packed_alias(0x7f00_0000_0000, 0x3000, 0x1000, 0x1000, pages)
+                .expect("three pages cover the allocation");
+        assert_eq!(alias.gpa_base(), None, "an alias has no linear coordinate");
+        assert_eq!(alias.gpa_at(0), Some(0x2_0000_0000));
+        assert_eq!(alias.gpa_at(0x1000), Some(0x1_0000_5000));
+        assert_eq!(
+            alias.gpa_at(0x1800),
+            Some(0x1_0000_5800),
+            "the offset inside the page is carried, not dropped"
+        );
+        assert_eq!(alias.gpa_at(0x2000), Some(0x3_0000_1000));
+        assert_eq!(alias.gpa_at(0x3000), None);
+    }
+
+    /// A plain host allocation owns its memory and no guest page backs it, so
+    /// it has no coordinate to answer — and the difference between that and an
+    /// alias is the whole reason the map is carried.
+    #[test]
+    fn a_host_allocation_with_no_page_map_has_no_coordinate() {
+        let plain = GuestRamImport::new_host_allocation(0x7f00_0000_0000, 0x2000, 0x1000)
+            .expect("an aligned host allocation");
+        assert_eq!(plain.gpa_at(0), None);
+        assert_eq!(plain.gpa_at(0x1000), None);
+    }
+
+    /// A page map that stops short of the allocation, or a page size no index
+    /// can divide by, is refused where the alias is built rather than answered
+    /// as a coordinate for half of it.
+    #[test]
+    fn a_packed_alias_refuses_a_map_it_cannot_index() {
+        let short = GuestRamImport::new_packed_alias(
+            0x7f00_0000_0000,
+            0x3000,
+            0x1000,
+            0x1000,
+            std::sync::Arc::new(vec![0x2_0000_0000, 0x1_0000_5000]),
+        );
+        match short {
+            Err(error) => assert_eq!(
+                error.slug(),
+                "guest_ram_packed_pages_short",
+                "a map that covers 0x2000 of a 0x3000 allocation is short"
+            ),
+            Ok(_) => panic!("two pages cannot cover a three-page allocation"),
+        }
+        let zero = GuestRamImport::new_packed_alias(
+            0x7f00_0000_0000,
+            0x1000,
+            0x1000,
+            0,
+            std::sync::Arc::new(vec![0x2_0000_0000]),
+        );
+        match zero {
+            Err(error) => assert_eq!(error.slug(), "guest_ram_packed_page_size_not_power_of_two"),
+            Ok(_) => panic!("a page size of zero is not a map"),
+        }
     }
 
     /// A run may not name a byte past the mapping it was cut from.

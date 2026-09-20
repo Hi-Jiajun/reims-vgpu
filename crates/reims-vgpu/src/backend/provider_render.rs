@@ -6108,10 +6108,17 @@ fn note_sampled_bind_read(
 ///
 /// * a source that carries no `pages` at all, which is what
 ///   `host_pointer_import=disabled_by_env` produces for every gather;
-/// * an import with no GPA base: the packed alias, a host allocation this
-///   process arranged over scattered guest pages, for which there is no one
-///   guest range to name — and stating the one range it does not cover would
-///   license the pages it omitted.
+/// * an import that cannot state a guest coordinate at all: a plain host
+///   allocation, and an alias built before its pages travelled with it
+///   ([`crate::runtime::guest_ram::GuestRamImport::gpa_at`]).
+///
+/// That second arm used to be *all* of the packed aliases, and on this rig they
+/// are most of the family: the first arms of this round counted 43 and 45
+/// sampled reads while naming 22 pages between them, because a packed alias
+/// was a host range whose provenance stopped at "some guest bytes". The seam
+/// now builds those imports with the task page list it mapped them from
+/// ([`crate::runtime::guest_ram::GuestRamImport::new_packed_alias`]), so the
+/// same reads name the guest's own pages.
 ///
 /// Each stretch is stated at its **bound** range rather than at the window the
 /// caller asked for: `GuestRef::bound` is the import-granule-aligned range the
@@ -6126,22 +6133,36 @@ fn sampled_bind_pages(
     page_shift: u32,
 ) -> Option<Vec<u64>> {
     let runs = source.pages.as_ref()?;
-    let page_size = 1u64 << page_shift;
-    let mask = page_size - 1;
+    let step = 1u64 << page_shift;
+    let mask = step - 1;
     let mut pages = Vec::new();
     for run in runs.iter() {
         let guest = &run.guest;
-        let gpa_base = guest.import().gpa_base()?;
+        let import = guest.import();
         let bound = guest.bound().ok()?;
-        let start = gpa_base.checked_add(bound.offset)?;
-        let end = start.checked_add(bound.len)?;
-        let mut page = start & !mask;
-        while page < end {
-            pages.push(page);
-            page = page.checked_add(page_size)?;
+        let end = bound.offset.checked_add(bound.len)?;
+        let mut offset = bound.offset;
+        // One question per armed-set page, asked of the import that owns the
+        // byte: a RAMBlock answers linearly, a packed alias out of the guest
+        // pages it was assembled from. A reference whose import can answer
+        // neither makes the whole read undecided rather than partly named —
+        // the pages it omitted would otherwise be licensed by the ones it
+        // stated.
+        while offset < end {
+            // Aligned down at the armed set's own geometry and not left at the
+            // byte the question asked about: the guard is keyed by page, so
+            // this is the address it can be asked about — and one page reached
+            // twice by two offsets is one address, which the dedup below then
+            // sees.
+            pages.push(import.gpa_at(offset)? & !mask);
+            offset = offset.checked_add(step)?;
         }
     }
     pages.sort_unstable();
+    // Two stretches' granules can meet inside one page, and a page-sized
+    // question asked once per armed-set page lands on the same page several
+    // times when the guest's own page is the wider one: one page is one
+    // address, or one finding reads as several.
     pages.dedup();
     (!pages.is_empty()).then_some(pages)
 }
@@ -6205,6 +6226,9 @@ mod sampled_bind_read_tests {
     /// which is what lets a unit test hold a region it did not map.
     const GPA_BASE: u64 = 0x1_0000_0000;
     const RAMBLOCK: u64 = 0x7f00_0000_0000;
+    /// The guest's own page size on the pathway these fixtures describe
+    /// (`PAGE_SHIFT_X86`), which is also the geometry the armed set is keyed at.
+    const PAGE: u64 = 4096;
 
     /// The run list the seam hands this rail for a zero-copy sampled gather: one
     /// bounded reference per stretch of one RAMBlock, ascending and tiling the
@@ -6269,6 +6293,37 @@ mod sampled_bind_read_tests {
         NarrowTextureSource::Window {
             binding: 0,
             window: owned_window(),
+        }
+    }
+
+    /// A host allocation whose first byte meets the import granularity, which
+    /// the alias's own constructor requires (the same shape the seam's packed
+    /// resolution gets from `HostOps::map_pages`).
+    struct AlignedHost {
+        pointer: *mut u8,
+        layout: std::alloc::Layout,
+    }
+
+    impl AlignedHost {
+        fn new(bytes: usize, alignment: usize) -> Self {
+            let layout =
+                std::alloc::Layout::from_size_align(bytes, alignment).expect("a legal layout");
+            // SAFETY: the layout is non-zero-sized and this struct owns the
+            // allocation until it is dropped.
+            let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!pointer.is_null(), "the host allocation");
+            Self { pointer, layout }
+        }
+
+        fn base(&self) -> usize {
+            self.pointer as usize
+        }
+    }
+
+    impl Drop for AlignedHost {
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from `alloc_zeroed` with this layout.
+            unsafe { std::alloc::dealloc(self.pointer, self.layout) }
         }
     }
 
@@ -6346,6 +6401,56 @@ mod sampled_bind_read_tests {
             window: None,
         };
         assert_eq!(sampled_bind_pages(&source_over(vec![run], 0x800), 12), None);
+    }
+
+    /// A packed alias is a host range over the guest's own pages. Once the seam
+    /// hands the import the page list it was mapped from, a bind over it names
+    /// those pages like any other bind — and a read of one the guest has taken
+    /// back is the same finding it would be through a RAMBlock import.
+    #[test]
+    fn a_packed_alias_names_the_guest_pages_it_was_assembled_from() {
+        let backing = AlignedHost::new(0x4000, PAGE as usize);
+        let alias = std::sync::Arc::new(
+            GuestRamImport::new_packed_alias(
+                backing.base(),
+                0x4000,
+                PAGE,
+                PAGE,
+                std::sync::Arc::new(vec![
+                    0x2_0000_0000,
+                    0x1_0000_5000,
+                    0x3_0000_0000,
+                    0x4_0000_0000,
+                ]),
+            )
+            .expect("a host allocation with its own page map"),
+        );
+        let run = GuestWindowRun {
+            window_offset: 0,
+            guest: GuestRef::new(
+                std::sync::Arc::clone(&alias),
+                alias.slice(0, 0x2000).expect("inside the allocation"),
+            )
+            .expect("the slice came from this import"),
+            window: None,
+        };
+        let source = source_over(vec![run], 0x2000);
+        assert_eq!(
+            sampled_bind_pages(&source, 12),
+            Some(vec![0x1_0000_5000, 0x2_0000_0000]),
+            "the alias's pages are the guest's pages, in host order"
+        );
+
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        let mut writes = HostWrites::new(12);
+        writes.release_page(0x1_0000_5000);
+        note_sampled_bind_read(Some(&writes), false, 2, (16, 16), &source, &borrowed());
+        let line = cap.one(SAMPLED_BIND_ROUTE);
+        assert!(
+            line.contains(&format!("gpa={:#x}", 0x1_0000_5000u64)),
+            "{line}"
+        );
     }
 
     /// The entry is dark — nothing counted — for a caller that handed no census
