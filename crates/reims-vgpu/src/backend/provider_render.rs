@@ -932,7 +932,8 @@ use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
 
 use super::provider_compute::{
-    provider_error_detail, rail, refusal_decline, refuse_unhealthy, ProviderRefusalClass,
+    provider_error_detail, rail, refusal_decline, refuse_unhealthy, ProviderRail,
+    ProviderRefusalClass,
 };
 use super::provider_owner::{self, DeviceLossTeardown};
 use super::provider_wire;
@@ -10418,12 +10419,33 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
     true
 }
 
-fn record_production(
+/// The production one pass would record, prepared but not yet recorded (R22).
+///
+/// Everything here is a copy the recording keeps: the identity, the geometry it
+/// was minted under, the descriptor with every bind restated as the trace's own
+/// bytes, and the pipeline the re-run executes. The registry insert is *not*
+/// here — a production is recorded only once the completion says the pass that
+/// would produce it actually ran (G3-B/B-1: a batch commits its records'
+/// productions after its one completion, in record order, exactly as a single
+/// record commits after its own).
+struct PendingProduction {
+    identity: TargetIdentity,
+    allocation: AllocationId,
+    format: AttachmentFormat,
+    width: u64,
+    height: u64,
+    extent: u64,
+    descriptor: RenderPassDescriptor,
+    pipeline: CompiledComputePipeline,
+    views: usize,
+}
+
+fn prepare_production(
     req: &DrawRequest,
     pass: &NarrowPass<'_>,
     pipeline: &CompiledComputePipeline,
     descriptor: &RenderPassDescriptor,
-) -> Option<Arc<RecordedProduction>> {
+) -> Option<PendingProduction> {
     if !production_recordable(req, pass) {
         return None;
     }
@@ -10469,13 +10491,8 @@ fn record_production(
     // here.
     let mut descriptor = descriptor.clone();
     production_bytes(pass, &mut descriptor)?;
-    let registry = production_registry();
-    let mut registry = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registry.next += 1;
-    let production = Arc::new(RecordedProduction {
-        identity: identity.clone(),
+    Some(PendingProduction {
+        identity,
         allocation: attachment.allocation,
         format: pass.format,
         width: pass.width,
@@ -10484,11 +10501,32 @@ fn record_production(
         descriptor,
         pipeline: pipeline.clone(),
         views: pass.views(),
+    })
+}
+
+/// Commit one prepared production to the registry, in the one place the
+/// single-record path ever committed it: after the completion.
+fn commit_production(pending: &PendingProduction) -> Arc<RecordedProduction> {
+    let registry = production_registry();
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.next += 1;
+    let production = Arc::new(RecordedProduction {
+        identity: pending.identity.clone(),
+        allocation: pending.allocation,
+        format: pending.format,
+        width: pending.width,
+        height: pending.height,
+        extent: pending.extent,
+        descriptor: pending.descriptor.clone(),
+        pipeline: pending.pipeline.clone(),
+        views: pending.views,
         sequence: registry.next,
     });
     registry
         .by_identity
-        .insert(identity, Arc::clone(&production));
+        .insert(pending.identity.clone(), Arc::clone(&production));
     while registry.by_identity.len() > PRODUCTION_LIMIT {
         let Some(oldest) = registry
             .by_identity
@@ -10500,7 +10538,7 @@ fn record_production(
         };
         registry.by_identity.remove(&oldest);
     }
-    Some(production)
+    production
 }
 
 /// Drop every recorded production, for the one event that retires the traces
@@ -12327,7 +12365,7 @@ pub fn render_class_probe(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> R
     // can reach, and no other caller can produce it. Every other arm keeps its
     // own meaning, and anything this match does not recognise is fail-closed —
     // a successor the walk could not classify is one it keeps no frame for.
-    let answer = match submit_render_inner(inputs, req, true) {
+    let answer = match submit_render_inner(inputs, req, true, None) {
         RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted) => {
             RenderClassProbe::InClass
         }
@@ -12352,13 +12390,19 @@ pub fn render_class_probe(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> R
 }
 
 pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> RenderRailOutcome {
-    submit_render_inner(inputs, req, false)
+    submit_render_inner(inputs, req, false, None)
 }
 
 fn submit_render_inner(
     inputs: &RenderRailInputs<'_>,
     req: &DrawRequest,
     class_only: bool,
+    // G3-B/B-1: the batch under construction, when this call assembles a record
+    // into a run the walk has proven keepable instead of submitting one of its
+    // own. `None` is every single-record call, and the two paths share every
+    // line of the class above the submission by construction — the park step is
+    // taken exactly where `submit_narrow` is called.
+    park: Option<&mut RenderBatch>,
 ) -> RenderRailOutcome {
     // The frame profile's first bar inside the provider rail, and the only one
     // on this side of `submit_narrow`: the pure class gate, every capability
@@ -13377,7 +13421,15 @@ fn submit_render_inner(
     // capability (`resident_frames_fetchable`) keeps the provider's own
     // lifecycle names, which is what
     // `resident_lifecycle_failures_are_the_providers_own_names` pins.
-    if inputs.chain_loads_resident && !class_only {
+    // G3-B/B-1: a record whose predecessor is *in the run under construction*
+    // is not asked whether the provider still holds that image, because the
+    // provider is about to be handed both records as one trace: the image this
+    // record loads is the one the record before it stores, inside the same
+    // submission. The ask stays exactly where it was for the run's first record
+    // — whose predecessor is a *completed* submission, and therefore a fact
+    // this rail can be asked about — and for every single-record call.
+    let predecessor_in_batch = park.as_ref().is_some_and(|batch| !batch.is_empty());
+    if inputs.chain_loads_resident && !class_only && !predecessor_in_batch {
         if let NarrowLoad::Resident(resident) = pass.load {
             let live = match rail() {
                 Ok(rail) => rail
@@ -13409,6 +13461,22 @@ fn submit_render_inner(
     // submission, and the class cannot answer the two callers differently.
     if class_only {
         return RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted);
+    }
+    // G3-B/B-1: the batch's own door, taken at exactly the point a submission
+    // would leave. The class above answered this record; the park step
+    // assembles it into the run under construction and submits nothing, and the
+    // arm the class answers with here is the same one it answers a class-only
+    // call with — "admitted, and no submission left this call" — because that
+    // is what the caller has to read: a record in a run is answered by the
+    // run's one completion, never by its own.
+    if let Some(batch) = park {
+        return match batch.park(inputs, req, &pass, &copies, &texture_copies) {
+            RenderParkOutcome::Parked => {
+                RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted)
+            }
+            RenderParkOutcome::OutOfClass(reason) => RenderRailOutcome::NotInNarrowClass(reason),
+            RenderParkOutcome::Declined(decline) => RenderRailOutcome::ProviderDeclined(decline),
+        };
     }
     match submit_narrow(inputs, req, &pass, &copies, &texture_copies) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
@@ -17178,22 +17246,466 @@ fn attachment_identity(
     resident.into()
 }
 
-fn submit_narrow(
+/// A run of records the walk has proven keepable, assembled into one trace
+/// (G3-B/B-1).
+///
+/// The handle belongs to the walk's side of the seam: one call **parks** a
+/// record (the class gate and the assembly, and no submission) and the run is
+/// finished by one call that composes the trace, frames and admits it once,
+/// submits it once and reads one answer per record out of that completion.
+///
+/// Membership is not decided here. The walk's keep plan and its probes are what
+/// say which records form a run; this type holds them in the order they were
+/// parked, so the two sides cannot disagree about what a trace carries — and
+/// the one thing it checks for itself is the thing a trace cannot state: that
+/// every parked record's attachment names one `(allocation, view)` pair, which
+/// is what makes the run a chain rather than two images filed together.
+pub struct RenderBatch {
+    assembly: NarrowAssembly,
+    /// The records parked so far, in park order. The last one is the run's
+    /// publishing tail.
+    records: Vec<NarrowRecord>,
+    /// The `(allocation, view)` pair every parked record's attachment names.
+    identity: Option<(u64, u64)>,
+    /// The answers of the run's one submission, in park order, once the run has
+    /// been finished.
+    outcomes: Vec<RenderRailOutcome>,
+}
+
+/// How one park step ended (G3-B/B-1).
+#[derive(Debug)]
+pub enum RenderParkOutcome {
+    /// The record is assembled into the run under construction; nothing was
+    /// submitted, and the run's own completion will answer it.
+    Parked,
+    /// The class kept this record on the engine. A run never falls back: the
+    /// walk's probes proved every member admitted, so this answer is a wiring
+    /// defect and the caller refuses the run rather than executing it twice.
+    OutOfClass(OutOfClass),
+    /// The class admitted the record and the provider refused it. Fail-closed,
+    /// exactly as the single-record arm's own refusal is.
+    Declined(ProviderRenderDecline),
+}
+
+impl RenderBatch {
+    pub fn new() -> Self {
+        Self {
+            assembly: NarrowAssembly::new(),
+            records: Vec::new(),
+            identity: None,
+            outcomes: Vec::new(),
+        }
+    }
+
+    /// How many records the run states.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// The `(allocation, view)` pair the run's records share, once one has been
+    /// parked.
+    pub fn identity(&self) -> Option<(u64, u64)> {
+        self.identity
+    }
+
+    /// The answers of the run's one submission, in park order. Empty until the
+    /// run has been finished.
+    pub fn outcomes(&self) -> &[RenderRailOutcome] {
+        &self.outcomes
+    }
+
+    /// Assemble one record into the run, submitting nothing.
+    fn park(
+        &mut self,
+        inputs: &RenderRailInputs<'_>,
+        req: &DrawRequest,
+        pass: &NarrowPass<'_>,
+        copies: &WindowCopies,
+        texture_copies: &TextureCopies,
+    ) -> RenderParkOutcome {
+        let rail = match rail() {
+            Ok(rail) => rail,
+            Err(decline) => return RenderParkOutcome::Declined(decline.into_render()),
+        };
+        // The health gate, in the one place every submission on this rail meets
+        // it: a provider the lifecycle reports terminal cannot take this record,
+        // and the run that contains it is refused with it.
+        if let Some(decline) = refuse_unhealthy(&rail.provider, "batch admission") {
+            return RenderParkOutcome::Declined(decline.into_render());
+        }
+        let record = match assemble_narrow_record(
+            rail,
+            inputs,
+            req,
+            pass,
+            copies,
+            texture_copies,
+            &mut self.assembly,
+        ) {
+            Ok(record) => record,
+            Err(decline) => return RenderParkOutcome::Declined(decline),
+        };
+        let identity = (
+            record.attachment.allocation.get(),
+            record.attachment.view.get(),
+        );
+        match self.identity {
+            None => self.identity = Some(identity),
+            Some(known) if known == identity => {}
+            Some(_) => {
+                // The run's records share one image by construction — that is
+                // the whole reason they may travel as one trace — so a second
+                // identity is refused by name rather than filed as one trace
+                // that would read a frame no record before it stored. The walk
+                // checks the same fact from its probes, before any assembly, so
+                // this route is a wiring finding and a healthy round reads it at
+                // zero.
+                crate::runtime::drain::note_store_route("render_provider_batch_member_refused");
+                self.records.push(record);
+                return RenderParkOutcome::Declined(ProviderRenderDecline::TraceAdmission {
+                    detail: format!(
+                        "batch member refused: the record's attachment names {:?}, and the run \
+                         already states {:?}",
+                        identity,
+                        self.identity.expect("the run states an identity"),
+                    ),
+                });
+            }
+        }
+        self.records.push(record);
+        RenderParkOutcome::Parked
+    }
+
+    /// Finish the run: one trace, one submission, one answer per record.
+    ///
+    /// On a refusal the run's leases are given back — every record's, including
+    /// the ones whose plans the failing step never reached — so a refusal leaves
+    /// no window imported and no frame half-landed.
+    pub fn finish(&mut self) -> Result<(), ProviderRenderDecline> {
+        let rail = rail().map_err(IntoRender::into_render)?;
+        // A run with no records states no trace: a submission of nothing is a
+        // wiring defect (the walk elects a run of at least two records), and it
+        // is refused here rather than handed to the provider as an empty trace.
+        if self.records.is_empty() {
+            return Err(ProviderRenderDecline::TraceAdmission {
+                detail: "a batch of no records states no trace".to_string(),
+            });
+        }
+        if let Some(decline) = refuse_unhealthy(&rail.provider, "batch admission") {
+            self.abandon();
+            return Err(decline.into_render());
+        }
+        let records = std::mem::take(&mut self.records);
+        let assembly = std::mem::replace(&mut self.assembly, NarrowAssembly::new());
+        match finish_narrow_records(&rail.provider, &records, assembly) {
+            Ok(completions) => {
+                let records = completions.len();
+                self.outcomes = completions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, completion)| match completion {
+                        RenderCompletion::Writeback(output) => {
+                            // Only the run's publishing tail can have published a
+                            // frame: every record before it states a resident
+                            // store, and a resident store publishes nothing. A
+                            // writeback anywhere else is a trace whose shape the
+                            // walk did not state.
+                            debug_assert_eq!(index + 1, records);
+                            RenderRailOutcome::ProviderCompleted(output)
+                        }
+                        RenderCompletion::Resident(frame) => {
+                            RenderRailOutcome::ProviderCompletedResident(frame)
+                        }
+                    })
+                    .collect();
+                Ok(())
+            }
+            Err(decline) => {
+                self.records = records;
+                self.abandon();
+                Err(decline)
+            }
+        }
+    }
+
+    /// Give back every lease the run imported, on a path that never reached a
+    /// completion.
+    pub fn abandon(&mut self) {
+        if let Ok(rail) = rail() {
+            abort_narrow_leases(&mut self.assembly.leases, &rail.provider);
+        }
+    }
+}
+
+impl Default for RenderBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// G3-B/B-1: assemble one record into a run the walk has proven keepable.
+///
+/// This is `submit_render`'s own walk with the submission replaced by the
+/// park step: the same class gate, the same copies, the same assembly — and the
+/// answer says only whether the record joined the run. The run's own answers
+/// come from [`finish_render_batch`], one per record, in park order.
+pub fn park_render(
+    inputs: &RenderRailInputs<'_>,
+    req: &DrawRequest,
+    batch: &mut RenderBatch,
+) -> RenderParkOutcome {
+    match submit_render_inner(inputs, req, false, Some(batch)) {
+        RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted) => {
+            RenderParkOutcome::Parked
+        }
+        RenderRailOutcome::NotInNarrowClass(reason) => RenderParkOutcome::OutOfClass(reason),
+        RenderRailOutcome::ProviderDeclined(decline) => RenderParkOutcome::Declined(decline),
+        // The park step submits nothing, so a completion cannot be reached.
+        // Stated rather than left out so the mapping is total, and answered as a
+        // refusal: a completion here would be a submission this call did not
+        // make.
+        RenderRailOutcome::ProviderCompleted(_)
+        | RenderRailOutcome::ProviderCompletedResident(_) => {
+            RenderParkOutcome::Declined(ProviderRenderDecline::TraceAdmission {
+                detail: "the park step answered with a completion it could not have made"
+                    .to_string(),
+            })
+        }
+    }
+}
+
+/// G3-B/B-1: finish a run — one trace, one submission, one answer per record.
+///
+/// The answers are on the batch ([`RenderBatch::outcomes`]), in park order, and
+/// they are the same two arms the single-record path returns: a record the run
+/// kept a frame for is `ProviderCompletedResident`, and the run's publishing
+/// tail is whatever its own arm answered.
+pub fn finish_render_batch(batch: &mut RenderBatch) -> Result<(), ProviderRenderDecline> {
+    batch.finish()
+}
+
+/// The state one trace's records are assembled into, shared by every record of
+/// the trace (G3-B/B-1).
+///
+/// One trace states **one** resource namespace and **one** view-id namespace,
+/// so the table and the counters below belong to the trace rather than to a
+/// record: the second record of a run mints its views where the first left off,
+/// and its allocations land in the same table. A single-record trace is this
+/// same walk with one record in it, which is what keeps the two paths one
+/// shape rather than two.
+struct NarrowAssembly {
+    /// Every allocation the trace's views name, and every lease reservation the
+    /// owner plan minted for them. One table per trace, exactly as
+    /// `submit_narrow` built it before this increment, because that is what the
+    /// admission resolves a view against.
+    resources: ResourceTableSnapshot,
+    /// The trace's own view-id counter. It starts where a trace has always
+    /// started ([`FIRST_INPUT_VIEW`]) and never moves backwards, so a record's
+    /// views cannot alias the record before it's — nor the attachment's own.
+    next_view: u64,
+    /// One owner-lease plan per record, in record order. `None` is a real arm:
+    /// a pass whose binds are all trace-owned bytes states no lease and crosses
+    /// no owner→provider frame.
+    ///
+    /// Held per record rather than per batch because the retirement chain is
+    /// per record: `plan.settle` binds *that record's* leases to the
+    /// completion, and a path that never reaches a completion aborts the plans
+    /// of every record that has not settled yet.
+    leases: Vec<Option<provider_owner::Plan>>,
+    /// The running base of the productions' own view block (R22). The first
+    /// record's block is [`PRODUCTION_VIEW_BASE`] itself, which is what a
+    /// single-record trace has always minted; every record that carries
+    /// productions advances the base by one stride per production, so two
+    /// records' productions cannot mint one view between them.
+    production_base: u64,
+}
+
+impl NarrowAssembly {
+    fn new() -> Self {
+        Self {
+            resources: ResourceTableSnapshot::new(),
+            next_view: FIRST_INPUT_VIEW,
+            leases: Vec::new(),
+            production_base: PRODUCTION_VIEW_BASE,
+        }
+    }
+
+    /// How many records this trace states so far.
+    fn records(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Record one allocation in the trace's table.
+    ///
+    /// The **first** record of a trace inserts exactly as the single-record
+    /// path always did — a duplicate is an admission refusal by name. A record
+    /// *after* the first may restate an allocation the record before it already
+    /// stated, because that is what a kept chain is: one resident image, N
+    /// records that store into it and load out of it, and the table is one
+    /// namespace per trace. A restatement is accepted only when it is the same
+    /// record, field for field; an allocation restated with another size or
+    /// epoch is refused here rather than admitted as a second, disagreeing
+    /// record of one allocation.
+    fn insert_allocation(&mut self, record: AllocationRecord) -> Result<(), ProviderRenderDecline> {
+        if self.records() > 0 {
+            if let Some(known) = self.resources.allocation(record.allocation_id) {
+                if known == record {
+                    return Ok(());
+                }
+                return Err(ProviderRenderDecline::TraceAdmission {
+                    detail: format!(
+                        "allocation {:?} restated with a different record ({} bytes at epoch \
+                         {:?} against {} bytes at epoch {:?})",
+                        record.allocation_id,
+                        known.size,
+                        known.owner_epoch,
+                        record.size,
+                        record.owner_epoch,
+                    ),
+                });
+            }
+        }
+        self.resources.insert_allocation(record).map_err(|error| {
+            ProviderRenderDecline::TraceAdmission {
+                detail: error.to_string(),
+            }
+        })
+    }
+}
+
+/// One record's own half of a trace: everything the assembly minted for it, in
+/// the shape the trace builder and the completion's post-checks read.
+struct NarrowRecord {
+    /// The declaring kernel this record's pool entries land through.
+    declaring: CompiledComputePipeline,
+    /// The record's own translated pipeline.
+    render_pipeline: CompiledComputePipeline,
+    /// The `(allocation, view)` pair this record's colour attachment names.
+    attachment: AttachmentIdentity,
+    /// This record's own declaration of that view.
+    declaration: BufferView,
+    /// The second declaration an elected landing view carries (E-TX13), when
+    /// this record states one.
+    landing_view: Option<BufferView>,
+    /// The writable views this record's completion writebacks are paired with.
+    stage_buffer_slots: Vec<StageBufferSlot>,
+    /// The productions this record's trace carries (R22).
+    in_flight: Vec<ProductionInFlight>,
+    /// The compiled pipeline each of those productions was recorded with, in
+    /// the same order. The trace states one entry per pipeline id, and the
+    /// descriptor of a production carries only the id — so the compiled handle
+    /// has to travel beside it.
+    production_pipelines: Vec<CompiledComputePipeline>,
+    /// This record's own render pass.
+    pass_descriptor: RenderPassDescriptor,
+    /// The record's own facts the completion's post-checks read, owned rather
+    /// than borrowed from the pass: a batch's records outlive the seam call
+    /// that assembled them, and these are the answers that call was made from.
+    facts: NarrowRecordFacts,
+    /// The production this record's pass would record for a later consumer
+    /// (R22), prepared at assembly and **committed** only once the trace's
+    /// completion has said the pass actually ran. The copy is paid here, in the
+    /// same place the single-record path paid it, because the descriptor is
+    /// what the recording carries; what moves is only the registry insert.
+    pending_production: Option<PendingProduction>,
+}
+
+/// One record's own answers, in the shape the completion's post-checks read
+/// them (G3-B/B-1).
+///
+/// Every field is a fact about the record the class gate admitted — the two
+/// arms of the load, the store's own arm, the doors the attachment's bytes came
+/// through, and the two shapes the seam states beside them. They are owned here
+/// so that a run of records can be assembled by N seam calls and read back by
+/// one completion: the pass those facts came from does not outlive its call.
+#[derive(Clone, Copy, Debug)]
+struct NarrowRecordFacts {
+    /// `NarrowLoad::Resident`.
+    loads_resident: bool,
+    /// `NarrowLoad::Bytes`.
+    loads_bytes: bool,
+    /// `NarrowLoad::GuestRuns`.
+    loads_guest_runs: bool,
+    /// `NarrowStore::Resident` or `NarrowStore::KeptFrameLanding`.
+    keeps_frame: bool,
+    /// `NarrowStore::KeptFrameLanding`.
+    kept_frame_landing: bool,
+    /// `NarrowStore::Borrowed` (E-TX8).
+    borrowed: bool,
+    /// `NarrowStore::BorrowedLanding` (E-TX13).
+    borrowed_landing: bool,
+    /// The caller withheld its readback and the rail published the frame.
+    published_held_resident: bool,
+    /// The record declared a sampled target's frame as its own bytes (R24).
+    sampled_target_frames: bool,
+    /// The seed door's own bytes (R32).
+    carried_load_seed_bytes: bool,
+    /// The predecessor's frame was handed over as bytes (R25).
+    carried_chain_middle: bool,
+    /// The surface's resident was handed over as bytes (R26).
+    carried_surface_resident: bool,
+    /// The attachment's pages are the surface's own registered window (B).
+    carried_attachment_guest_window: bool,
+    /// The seed door cut that window itself (R38).
+    carried_seed_guest_window: bool,
+    /// The attachment's tightly packed extent, which the writeback has to be.
+    extent: u64,
+    /// The byte order of the frame this record publishes.
+    bgra: bool,
+    /// The record states a present tail (R4b).
+    present: bool,
+    /// The present target that tail hands on, when it states one.
+    present_attachment: Option<PresentAttachment>,
+}
+
+impl NarrowRecordFacts {
+    fn of(pass: &NarrowPass<'_>) -> Self {
+        Self {
+            loads_resident: matches!(pass.load, NarrowLoad::Resident(_)),
+            loads_bytes: matches!(pass.load, NarrowLoad::Bytes(_)),
+            loads_guest_runs: matches!(pass.load, NarrowLoad::GuestRuns(_)),
+            keeps_frame: pass.store.keeps_frame(),
+            kept_frame_landing: matches!(pass.store, NarrowStore::KeptFrameLanding(_)),
+            borrowed: matches!(pass.store, NarrowStore::Borrowed),
+            borrowed_landing: matches!(pass.store, NarrowStore::BorrowedLanding),
+            published_held_resident: pass.published_held_resident,
+            sampled_target_frames: pass.sampled_target_frames,
+            carried_load_seed_bytes: pass.carried_load_seed_bytes,
+            carried_chain_middle: pass.carried_chain_middle,
+            carried_surface_resident: pass.carried_surface_resident,
+            carried_attachment_guest_window: pass.carried_attachment_guest_window,
+            carried_seed_guest_window: pass.carried_seed_guest_window,
+            extent: pass.extent,
+            bgra: pass.bgra,
+            present: pass.present.is_some(),
+            present_attachment: pass.present,
+        }
+    }
+}
+
+/// Assemble one record into the trace under construction (G3-B/B-1).
+///
+/// Everything here is CPU-side assembly: the pipelines, the resource table, the
+/// owner-lease plan, the views and the render pass descriptor. It frames
+/// nothing and submits nothing — the caller hands the whole assembly to
+/// [`finish_narrow_records`] once — which is what lets a run of kept records
+/// travel as one trace. The walk is the one a single-record submission always
+/// made; what changed is only that the trace's own view counter and resource
+/// table live in `assembly` rather than being restarted per record.
+fn assemble_narrow_record(
+    rail: &ProviderRail,
     inputs: &RenderRailInputs<'_>,
     req: &DrawRequest,
     pass: &NarrowPass<'_>,
     copies: &WindowCopies,
     texture_copies: &TextureCopies,
-) -> Result<RenderCompletion, ProviderRenderDecline> {
-    let rail = rail().map_err(IntoRender::into_render)?;
+    assembly: &mut NarrowAssembly,
+) -> Result<NarrowRecord, ProviderRenderDecline> {
     let provider = &rail.provider;
-    // The health gate runs before anything is compiled or registered: a
-    // provider the lifecycle already reports terminal cannot take this draw,
-    // and the answer is a refusal, never a silent switch to the other rail.
-    if let Some(decline) = refuse_unhealthy(provider, "admission") {
-        return Err(decline.into_render());
-    }
-
     // The frame profile's pipeline bar: the declaring kernel's own lookup and
     // this request's translated pair. Both are cache lookups on a warm boot —
     // `shader_misses` and `pipeline_misses` are zero over a boot that runs
@@ -17208,20 +17720,17 @@ fn submit_narrow(
             register_render_pipeline(&rail.provider, &rail.device, inputs, pass)?,
         )
     };
-    let loads_resident = matches!(pass.load, NarrowLoad::Resident(_));
-
-    let mut resources = ResourceTableSnapshot::new();
-    for allocation in input_allocations(pass, texture_copies) {
+    // This record's own block of the trace's view namespace. The staged views'
+    // allocations are derived from the same view numbers this assembly mints
+    // below (`input_allocation`), so the two walks start at one base.
+    let view_base = assembly.next_view;
+    for allocation in input_allocations(pass, texture_copies, view_base) {
         let (allocation_id, size) = allocation;
-        resources
-            .insert_allocation(AllocationRecord {
-                allocation_id,
-                owner_epoch: provider.device_epoch(),
-                size,
-            })
-            .map_err(|error| ProviderRenderDecline::TraceAdmission {
-                detail: error.to_string(),
-            })?;
+        assembly.insert_allocation(AllocationRecord {
+            allocation_id,
+            owner_epoch: provider.device_epoch(),
+            size,
+        })?;
     }
     // The owner's leases first (R9d/R9q): every window-backed binding this
     // pass states — a stage buffer's, and a vertex stream's since R9q — is
@@ -17235,9 +17744,9 @@ fn submit_narrow(
     // only the plan knows which allocation its registration minted.
     // The frame profile's plan bar: the resource table this submission states
     // and the owner-lease plan every window-backed bind is imported through.
-    let mut leases = {
+    let leases = {
         let _plan = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvPlan);
-        plan_owner_leases(provider, pass, &mut resources, copies)?
+        plan_owner_leases(provider, pass, &mut assembly.resources, copies)?
     };
     // The frame profile's trace bar opens here and closes at the wire frame
     // below: the attachment's identity, the vertex/index/stage buffer views,
@@ -17284,15 +17793,11 @@ fn submit_narrow(
     // size is the registration's, not the extent's — so only the pooled and
     // resident arms mint their own here.
     if pass.load_seed_runs().is_none() {
-        resources
-            .insert_allocation(AllocationRecord {
-                allocation_id: attachment.allocation,
-                owner_epoch: provider.device_epoch(),
-                size: pass.extent,
-            })
-            .map_err(|error| ProviderRenderDecline::TraceAdmission {
-                detail: error.to_string(),
-            })?;
+        assembly.insert_allocation(AllocationRecord {
+            allocation_id: attachment.allocation,
+            owner_epoch: provider.device_epoch(),
+            size: pass.extent,
+        })?;
     }
     // R22: the productions this record's trace carries, restated in this
     // trace's own view namespace. Built before the views below because the
@@ -17301,7 +17806,14 @@ fn submit_narrow(
         .productions
         .iter()
         .enumerate()
-        .map(|(index, production)| production_in_flight(production, index))
+        .map(|(index, production)| {
+            production_in_flight(production, index, assembly.production_base)
+        })
+        .collect();
+    let production_pipelines: Vec<CompiledComputePipeline> = pass
+        .productions
+        .iter()
+        .map(|production| production.pipeline.clone())
         .collect();
     for production in &in_flight {
         for (allocation_id, size) in production
@@ -17310,19 +17822,15 @@ fn submit_narrow(
             .copied()
             .chain(std::iter::once((production.allocation, production.extent)))
         {
-            resources
-                .insert_allocation(AllocationRecord {
-                    allocation_id,
-                    owner_epoch: provider.device_epoch(),
-                    size,
-                })
-                .map_err(|error| ProviderRenderDecline::TraceAdmission {
-                    detail: error.to_string(),
-                })?;
+            assembly.insert_allocation(AllocationRecord {
+                allocation_id,
+                owner_epoch: provider.device_epoch(),
+                size,
+            })?;
         }
     }
     let mut vertex_buffers = Vec::new();
-    let mut next_view = FIRST_INPUT_VIEW;
+    let mut next_view = view_base;
     for (binding, stream) in pass.vertex_streams.iter().enumerate() {
         // The canonical binding index is the stream's position in the request,
         // not the guest's own binding number: the contract requires entry `i` to
@@ -17894,86 +18402,175 @@ fn submit_narrow(
     // descriptor, and it is paid only for the shapes
     // [`production_recordable`] admits — the record this rail can restate
     // inside another record's trace. A shape that is not one keeps no copy.
-    let recordable_descriptor = production_recordable(req, pass).then(|| pass_descriptor.clone());
-    let trace = ComputeTrace {
+    let pending_production = prepare_production(req, pass, &render_pipeline, &pass_descriptor);
+    // Leave the trace's own counters where the record after this one has to
+    // pick them up (G3-B/B-1). The landing view is minted from the view counter
+    // without advancing it — it is the last view a *single-record* trace states
+    // — so a trace that carries one claims it here; and a record's productions
+    // own a block of the view namespace, which the record after it may not mint
+    // into.
+    assembly.next_view = next_view + u64::from(landing_view.is_some());
+    assembly.production_base = assembly.production_base.saturating_add(
+        PRODUCTION_VIEW_STRIDE.saturating_mul(u64::try_from(in_flight.len()).unwrap_or(u64::MAX)),
+    );
+    let record = NarrowRecord {
+        declaring,
+        render_pipeline,
+        attachment,
+        declaration,
+        landing_view,
+        stage_buffer_slots,
+        in_flight,
+        production_pipelines,
+        pass_descriptor,
+        facts: NarrowRecordFacts::of(pass),
+        pending_production,
+    };
+    assembly.leases.push(leases);
+    Ok(record)
+}
+
+/// The trace one batch of assembled records states (G3-B/B-1).
+///
+/// The composition rules are the ones a single record's trace always used, read
+/// across records instead of within one:
+///
+/// * `pipelines` holds one entry per **distinct pipeline id**, because the
+///   contract states each pipeline once and two records of one module pair
+///   share the registration;
+/// * the declaring passes come first, in record order — one compute pass per
+///   view a render pass binds, which is what the trace's serial pool is — with
+///   each view declared **once**: a kept chain's records share one attachment
+///   identity by construction, and a second declaration of one view would be
+///   the same statement spelled twice;
+/// * then, per record, its productions' own declare passes and render passes
+///   (R22) and the record's own render pass, which is the order
+///   `validate_serial_buffer_reuse` walks;
+/// * and last the kept frame's own delivery (E-TX14), after the pass that
+///   defined it and before the submission ends.
+fn narrow_trace(
+    provider: &metal_api_vulkan::VulkanComputeProvider,
+    records: &[NarrowRecord],
+) -> ComputeTrace {
+    let mut pipelines: Vec<CompiledComputePipeline> = Vec::new();
+    let mut trace_passes: Vec<TracePass> = Vec::new();
+    // The views this trace has already declared, keyed by the view id alone —
+    // which is what the contract's pool is keyed by.
+    let mut declared: Vec<ViewId> = Vec::new();
+    for record in records {
+        declare_pipeline(&mut pipelines, &record.declaring);
+        declare_pipeline(&mut pipelines, &record.render_pipeline);
+        for pipeline in &record.production_pipelines {
+            declare_pipeline(&mut pipelines, pipeline);
+        }
+        let declare_attachment = !declared.contains(&record.declaration.view_id);
+        if declare_attachment {
+            declared.push(record.declaration.view_id);
+        }
+        trace_passes.extend(declaring_passes_for_record(record, declare_attachment));
+        for production in &record.in_flight {
+            trace_passes.push(declaring_pass(
+                record.declaring.pipeline_id,
+                vec![production_declaration(production)],
+            ));
+        }
+        for production in &record.in_flight {
+            trace_passes.push(TracePass::Render(production.descriptor.clone()));
+        }
+        trace_passes.push(TracePass::Render(record.pass_descriptor.clone()));
+    }
+    // E-TX14: the kept frame's own delivery, in the one position the contract
+    // makes resolvable — *after* the pass that kept it, so the entry resolves an
+    // image a completed pass defined, and before the submission ends, so the
+    // owner's pages hold the frame by the time this trace's completion is
+    // handed back. The window's declaration rode the declaring compute passes
+    // above (the trace's serial pool is what a landing view is resolved
+    // against), and the frame's identity is the attachment's own — the same pair
+    // the resident store named, which is why the entry cannot deliver an image
+    // the pass did not leave behind. In a batch the arm belongs to the trace's
+    // last record: a landing *is* a delivery, so an intermediate record that
+    // carried one would hand the guest a frame the record after it draws over.
+    if let Some(record) = records.last() {
+        if let (true, Some(landing)) = (
+            record.facts.kept_frame_landing,
+            record.landing_view.as_ref(),
+        ) {
+            let frame = record
+                .pass_descriptor
+                .color_attachments
+                .first()
+                .expect("a record's trace states one colour attachment");
+            trace_passes.push(TracePass::Landing(
+                metal_api_core::provider::KeptFrameLanding {
+                    frame: metal_api_core::provider::KeptFrame {
+                        allocation_id: record.attachment.allocation,
+                        view_id: record.attachment.view,
+                        format: frame.format,
+                        width: frame.width,
+                        height: frame.height,
+                    },
+                    landing: AttachmentLandingView {
+                        allocation_id: landing.allocation_id,
+                        view_id: landing.view_id,
+                    },
+                },
+            ));
+        }
+    }
+    ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch: provider.device_epoch(),
         operation_id: OperationId::new(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)),
-        // R22: one render pipeline per pass this trace states — the consumer's
-        // own, and the registered pipeline of every production it carries.
-        // Deduplicated by pipeline id, because two records of one module pair
-        // share the registration and a trace states each pipeline once.
-        pipelines: {
-            let mut pipelines = vec![declaring.clone(), render_pipeline.clone()];
-            for production in &pass.productions {
-                if !pipelines
-                    .iter()
-                    .any(|known| known.pipeline_id == production.pipeline.pipeline_id)
-                {
-                    pipelines.push(production.pipeline.clone());
-                }
-            }
-            pipelines
-        },
+        pipelines,
         encoder_dispatch_type: DispatchType::Serial,
-        passes: {
-            let mut passes = declaring_passes_with(
-                declaring.pipeline_id,
-                declaration,
-                &stage_buffers,
-                landing_view.as_ref(),
-            );
-            // The productions' own declarations and passes, in the order the
-            // textures named them: a trace-produced view has to be declared
-            // before a render pass stores into it (the trace's pool is what
-            // admission resolves an attachment view against), and the store
-            // has to precede the sampling pass — which is the same order
-            // `validate_serial_buffer_reuse` walks.
-            for production in &in_flight {
-                passes.push(declaring_pass(
-                    declaring.pipeline_id,
-                    vec![production_declaration(production)],
-                ));
-            }
-            for production in &in_flight {
-                passes.push(TracePass::Render(production.descriptor.clone()));
-            }
-            passes.push(TracePass::Render(pass_descriptor));
-            // E-TX14: the kept frame's own delivery, in the one position the
-            // contract makes resolvable — *after* the pass that kept it, so the
-            // entry resolves an image a completed pass defined, and before the
-            // submission ends, so the owner's pages hold the frame by the time
-            // this trace's completion is handed back. The window's declaration
-            // rode the declaring compute pass above (the trace's serial pool is
-            // what a landing view is resolved against), and the frame's identity
-            // is the attachment's own — the same pair the resident store named,
-            // which is why the entry cannot deliver an image the pass did not
-            // leave behind.
-            if let (NarrowStore::KeptFrameLanding(_), Some(landing)) =
-                (pass.store, landing_view.as_ref())
-            {
-                passes.push(TracePass::Landing(
-                    metal_api_core::provider::KeptFrameLanding {
-                        frame: metal_api_core::provider::KeptFrame {
-                            allocation_id: attachment.allocation,
-                            view_id: attachment.view,
-                            format: pass.format,
-                            width: pass.width,
-                            height: pass.height,
-                        },
-                        landing: AttachmentLandingView {
-                            allocation_id: landing.allocation_id,
-                            view_id: landing.view_id,
-                        },
-                    },
-                ));
-            }
-            passes
-        },
+        passes: trace_passes,
         completion_policy: CompletionPolicy::HostReadback,
         heap: None,
         indirect: None,
-    };
+    }
+}
+
+/// State one pipeline in a trace's own list, once per pipeline id.
+fn declare_pipeline(
+    pipelines: &mut Vec<CompiledComputePipeline>,
+    pipeline: &CompiledComputePipeline,
+) {
+    if !pipelines
+        .iter()
+        .any(|known| known.pipeline_id == pipeline.pipeline_id)
+    {
+        pipelines.push(pipeline.clone());
+    }
+}
+
+/// Finish one assembled trace: the owner→provider frame, admission, the single
+/// submission, and one answer per record (G3-B/B-1).
+///
+/// This is the half of `submit_narrow` that follows the assembly, with the
+/// submission hoisted out of the per-record walk: the frame, the admission, the
+/// queue submission, the fence wait and the completion the retirement chain
+/// binds to are **one per trace** — which is what the canonical provider
+/// states, one submission scope per trace — and everything that was already per
+/// record (the lease retirement, the stage-buffer writebacks, the productions'
+/// landed check, the resident and publishing arms with their counters) is read
+/// back out of that one completion in record order.
+fn finish_narrow_records(
+    provider: &metal_api_vulkan::VulkanComputeProvider,
+    records: &[NarrowRecord],
+    assembly: NarrowAssembly,
+) -> Result<Vec<RenderCompletion>, ProviderRenderDecline> {
+    let NarrowAssembly {
+        resources,
+        mut leases,
+        ..
+    } = assembly;
+    debug_assert_eq!(records.len(), leases.len());
+    debug_assert!(!records.is_empty());
+    // The frame profile's trace bar, on this path: the *composition* of the
+    // assembled records into one trace, which is the work a batch adds where a
+    // single record only stated its own pass.
+    let _trace = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvTrace);
+    let trace = narrow_trace(provider, records);
     // R9j/R9q: a pass that declares a stage buffer — or, since R9q, carries a
     // vertex stream through the owner's window — crosses the owner→provider
     // wire before anything is admitted. The frame is the payload (every
@@ -17999,16 +18596,22 @@ fn submit_narrow(
     // in-process arm the class gate's declarations make exact. The two shapes
     // the v40 blend section cannot carry are answered by the class gate before
     // this point (`declared_blend`), not framed as another state here.
+    //
+    // G3-B/B-1: the frame is the *trace's*, so a batch crosses it once, with
+    // every record's declarations and views in it — and a record of the batch
+    // that states no lease of its own is that same frame with one plan fewer,
+    // not a second door. The gate below is the union of the records' plans,
+    // which is what the single-record arm's one plan always was.
     drop(_trace);
     // The frame profile's admission bar: the owner→provider wire frame (only
     // when this pass states leases) and the trace's admission. Both are
     // CPU-side and both are on the path to every submission this rail makes.
     let _admit = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvAdmit);
-    let (trace, resources) = if leases.is_none() {
+    let (trace, resources) = if leases.iter().all(Option::is_none) {
         (trace, resources)
     } else {
         let frame = provider_wire::submit_frame(&trace, &resources).map_err(|decline| {
-            abort_stage_buffer_leases(&mut leases, provider);
+            abort_narrow_leases(&mut leases, provider);
             ProviderRenderDecline::StageBufferWire {
                 step: decline.step,
                 detail: decline.detail,
@@ -18022,7 +18625,7 @@ fn submit_narrow(
                 (trace, resources)
             }
             Err(decline) => {
-                abort_stage_buffer_leases(&mut leases, provider);
+                abort_narrow_leases(&mut leases, provider);
                 return Err(ProviderRenderDecline::StageBufferWire {
                     step: decline.step,
                     detail: decline.detail,
@@ -18033,7 +18636,7 @@ fn submit_narrow(
     let validated = match provider.capabilities().validate_trace(trace, resources) {
         Ok(validated) => validated,
         Err(error) => {
-            abort_stage_buffer_leases(&mut leases, provider);
+            abort_narrow_leases(&mut leases, provider);
             return Err(ProviderRenderDecline::TraceAdmission {
                 detail: provider_error_detail(&error),
             });
@@ -18042,14 +18645,20 @@ fn submit_narrow(
     drop(_admit);
     // Counted here, at the boundary: this is the point past which the draw is
     // the provider's work, so a request that stays on the engine must leave
-    // the counter where it was.
+    // the counter where it was. One per *trace*: a batch of N records is one
+    // submission scope (G3-B/B-1), and this number has always counted
+    // submissions handed to the provider rather than records answered.
     PROVIDER_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
     // R4b: the provider's presentation counters are the only channel that can
     // say whether a stated present tail actually acquired and presented. Read
     // around the submission, exactly as the emulator's own present tests do —
     // the rail's callers submit from one worker, so the delta names this
-    // submission's action rather than a neighbour's.
-    let present_before = pass.present.map(|_| provider.present_counts());
+    // submission's action rather than a neighbour's. A presenting record is a
+    // *sole or tail* record by construction, so in a batch the reading belongs
+    // to the trace's last record and no intermediate record can state one.
+    let present_before = records
+        .last()
+        .and_then(|record| record.facts.present.then(|| provider.present_counts()));
     // The frame profile's submission bar. This is the one bar on the provider
     // rail that is GPU latency rather than CPU work: `provider.submit` submits
     // and blocks on the completion, and the completion is what carries the
@@ -18065,7 +18674,7 @@ fn submit_narrow(
             // reports is the state the teardown found — before this plan's own
             // unwind releases what it imported.
             let decline = refusal_decline(&error, "submission").into_render();
-            abort_stage_buffer_leases(&mut leases, provider);
+            abort_narrow_leases(&mut leases, provider);
             return Err(decline);
         }
     };
@@ -18074,20 +18683,24 @@ fn submit_narrow(
         result.completion,
         CompletionDisposition::CompletedVisible { .. }
     ) {
-        abort_stage_buffer_leases(&mut leases, provider);
+        abort_narrow_leases(&mut leases, provider);
         return Err(ProviderRenderDecline::CompletionNotVisible);
     }
     // A stated present tail that did not run is a decline, never a frame that
     // looks right: the display rail is about to read these bytes as the
     // presented frame, so the one fact that makes that claim checkable is the
     // provider's own acquire/present pair.
-    let present = match (pass.present, present_before) {
+    let mut present = match (
+        records
+            .last()
+            .and_then(|record| record.facts.present_attachment),
+        present_before,
+    ) {
         (Some(target), Some(before)) => {
             let after = provider.present_counts();
             let acquires = after.0.saturating_sub(before.0);
             let presents = after.1.saturating_sub(before.1);
             if acquires != 1 || presents != 1 {
-                abort_stage_buffer_leases(&mut leases, provider);
                 return Err(ProviderRenderDecline::PresentNotExecuted { acquires, presents });
             }
             Some(PresentCompletion {
@@ -18098,6 +18711,47 @@ fn submit_narrow(
         }
         _ => None,
     };
+    // G3-B/B-1: the batch-level half of the resident store's own check.
+    //
+    // A kept chain's records share *one* attachment identity — that is what the
+    // chain is — and the trace's last record is the one record whose store arm
+    // publishes it. So the per-record reading "the provider published nothing
+    // for this attachment" cannot be asked of an intermediate record in so many
+    // words: the identity it names is the tail's own, and the writeback the
+    // completion carries for it is the tail's answer. The check moves up one
+    // level instead, where the fact is checkable on its own: the trace publishes
+    // the shared identity exactly when its last record's store publishes, so a
+    // trace whose tail keeps the frame publishes it not at all, and a trace
+    // whose tail publishes carries exactly one writeback for it. A single-record
+    // trace is not covered here — it keeps that record's own arm below, which is
+    // the same statement with one record in it.
+    let shared_identity = records.last().map(|record| record.attachment);
+    let tail_keeps_frame = records
+        .last()
+        .is_some_and(|record| record.facts.keeps_frame);
+    if records.len() > 1 {
+        if let Some(identity) = shared_identity {
+            let published = result
+                .writebacks
+                .iter()
+                .filter(|writeback| {
+                    writeback.view_id == identity.view
+                        && writeback.allocation_id == identity.allocation
+                })
+                .count();
+            // More than one writeback for one identity is a resident store
+            // having published — the exact shape
+            // [`ProviderRenderDecline::ResidentWritebackPublished`] names. A
+            // missing one is not checked here: the tail's own arm refuses it by
+            // name (`AttachmentWritebackMissing`) below.
+            if published > usize::from(!tail_keeps_frame) {
+                return Err(ProviderRenderDecline::ResidentWritebackPublished {
+                    allocation: identity.allocation,
+                    view: identity.view,
+                });
+            }
+        }
+    }
     // The retirement chain (`research/docs/20` §3.4), in the order the owner
     // rail states it: bind the completion's token to every lease, observe that
     // the completion retires it, retire and reclaim each window, release the
@@ -18107,229 +18761,300 @@ fn submit_narrow(
     // The frame profile's settle bar: the retirement chain and the writeback
     // of this record's writable views. This is the answer to "is the guest-page
     // write per draw or per pass" — it is charged here, once per record.
-    let _settle = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvSettle);
-    if let Some(plan) = leases.take() {
-        plan.settle(provider, result.completion)
-            .map_err(ProviderRenderDecline::Owner)?;
-    }
-    // R9j: the writable stage buffers' bytes, on the same `BufferWriteback`
-    // channel the stored attachment lands through (R9f). One writeback per
-    // writable view, in the contract's canonical order, re-based onto the bind
-    // the pass stated with the range checked against the view the trace
-    // carried — a provider-reported interval the view cannot hold is never
-    // truncated into place. The bytes leave here for the caller, which owns the
-    // guest destination (`StageBufferLanding`).
-    let stage_writebacks = stage_buffer_writebacks(&stage_buffer_slots, &result.writebacks)?;
-    drop(_settle);
-    // R22: every production this trace carried has to have landed its bytes in
-    // the trace's own writeback channel, or the consuming declaration sampled a
-    // view the provider never produced. The contract refuses that shape at
-    // admission (`render_texture_source_unwritten`) and the producer's store is
-    // `StoreOp::Store`, so this is a check rather than an expectation: a
-    // submission whose trace states a production and no writeback for it is a
-    // wiring defect and a typed decline, never a frame.
-    for production in &in_flight {
-        let landed = result.writebacks.iter().any(|writeback| {
-            writeback.view_id == production.attachment
-                && writeback.allocation_id == production.allocation
-        });
-        if !landed {
-            return Err(ProviderRenderDecline::AttachmentWritebackMissing);
+    //
+    // G3-B/B-1: the completion is the trace's — one submission, one fence — so
+    // the walk settles the records in order against the one completion the batch
+    // carries. Every record's leases retire on it before that record's writeback
+    // is read, exactly as a single record's did, and a plan that refuses stops
+    // the walk while the records whose plans already retired stay retired
+    // (their bytes were published by a completion that ran).
+    let mut out = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        // The record's own half of the trace, under the names this walk was
+        // always written in: one indirection more than the single-record path
+        // had, and the same statements after it.
+        let attachment = record.attachment;
+        let facts = &record.facts;
+        let loads_resident = facts.loads_resident;
+        let in_flight = &record.in_flight;
+        // G3-B/B-1: an intermediate record of a batch is not the trace's
+        // publishing tail. Its own frame stays in the provider's image (which
+        // is what its store arm states), and the writeback the completion
+        // carries for the identity the whole run shares belongs to the tail.
+        let intermediate = records.len() > 1 && index + 1 < records.len();
+        // The present completion belongs to the record that stated one; every
+        // other record of a batch reads `None` here.
+        let present = if facts.present { present.take() } else { None };
+        let _settle =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvSettle);
+        if let Some(plan) = leases[index].take() {
+            plan.settle(provider, result.completion)
+                .map_err(ProviderRenderDecline::Owner)?;
         }
-    }
-    // A production is recorded only once it has actually run: the re-run the
-    // consuming trace states is the pass this submission sent, and the bytes a
-    // later consumer samples are the ones this completion published.
-    if let Some(descriptor) = recordable_descriptor.as_ref() {
-        record_production(req, pass, &render_pipeline, descriptor);
-    }
-    // The resident arm's whole claim is that the frame stayed in the provider's
-    // image. The one fact that would make that claim unreadable is a published
-    // writeback for the same attachment, so it is checked rather than assumed —
-    // and it is a typed decline, because an in-class shape is never re-run
-    // somewhere else.
-    let resident_writeback = result.writebacks.iter().any(|writeback| {
-        writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation
-    });
-    if pass.store.keeps_frame() {
-        if resident_writeback {
-            return Err(ProviderRenderDecline::ResidentWritebackPublished {
-                allocation: attachment.allocation,
-                view: attachment.view,
+        // R9j: the writable stage buffers' bytes, on the same `BufferWriteback`
+        // channel the stored attachment lands through (R9f). One writeback per
+        // writable view, in the contract's canonical order, re-based onto the bind
+        // the pass stated with the range checked against the view the trace
+        // carried — a provider-reported interval the view cannot hold is never
+        // truncated into place. The bytes leave here for the caller, which owns the
+        // guest destination (`StageBufferLanding`).
+        let stage_writebacks =
+            stage_buffer_writebacks(&record.stage_buffer_slots, &result.writebacks)?;
+        drop(_settle);
+        // R22: every production this trace carried has to have landed its bytes in
+        // the trace's own writeback channel, or the consuming declaration sampled a
+        // view the provider never produced. The contract refuses that shape at
+        // admission (`render_texture_source_unwritten`) and the producer's store is
+        // `StoreOp::Store`, so this is a check rather than an expectation: a
+        // submission whose trace states a production and no writeback for it is a
+        // wiring defect and a typed decline, never a frame.
+        for production in in_flight {
+            let landed = result.writebacks.iter().any(|writeback| {
+                writeback.view_id == production.attachment
+                    && writeback.allocation_id == production.allocation
             });
+            if !landed {
+                return Err(ProviderRenderDecline::AttachmentWritebackMissing);
+            }
         }
-        // Two populations, counted where they happen: a store that kept the
-        // frame, and a *load* that began from one. The second is counted for
-        // both store arms — a record that loads the image and publishes its own
-        // frame is the shape the next record's chain depends on, and it is the
-        // one the `draw_partial_load_from_target` readers are.
-        crate::runtime::drain::note_store_route("render_provider_resident_store");
-        crate::runtime::drain::note_store_route(if loads_resident {
-            "render_provider_resident_store_chained"
-        } else {
-            "render_provider_resident_store_seed"
+        // A production is recorded only once it has actually run: the re-run the
+        // consuming trace states is the pass this submission sent, and the bytes a
+        // later consumer samples are the ones this completion published.
+        if let Some(pending) = record.pending_production.as_ref() {
+            commit_production(pending);
+        }
+        // The resident arm's whole claim is that the frame stayed in the provider's
+        // image. The one fact that would make that claim unreadable is a published
+        // writeback for the same attachment, so it is checked rather than assumed —
+        // and it is a typed decline, because an in-class shape is never re-run
+        // somewhere else.
+        //
+        // G3-B/B-1: an intermediate record of a batch checks it one level up
+        // instead — the batch-level check above states that the trace's one
+        // published writeback for the shared identity is the tail's and that the
+        // trace's own record count carries it once. The record's own arm here would
+        // otherwise refuse the *tail's* answer as its own.
+        let resident_writeback = result.writebacks.iter().any(|writeback| {
+            writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation
         });
+        if facts.keeps_frame {
+            if resident_writeback && !intermediate {
+                return Err(ProviderRenderDecline::ResidentWritebackPublished {
+                    allocation: attachment.allocation,
+                    view: attachment.view,
+                });
+            }
+            // Two populations, counted where they happen: a store that kept the
+            // frame, and a *load* that began from one. The second is counted for
+            // both store arms — a record that loads the image and publishes its own
+            // frame is the shape the next record's chain depends on, and it is the
+            // one the `draw_partial_load_from_target` readers are.
+            crate::runtime::drain::note_store_route("render_provider_resident_store");
+            crate::runtime::drain::note_store_route(if loads_resident {
+                "render_provider_resident_store_chained"
+            } else {
+                "render_provider_resident_store_seed"
+            });
+            if loads_resident {
+                crate::runtime::drain::note_store_route("render_provider_resident_load");
+            }
+            // E-TX14: the kept frame's own delivery, counted where it happened. Two
+            // names rather than one, because the census has to be able to read the
+            // *movement* this increment is judged on: `…_kept_frame` is the
+            // population that left the published path, and the bytes beside it are
+            // what the frames would have weighed in the completion's writeback
+            // channel. The resident counters above are charged for this arm too —
+            // it *is* a resident store — so a round reads "resident stores held"
+            // and "of those, delivered by an entry" as two numbers rather than one.
+            if facts.kept_frame_landing {
+                crate::runtime::drain::note_store_route("render_provider_kept_frame_landing");
+                crate::runtime::drain::note_store_route_n(
+                    "render_provider_kept_frame_landing_bytes",
+                    facts.extent,
+                );
+            }
+            out.push(RenderCompletion::Resident(ResidentFrame {
+                attachment: ResidentAttachment {
+                    allocation: attachment.allocation,
+                    view: attachment.view,
+                },
+                loaded: loads_resident,
+                landed: facts.kept_frame_landing,
+            }));
+            continue;
+        }
         if loads_resident {
             crate::runtime::drain::note_store_route("render_provider_resident_load");
         }
-        // E-TX14: the kept frame's own delivery, counted where it happened. Two
-        // names rather than one, because the census has to be able to read the
-        // *movement* this increment is judged on: `…_kept_frame` is the
-        // population that left the published path, and the bytes beside it are
-        // what the frames would have weighed in the completion's writeback
-        // channel. The resident counters above are charged for this arm too —
-        // it *is* a resident store — so a round reads "resident stores held"
-        // and "of those, delivered by an entry" as two numbers rather than one.
-        if let NarrowStore::KeptFrameLanding(_) = pass.store {
-            crate::runtime::drain::note_store_route("render_provider_kept_frame_landing");
+        // The byte arms' own populations, counted where the answer happens for the
+        // reason above: the frame was carried into the pass as bytes, so neither
+        // resident arm moved and these are the only names that say the record was
+        // answered this way. R23's is the frame the caller read out of the
+        // engine's registry under the record's own chain, R25's is the packet's
+        // own chain value handed on by the walk, and R26's is the frame of the
+        // surface the LOAD elision named — three doors, three numbers, because the
+        // callers' obligations differ even though the load does not.
+        if facts.loads_bytes && facts.carried_load_seed_bytes {
+            // R32: the one byte arm whose caller is not a registry read — the
+            // seed door's own bytes, folded into the attachment's order by the
+            // seam. Its own name, for the same reason the three above have theirs.
+            crate::runtime::drain::note_store_route("render_provider_load_seed_bytes");
+        } else if facts.loads_bytes {
+            crate::runtime::drain::note_store_route(if facts.carried_chain_middle {
+                "render_provider_chain_middle_source_bytes"
+            } else if facts.carried_surface_resident {
+                "render_provider_surface_resident_source_bytes"
+            } else {
+                "render_provider_resident_source_bytes"
+            });
+        }
+        // R32's other arm: the attachment's previous contents are the surface's own
+        // guest pages, declared as the contract's ordered run list and gathered by
+        // the provider. Counted where the answer happens, like every arm above.
+        //
+        // B: the elision door states the *same* declaration shape from its own
+        // caller (the window it cut after paying the debt), so the two populations
+        // are counted apart by the flag the load arm set — a census that folded them
+        // together could not say whether the seed door or the elision door had
+        // moved, which is exactly the reading this increment is judged on.
+        if facts.loads_guest_runs {
+            if facts.carried_attachment_guest_window {
+                crate::runtime::drain::note_store_route_n(
+                    "render_provider_attachment_guest_window_bytes",
+                    facts.extent,
+                );
+            } else {
+                crate::runtime::drain::note_store_route("render_provider_load_seed_runs");
+            }
+        }
+        // R38: the same declaration, counted again under the door that produced it.
+        // The seed door's own population is the one this increment moved, and it is
+        // read *beside* the merged name above rather than instead of it: the merged
+        // number is what says the window population grew, this one is what says
+        // which door grew.
+        if facts.carried_seed_guest_window {
             crate::runtime::drain::note_store_route_n(
-                "render_provider_kept_frame_landing_bytes",
-                pass.extent,
+                "render_provider_seed_attachment_guest_window_bytes",
+                facts.extent,
             );
         }
-        return Ok(RenderCompletion::Resident(ResidentFrame {
-            attachment: ResidentAttachment {
-                allocation: attachment.allocation,
-                view: attachment.view,
+        // B3: the frame this pass landed in the owner's own window (E-TX8), priced
+        // beside the arm above. Counted where the answer happens for the same reason
+        // every arm here is: a submission that never reached the caller is not an
+        // answer.
+        if facts.borrowed {
+            crate::runtime::drain::note_store_route_n(
+                "render_provider_borrowed_landing_bytes",
+                facts.extent,
+            );
+        }
+        // E-TX13: the other half of that population, under its own name. The two
+        // arms land in the same kind of place (the owner's registered window) by two
+        // different declarations, and the census has to be able to read which one
+        // grew: this one's population is the guest-backed tail the class used to
+        // refuse, and it is the number this increment is judged on.
+        if facts.borrowed_landing {
+            crate::runtime::drain::note_store_route_n(
+                "render_provider_borrowed_landing_view_bytes",
+                facts.extent,
+            );
+        }
+        // R24's own population, counted where the answer happens for the same
+        // reason as R23's above: the caller read a sampled GPU target's frame out
+        // of the registry that holds it and this pass declared it as the trace's
+        // own bytes, so the record left the engine without a production to restate.
+        if facts.sampled_target_frames {
+            crate::runtime::drain::note_store_route("render_provider_sampled_target_frames");
+        }
+        // The held arm's own population: a caller withheld its readback and this
+        // rail published the frame because the caller cannot fetch a kept one.
+        // Counted here rather than where the arm was elected, so a submission that
+        // never reached the caller is not counted as an answer.
+        if facts.published_held_resident {
+            crate::runtime::drain::note_store_route("render_provider_publish_held_resident");
+        }
+        let Some(writeback) = result.writebacks.iter().find(|writeback| {
+            writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation
+        }) else {
+            return Err(ProviderRenderDecline::AttachmentWritebackMissing);
+        };
+        let length = u64::try_from(writeback.bytes.len()).unwrap_or(u64::MAX);
+        if writeback.offset != 0 || length != facts.extent {
+            return Err(ProviderRenderDecline::AttachmentWritebackShape {
+                offset: writeback.offset,
+                length,
+                expected: facts.extent,
+            });
+        }
+        // One population of its own, counted where it happens: a submission whose
+        // frame is the provider's own present target rather than a pooled scratch
+        // image. The seam prints the counters beside the same line, so a boot can
+        // read the ratio of present-bearing submissions to the class's whole
+        // population.
+        if present.is_some() {
+            crate::runtime::drain::note_store_route("render_provider_present");
+        }
+        out.push(RenderCompletion::Writeback(RenderRailOutput {
+            bytes: writeback.bytes.clone(),
+            bgra: facts.bgra,
+            present,
+            stage_writebacks,
+            landing: if facts.borrowed {
+                Some(WindowLanding::OwnView)
+            } else if facts.borrowed_landing {
+                Some(WindowLanding::LandingView)
+            } else {
+                // E-TX14: this arm has no writeback to attach the landing to — the
+                // frame is kept and the entry delivers it — so the seam reads the
+                // landing off the resident completion instead
+                // (`RenderRailOutcome::ProviderCompletedResident` and the trace's
+                // own store arm, which is where the seam states whether it elected
+                // one).
+                None
             },
-            loaded: loads_resident,
-            landed: matches!(pass.store, NarrowStore::KeptFrameLanding(_)),
         }));
     }
-    if loads_resident {
-        crate::runtime::drain::note_store_route("render_provider_resident_load");
-    }
-    // The byte arms' own populations, counted where the answer happens for the
-    // reason above: the frame was carried into the pass as bytes, so neither
-    // resident arm moved and these are the only names that say the record was
-    // answered this way. R23's is the frame the caller read out of the
-    // engine's registry under the record's own chain, R25's is the packet's
-    // own chain value handed on by the walk, and R26's is the frame of the
-    // surface the LOAD elision named — three doors, three numbers, because the
-    // callers' obligations differ even though the load does not.
-    if matches!(pass.load, NarrowLoad::Bytes(_)) && pass.carried_load_seed_bytes {
-        // R32: the one byte arm whose caller is not a registry read — the
-        // seed door's own bytes, folded into the attachment's order by the
-        // seam. Its own name, for the same reason the three above have theirs.
-        crate::runtime::drain::note_store_route("render_provider_load_seed_bytes");
-    } else if matches!(pass.load, NarrowLoad::Bytes(_)) {
-        crate::runtime::drain::note_store_route(if pass.carried_chain_middle {
-            "render_provider_chain_middle_source_bytes"
-        } else if pass.carried_surface_resident {
-            "render_provider_surface_resident_source_bytes"
-        } else {
-            "render_provider_resident_source_bytes"
-        });
-    }
-    // R32's other arm: the attachment's previous contents are the surface's own
-    // guest pages, declared as the contract's ordered run list and gathered by
-    // the provider. Counted where the answer happens, like every arm above.
-    //
-    // B: the elision door states the *same* declaration shape from its own
-    // caller (the window it cut after paying the debt), so the two populations
-    // are counted apart by the flag the load arm set — a census that folded them
-    // together could not say whether the seed door or the elision door had
-    // moved, which is exactly the reading this increment is judged on.
-    if matches!(pass.load, NarrowLoad::GuestRuns(_)) {
-        if pass.carried_attachment_guest_window {
-            crate::runtime::drain::note_store_route_n(
-                "render_provider_attachment_guest_window_bytes",
-                pass.extent,
-            );
-        } else {
-            crate::runtime::drain::note_store_route("render_provider_load_seed_runs");
-        }
-    }
-    // R38: the same declaration, counted again under the door that produced it.
-    // The seed door's own population is the one this increment moved, and it is
-    // read *beside* the merged name above rather than instead of it: the merged
-    // number is what says the window population grew, this one is what says
-    // which door grew.
-    if pass.carried_seed_guest_window {
-        crate::runtime::drain::note_store_route_n(
-            "render_provider_seed_attachment_guest_window_bytes",
-            pass.extent,
-        );
-    }
-    // B3: the frame this pass landed in the owner's own window (E-TX8), priced
-    // beside the arm above. Counted where the answer happens for the same reason
-    // every arm here is: a submission that never reached the caller is not an
-    // answer.
-    if matches!(pass.store, NarrowStore::Borrowed) {
-        crate::runtime::drain::note_store_route_n(
-            "render_provider_borrowed_landing_bytes",
-            pass.extent,
-        );
-    }
-    // E-TX13: the other half of that population, under its own name. The two
-    // arms land in the same kind of place (the owner's registered window) by two
-    // different declarations, and the census has to be able to read which one
-    // grew: this one's population is the guest-backed tail the class used to
-    // refuse, and it is the number this increment is judged on.
-    if matches!(pass.store, NarrowStore::BorrowedLanding) {
-        crate::runtime::drain::note_store_route_n(
-            "render_provider_borrowed_landing_view_bytes",
-            pass.extent,
-        );
-    }
-    // R24's own population, counted where the answer happens for the same
-    // reason as R23's above: the caller read a sampled GPU target's frame out
-    // of the registry that holds it and this pass declared it as the trace's
-    // own bytes, so the record left the engine without a production to restate.
-    if pass.sampled_target_frames {
-        crate::runtime::drain::note_store_route("render_provider_sampled_target_frames");
-    }
-    // The held arm's own population: a caller withheld its readback and this
-    // rail published the frame because the caller cannot fetch a kept one.
-    // Counted here rather than where the arm was elected, so a submission that
-    // never reached the caller is not counted as an answer.
-    if pass.published_held_resident {
-        crate::runtime::drain::note_store_route("render_provider_publish_held_resident");
-    }
-    let Some(writeback) = result.writebacks.iter().find(|writeback| {
-        writeback.view_id == attachment.view && writeback.allocation_id == attachment.allocation
-    }) else {
-        return Err(ProviderRenderDecline::AttachmentWritebackMissing);
-    };
-    let length = u64::try_from(writeback.bytes.len()).unwrap_or(u64::MAX);
-    if writeback.offset != 0 || length != pass.extent {
-        return Err(ProviderRenderDecline::AttachmentWritebackShape {
-            offset: writeback.offset,
-            length,
-            expected: pass.extent,
-        });
-    }
-    // One population of its own, counted where it happens: a submission whose
-    // frame is the provider's own present target rather than a pooled scratch
-    // image. The seam prints the counters beside the same line, so a boot can
-    // read the ratio of present-bearing submissions to the class's whole
-    // population.
-    if present.is_some() {
-        crate::runtime::drain::note_store_route("render_provider_present");
-    }
-    Ok(RenderCompletion::Writeback(RenderRailOutput {
-        bytes: writeback.bytes.clone(),
-        bgra: pass.bgra,
-        present,
-        stage_writebacks,
-        landing: match pass.store {
-            NarrowStore::Borrowed => Some(WindowLanding::OwnView),
-            NarrowStore::BorrowedLanding => Some(WindowLanding::LandingView),
-            // E-TX14: this arm has no writeback to attach the landing to — the
-            // frame is kept and the entry delivers it — so the seam reads the
-            // landing off the resident completion instead
-            // (`RenderRailOutcome::ProviderCompletedResident` and the trace's
-            // own store arm, which is where the seam states whether it elected
-            // one).
-            NarrowStore::Writeback
-            | NarrowStore::Resident(_)
-            | NarrowStore::KeptFrameLanding(_) => None,
-        },
-    }))
+    Ok(out)
 }
 
-/// The trace's compute half: the pass that declares the attachment's bytes,
-/// plus one declare pass per *writable* stage buffer (R9f/R9j).
+/// Submit one record as its own trace — the single-record arm of the provider
+/// rail, and the arm every record of a packet uses when a batch is not elected
+/// (G3-B/B-1).
+///
+/// The walk is the one this rail always ran: assemble the record into a
+/// one-record trace and finish that trace. The batch path is the same two steps
+/// with more records in them, which is what keeps the two answers one shape.
+fn submit_narrow(
+    inputs: &RenderRailInputs<'_>,
+    req: &DrawRequest,
+    pass: &NarrowPass<'_>,
+    copies: &WindowCopies,
+    texture_copies: &TextureCopies,
+) -> Result<RenderCompletion, ProviderRenderDecline> {
+    let rail = rail().map_err(IntoRender::into_render)?;
+    // The health gate runs before anything is compiled or registered: a
+    // provider the lifecycle already reports terminal cannot take this draw,
+    // and the answer is a refusal, never a silent switch to the other rail.
+    if let Some(decline) = refuse_unhealthy(&rail.provider, "admission") {
+        return Err(decline.into_render());
+    }
+    let mut assembly = NarrowAssembly::new();
+    let record = assemble_narrow_record(
+        rail,
+        inputs,
+        req,
+        pass,
+        copies,
+        texture_copies,
+        &mut assembly,
+    )?;
+    let mut completions = finish_narrow_records(&rail.provider, &[record], assembly)?;
+    Ok(completions.pop().expect("one record, one completion"))
+}
+
+/// One record's compute half: the pass that declares the attachment's bytes,
+/// plus one declare pass per *writable* stage buffer (R9f/R9j) and one for the
+/// landing view when the record states one.
 ///
 /// A landing has to name a view the trace declares, and the views a trace
 /// declares are the ones a compute pass binds — the trace's pool
@@ -18342,7 +19067,8 @@ fn submit_narrow(
 /// pipeline declares (`UnknownBinding` / `MissingBinding`), and the declaring
 /// kernel declares one buffer.
 ///
-/// The render half follows, in the same order the render pass always had.
+/// The record's render pass follows these, in the order the render half of a
+/// trace has always kept.
 ///
 /// E-TX13 adds a **second** declare pass for the landing view, and for exactly
 /// the reason above: the trace's pool is the set of views a compute pass binds
@@ -18352,14 +19078,22 @@ fn submit_narrow(
 /// binding beside the attachment's, because the declaring kernel declares one
 /// buffer and a pass's bound set has to be exactly what its pipeline declares
 /// (`UnknownBinding` / `MissingBinding` otherwise).
-fn declaring_passes_with(
-    pipeline: metal_api_core::provider::PipelineId,
-    attachment: BufferView,
-    stage_buffers: &[StageBufferView],
-    landing: Option<&BufferView>,
-) -> Vec<TracePass> {
-    let mut passes = vec![declaring_pass(pipeline, vec![attachment])];
-    for buffer in stage_buffers
+///
+/// G3-B/B-1 adds the one argument: `declare_attachment` is false for a record
+/// whose attachment view an earlier record of the same trace already declared
+/// — the shared identity of a kept chain, which the pool states once.
+fn declaring_passes_for_record(record: &NarrowRecord, declare_attachment: bool) -> Vec<TracePass> {
+    let pipeline = record.declaring.pipeline_id;
+    let mut passes = Vec::new();
+    // The attachment's own declaration, unless an earlier record of this trace
+    // already stated that view: the pool is keyed by view id, and a kept chain's
+    // records share one attachment identity by construction.
+    if declare_attachment {
+        passes.push(declaring_pass(pipeline, vec![record.declaration.clone()]));
+    }
+    for buffer in record
+        .pass_descriptor
+        .stage_buffers
         .iter()
         .filter(|buffer| buffer.view.access.is_writable())
     {
@@ -18369,7 +19103,7 @@ fn declaring_passes_with(
         pool.access = BufferAccess::Read;
         passes.push(declaring_pass(pipeline, vec![pool]));
     }
-    if let Some(landing) = landing {
+    if let Some(landing) = record.landing_view.as_ref() {
         // The view is already stated at the declaring kernel's own interface
         // (one buffer, `metal_binding` zero, read) by the trace builder, so it
         // travels into the pass unchanged: restating it here would be the
@@ -18431,9 +19165,17 @@ struct ProductionInFlight {
 /// * the colour attachment becomes the identity's allocation at this trace's
 ///   view with [`StoreOp::Store`], which is what makes the frame land in the
 ///   trace's writeback channel for the consumer to sample.
-fn production_in_flight(production: &RecordedProduction, index: usize) -> ProductionInFlight {
+fn production_in_flight(
+    production: &RecordedProduction,
+    index: usize,
+    base: u64,
+) -> ProductionInFlight {
     let mut descriptor = production.descriptor.clone();
-    let offset = PRODUCTION_VIEW_BASE + u64::try_from(index).unwrap_or(0) * PRODUCTION_VIEW_STRIDE;
+    // `base` is [`PRODUCTION_VIEW_BASE`] for the first record of a trace —
+    // which is every single-record trace — and one stride per production of
+    // every record before it for a record of a batch, so two records'
+    // productions cannot mint one view between them.
+    let offset = base + u64::try_from(index).unwrap_or(0) * PRODUCTION_VIEW_STRIDE;
     let mint = |view: ViewId| ViewId::new(view.get() + offset);
     let mut allocations = Vec::new();
     for vertex in descriptor.vertex_buffers.iter_mut() {
@@ -18587,9 +19329,14 @@ fn stage_buffer_writebacks(
 fn input_allocations(
     pass: &NarrowPass<'_>,
     texture_copies: &TextureCopies,
+    base: u64,
 ) -> Vec<(AllocationId, u64)> {
     let mut out = Vec::with_capacity(pass.vertex_streams.len() + 1 + pass.textures.len());
-    let mut next_view = FIRST_INPUT_VIEW;
+    // `base` is the view number this record's own block of the trace's
+    // namespace starts at: [`FIRST_INPUT_VIEW`] for the first record of a
+    // trace — which is every single-record trace — and where the record before
+    // it left off for a record of a batch.
+    let mut next_view = base;
     for stream in &pass.vertex_streams {
         if let Some(bytes) = stream.source.trace_owned() {
             out.push((
@@ -18993,6 +19740,22 @@ fn abort_stage_buffer_leases(
 ) {
     if let Some(plan) = leases.take() {
         plan.abort(provider);
+    }
+}
+
+/// Give up every lease a trace imported, on a path that never reached a
+/// completion.
+///
+/// The single-record arm's [`abort_stage_buffer_leases`] is this loop with one
+/// entry in it; a batch holds one plan per record, in record order, and every
+/// plan that has not settled yet is given back — including on the paths where
+/// only the *frame* or only the admission failed and no submission exists.
+fn abort_narrow_leases(
+    leases: &mut [Option<provider_owner::Plan>],
+    provider: &metal_api_vulkan::VulkanComputeProvider,
+) {
+    for lease in leases.iter_mut() {
+        abort_stage_buffer_leases(lease, provider);
     }
 }
 
