@@ -31961,29 +31961,32 @@ fn a_run_of_three_records_is_one_submission_and_keeps_both_members() {
     );
 }
 
-/// G3-B/B-2: a run of kept records travels as **one pass carrying N draws**,
-/// and that one pass lands the frame N submissions landed.
+/// G3-B/B-2: a run's keeping records travel as **one pass carrying their
+/// draws**, and that one pass lands the frame N submissions landed.
 ///
 /// The run is the three-record chain the N-pass test above assembles — a head
 /// that clears and keeps its frame, a middle that loads it and keeps its own,
 /// and a tail that loads and publishes — and the oracle is the same three
-/// submissions. What this test adds is the **shape**: the trace states one
-/// render pass whose draw list holds all three draws, and the pass's own store
-/// is the tail's, because one render pass instance states one store and the
-/// frame it leaves is the frame the run publishes.
+/// submissions. What this test adds is the **shape**: the run's two keeping
+/// records are one render pass whose draw list holds both of their draws, and
+/// the publishing tail keeps the pass it always had, because a list is one
+/// render pass instance and the store it states is its members' own
+/// (`StoreOp::Resident`) — the tail's `Store` would leave the run's identity
+/// rendered without being declared, which the provider refuses fail-closed.
 ///
 /// The arm's two claims are read where they happen rather than asserted:
 ///
-/// * the shape is counted — one pass, three draws, in the census's `3..=4`
-///   band — so a run that quietly stayed on the N-pass path cannot pass this
-///   test by landing the right bytes;
+/// * the shape is counted — one pass, two draws, in the census's `2` band, plus
+///   the tail's own pass under `render_batch_many_draws_publisher` — so a run
+///   that quietly stayed on the N-pass path cannot pass this test by landing
+///   the right bytes;
 /// * the bytes are the oracle's, byte for byte, so the shape cannot buy its
 ///   divisor with a different picture: the draws of a list are recorded inside
 ///   one `vkCmdBeginRenderPass`/`vkCmdEndRenderPass`, and the attachment they
 ///   chain through is the same image the N-pass shape stored and re-loaded
 ///   between two `vkQueueSubmit`s.
 #[test]
-fn a_run_of_three_records_travels_as_one_pass_carrying_three_draws() {
+fn a_run_of_three_records_travels_as_one_pass_carrying_its_keepers() {
     let _guard = engine_test_session();
     let stages = reviewed_stages();
     let (width, height) = extent();
@@ -31996,7 +31999,8 @@ fn a_run_of_three_records_travels_as_one_pass_carrying_three_draws() {
 
     let passes_before = route_count("render_batch_draws_per_pass_passes");
     let draws_before = route_count("render_batch_draws_per_pass_draws");
-    let band_before = route_count("render_batch_draws_per_pass_3_4");
+    let band_before = route_count("render_batch_draws_per_pass_2");
+    let publisher_before = route_count("render_batch_many_draws_publisher");
     let not_declared_before = route_count("render_batch_many_draws_unsupported");
     let submissions_before = provider_render::provider_submissions();
 
@@ -32040,13 +32044,18 @@ fn a_run_of_three_records_travels_as_one_pass_carrying_three_draws() {
     );
     assert_eq!(
         route_count("render_batch_draws_per_pass_draws") - draws_before,
-        3,
-        "and that pass carries all three of the run's draws"
+        2,
+        "and that pass carries the run's two keeping draws"
     );
     assert_eq!(
-        route_count("render_batch_draws_per_pass_3_4") - band_before,
+        route_count("render_batch_draws_per_pass_2") - band_before,
         1,
-        "the pass is counted in the 3..=4 band the census reads"
+        "the pass is counted in the `2` band the census reads"
+    );
+    assert_eq!(
+        route_count("render_batch_many_draws_publisher") - publisher_before,
+        1,
+        "the run's publishing tail keeps a pass of its own"
     );
     assert_eq!(
         route_count("render_batch_many_draws_unsupported") - not_declared_before,
@@ -32114,6 +32123,91 @@ fn a_run_of_three_records_travels_as_one_pass_carrying_three_draws() {
         provider, one_at_a_time,
         "a run that travels as one pass lands the bytes three submissions landed"
     );
+}
+
+/// G3-B/B-2: a run **every record of which keeps its frame** travels as one
+/// pass end to end.
+///
+/// This is the case the whole arm was built for and the one the provider's own
+/// residency rule permits without a seam: every draw of the list states
+/// `StoreOp::Resident` for the run's identity, so one pass states it once and
+/// the run's frame stays in the provider's image — which is what each of the
+/// three passes stated separately before this increment. Nothing publishes, so
+/// all three answers are `ProviderCompletedResident`.
+#[test]
+fn a_run_whose_every_record_keeps_travels_as_one_pass() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let identity = gva_identity(0x42_00_0a, ash::vk::Format::R8G8B8A8_UNORM);
+    let attachment = provider_render::resident_attachment(&identity);
+
+    let head_inputs = inputs_relay(&stages, RenderChainRole::Head, true, false);
+    let middle_inputs = inputs_relay(&stages, RenderChainRole::Middle, true, true);
+    // The packet's last record, whose frame the guest is owed — but a device
+    // without the landing entry answers it by keeping the frame
+    // (`ReadbackSkipReason::ResidentStore`), which is the shape that folds into
+    // the list. The landing arm is exercised by `override_kept_frame_landing`
+    // tests of its own.
+    let _no_landing = provider_render::override_kept_frame_landing(Some(false));
+    let tail_inputs = inputs_relay(&stages, RenderChainRole::SoleOrTail, true, true);
+
+    let passes_before = route_count("render_batch_draws_per_pass_passes");
+    let draws_before = route_count("render_batch_draws_per_pass_draws");
+    let band_before = route_count("render_batch_draws_per_pass_3_4");
+    let publisher_before = route_count("render_batch_many_draws_publisher");
+    let submissions_before = provider_render::provider_submissions();
+
+    let mut batch = provider_render::RenderBatch::new();
+    for (inputs, request) in [
+        (&head_inputs, resident_seed_request(&identity)),
+        (&middle_inputs, resident_load_request(&identity, false)),
+        (&tail_inputs, resident_load_request(&identity, false)),
+    ] {
+        match provider_render::park_render(inputs, &request, &mut batch) {
+            provider_render::RenderParkOutcome::Parked => {}
+            other => panic!("the run's record joins the run: {other:?}"),
+        }
+    }
+    assert_eq!(
+        batch.last_record_keeps_frame(),
+        Some(true),
+        "the run's last record keeps its own frame: that is what lets the whole run fold"
+    );
+    provider_render::finish_render_batch(&mut batch).expect("the run's own submission is admitted");
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before + 1,
+        "three draws inside one pass are still exactly one submission"
+    );
+    assert_eq!(
+        route_count("render_batch_draws_per_pass_passes") - passes_before,
+        1,
+        "the run states one render pass"
+    );
+    assert_eq!(
+        route_count("render_batch_draws_per_pass_draws") - draws_before,
+        3,
+        "and that pass carries all three of the run's draws"
+    );
+    assert_eq!(
+        route_count("render_batch_draws_per_pass_3_4") - band_before,
+        1,
+        "the pass is counted in the 3..=4 band the census reads"
+    );
+    assert_eq!(
+        route_count("render_batch_many_draws_publisher") - publisher_before,
+        0,
+        "a run with nothing to publish leaves no record on a pass of its own"
+    );
+    for (index, outcome) in batch.outcomes().iter().enumerate() {
+        match outcome {
+            RenderRailOutcome::ProviderCompletedResident(frame) => assert_eq!(
+                frame.attachment, attachment,
+                "record {index}'s frame stayed under the run's own identity"
+            ),
+            other => panic!("record {index} of an all-keeping run keeps its frame: {other:?}"),
+        }
+    }
 }
 
 /// G3-B/B-2: a device that declares no draw list keeps the run in the N-pass
