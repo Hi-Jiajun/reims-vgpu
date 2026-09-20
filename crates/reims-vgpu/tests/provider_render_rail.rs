@@ -31280,3 +31280,372 @@ fn the_reused_air_sampler_is_declared_for_every_texture_that_reads_through_it() 
         stages.fragment_texture_declarations.len(),
     );
 }
+
+/// G1-C, indexed half: a windowless vertex stream whose declared table is far
+/// longer than the records this draw's indices name is copied to *those*
+/// records, and the frame is the engine's own, byte for byte.
+///
+/// The `g1b` census carried **185 000 B** a vertex bind beside **36.7 B** an
+/// index bind of the same draws (`evidence/gate3-census-g1b-2026-09-20`): the
+/// guest binds a vertex table whole and one draw reads a handful of its
+/// records, so the copy paid for the table. `G1-C` cuts it to the draw's own
+/// reach — `(highest index + 1) × stride` on this arm — and the two ways that
+/// can go wrong are opposite: a copy that stopped *short* of the record the
+/// draw fetches last (a lost or refused draw) and a copy that carried the tail
+/// anyway (no saving). The assertions below separate them, and the `+ 1` is
+/// pinned by the arm that reads the record at the very top of the reach.
+#[test]
+fn an_indexed_draw_cuts_a_windowless_vertex_stream_to_the_vertices_its_indices_name() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    /// 128 `float2` records: the table the guest binds and one draw reads.
+    const RECORDS: usize = 128;
+    const TABLE_BYTES: u64 = (RECORDS as u64) * 8;
+    /// What `[0, 1, 2]` names: three records.
+    const NEAR_REACH: u64 = 3 * 8;
+    /// What `[0, 3, 5]` names: six — the last of them at the top of the copy.
+    const FAR_REACH: u64 = 6 * 8;
+    /// The first record of the tail neither arm names.
+    const TAIL_RECORD: usize = 6;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The owner's own address, copied out before the closures below are built:
+    // the sources a test hands the rails are host runs over this mapping, and
+    // the mapping's bytes are rewritten between submissions.
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+
+    // The reviewed triangle's three vertices, at the records each index set
+    // reads: `0, 1, 2` for the near reach and `0, 3, 5` for the far one, so both
+    // arms fetch the same three positions in the same order and land the same
+    // texel.
+    let reviewed = f32x2(&[(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)]);
+    let mut table = vec![0u8; TABLE_BYTES as usize];
+    for (record, vertex) in [(0usize, 0usize), (1, 1), (2, 2), (3, 1), (5, 2)] {
+        table[record * 8..record * 8 + 8].copy_from_slice(&reviewed[vertex * 8..vertex * 8 + 8]);
+    }
+    // The tail — every record past the far reach — in one of two values per
+    // reading. `NaN` is the poison: a fetch of one would collapse the triangle,
+    // so a rail that read the tail lands a different frame for it.
+    let fill = |owner: &mut AlignedHost, tail: f32| {
+        let mut bytes = table.clone();
+        let poison = f32x2(&[(tail, tail)]);
+        for record in TAIL_RECORD..RECORDS {
+            bytes[record * 8..record * 8 + 8].copy_from_slice(&poison);
+        }
+        owner.as_mut_slice()[..TABLE_BYTES as usize].copy_from_slice(&bytes);
+    };
+    // The production source: one live host run over the table's own bytes and no
+    // `pages`, which is the reading a host that cannot register an import gives
+    // every gather — the shape the G1-B test beside this one drives, with a
+    // whole table rather than one triangle's three records.
+    let source = || {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                mapping,
+                mapping_len,
+                0,
+                TABLE_BYTES,
+            )
+            .expect("the table's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: TABLE_BYTES,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        })
+    };
+    let request = |indices: [u32; 3]| {
+        let mut bytes = Vec::with_capacity(12);
+        for value in indices {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.indexed = Some(IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            content: BufferContent::Bytes(std::sync::Arc::new(bytes)),
+        });
+        req.vertex_attributes = vec![VertexAttributeResource {
+            location: 0,
+            binding: 0,
+            format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+                .expect("Float2 is a vertex format"),
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: source(),
+        }];
+        req
+    };
+    // The four engine frames first: the engine rail is reachable from a test
+    // before the provider's device exists, and these are what "the frame did not
+    // move" is measured against.
+    let engine_frame =
+        |label: &str, indices: [u32; 3]| engine_pixels(label, &stages, request(indices));
+    fill(&mut owner, 0.0);
+    let Some(near_engine) = engine_frame("the near reach over a quiet tail", [0, 1, 2]) else {
+        return;
+    };
+    let Some(far_engine) = engine_frame("the far reach over a quiet tail", [0, 3, 5]) else {
+        return;
+    };
+    fill(&mut owner, f32::NAN);
+    let Some(near_engine_poison) = engine_frame("the near reach over a NaN tail", [0, 1, 2]) else {
+        return;
+    };
+    let Some(far_engine_poison) = engine_frame("the far reach over a NaN tail", [0, 3, 5]) else {
+        return;
+    };
+    let frame = |label: &str, indices: [u32; 3]| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(indices),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => {
+                panic!("{label}: a windowless vertex stream is in class since G1-B: {other:?}")
+            }
+        }
+    };
+    let staged_before = route_count("render_provider_out_of_class_vertex_staging_staged");
+    let bytes_before = route_count("render_provider_out_of_class_vertex_staging_bytes");
+    let cut_before = route_count("render_provider_out_of_class_vertex_staging_reach_cut");
+    let slack_before = route_count("render_provider_out_of_class_vertex_staging_reach_slack_bytes");
+    let declared_before = route_count("render_provider_out_of_class_vertex_staging_declared_le4k");
+    let copied_before = route_count("render_provider_out_of_class_vertex_staging_copied_le64");
+    let copied_512_before = route_count("render_provider_out_of_class_vertex_staging_copied_le512");
+    let delivered = provider_render::provider_submissions();
+
+    fill(&mut owner, 0.0);
+    let near = frame("the near reach over a quiet tail", [0, 1, 2]);
+    fill(&mut owner, f32::NAN);
+    let near_poison = frame("the near reach over a NaN tail", [0, 1, 2]);
+    let far_poison = frame("the far reach over a NaN tail", [0, 3, 5]);
+    fill(&mut owner, 0.0);
+    let far = frame("the far reach over a quiet tail", [0, 3, 5]);
+
+    eprintln!(
+        "G1-C reach cut (indexed): a {TABLE_BYTES} byte table at 8 bytes a record, `[0, 1, 2]` \
+         reads {NEAR_REACH} of it and `[0, 3, 5]` reads {FAR_REACH}; texel (0, 0) {:?}",
+        texel_at(&near, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&near, 0, 0),
+        FRAGMENT_TEXEL,
+        "the cut copy still carries every record the draw's own indices name"
+    );
+    assert_frames_equal("the near reach, both rails", &near, &near_engine);
+    assert_frames_equal("the far reach, both rails", &far, &far_engine);
+    assert_frames_equal(
+        "the near reach over a NaN tail, both rails",
+        &near_poison,
+        &near_engine_poison,
+    );
+    assert_frames_equal(
+        "the far reach over a NaN tail, both rails",
+        &far_poison,
+        &far_engine_poison,
+    );
+    // The tail is not a fetch of either draw: the two values it holds land the
+    // same frame, and the two index sets — which read one triangle at `0, 1, 2`
+    // and `0, 3, 5` — land it too.
+    assert_frames_equal(
+        "the near reach against its own NaN tail",
+        &near,
+        &near_poison,
+    );
+    assert_frames_equal("the far reach against its own NaN tail", &far, &far_poison);
+    assert_frames_equal("the two reaches' frames", &near, &far);
+
+    // What the copy carried, arm by arm: `min(declared, reach)` a submission,
+    // four submissions, two of each reach.
+    let staged = route_count("render_provider_out_of_class_vertex_staging_staged") - staged_before;
+    let bytes = route_count("render_provider_out_of_class_vertex_staging_bytes") - bytes_before;
+    let cut = route_count("render_provider_out_of_class_vertex_staging_reach_cut") - cut_before;
+    let slack =
+        route_count("render_provider_out_of_class_vertex_staging_reach_slack_bytes") - slack_before;
+    eprintln!(
+        "reach-cut census: binds={staged} bytes={bytes} cut={cut} slack={slack} (declared \
+         {TABLE_BYTES} B a bind, copied {NEAR_REACH} B and {FAR_REACH} B)"
+    );
+    assert_eq!(staged, 4, "one copy a submission, one stream each");
+    assert_eq!(
+        bytes,
+        2 * NEAR_REACH + 2 * FAR_REACH,
+        "each copy carries the draw's own reach, not the table it was cut from"
+    );
+    assert_eq!(cut, 4, "every copy of the arm was shortened");
+    assert_eq!(
+        slack,
+        2 * (TABLE_BYTES - NEAR_REACH) + 2 * (TABLE_BYTES - FAR_REACH),
+        "and the bytes the cut left in the runs are the declared length less the reach"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_vertex_staging_declared_le4k") - declared_before,
+        4,
+        "the declared histogram reads the table's own size"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_vertex_staging_copied_le64") - copied_before,
+        4,
+        "and the copied histogram reads the reach's"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_vertex_staging_copied_le512") - copied_512_before,
+        0,
+        "no copy of this arm landed above the smallest bucket"
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the cut shape reaches the canonical provider instead of the engine"
+    );
+}
+
+/// G1-C, non-indexed half: the same cut on the arm that names its vertices
+/// directly, where the reach is the draw's own `vertex_count` rather than a
+/// number read out of index bytes.
+///
+/// This arm's span proof is [`nonindexed_vertex_span`]'s `draw_count × stride`,
+/// so the cut and the proof meet at the same number: the copy is *exactly* what
+/// the class proves the stream against, and a `min` that took one byte less
+/// would leave a stream the span proof refuses — a decline, not a fallback.
+#[test]
+fn a_non_indexed_draw_cuts_a_windowless_vertex_stream_to_its_own_vertex_count() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    const RECORDS: usize = 128;
+    const TABLE_BYTES: u64 = (RECORDS as u64) * 8;
+    /// The three vertices a `vertex_count` of three names.
+    const REACH: u64 = 3 * 8;
+    const TAIL_RECORD: usize = 6;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+
+    let reviewed = f32x2(&[(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)]);
+    let mut table = vec![0u8; TABLE_BYTES as usize];
+    table[0..24].copy_from_slice(&reviewed);
+    let fill = |owner: &mut AlignedHost, tail: f32| {
+        let mut bytes = table.clone();
+        let poison = f32x2(&[(tail, tail)]);
+        for record in TAIL_RECORD..RECORDS {
+            bytes[record * 8..record * 8 + 8].copy_from_slice(&poison);
+        }
+        owner.as_mut_slice()[..TABLE_BYTES as usize].copy_from_slice(&bytes);
+    };
+    let source = || {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                mapping,
+                mapping_len,
+                0,
+                TABLE_BYTES,
+            )
+            .expect("the table's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: TABLE_BYTES,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        })
+    };
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        // The contract's other arm: no index buffer, and the request's own
+        // `vertex_count` names `0..3` (the reviewed request already carries it).
+        req.indexed = None;
+        req.vertex_attributes = vec![VertexAttributeResource {
+            location: 0,
+            binding: 0,
+            format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+                .expect("Float2 is a vertex format"),
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: source(),
+        }];
+        req
+    };
+    fill(&mut owner, 0.0);
+    let Some(quiet_engine) = engine_pixels("the non-indexed reach, quiet tail", &stages, request())
+    else {
+        return;
+    };
+    fill(&mut owner, f32::NAN);
+    let Some(poison_engine) = engine_pixels("the non-indexed reach, NaN tail", &stages, request())
+    else {
+        return;
+    };
+    let frame = |label: &str| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => {
+                panic!("{label}: a windowless vertex stream is in class since G1-B: {other:?}")
+            }
+        }
+    };
+    let staged_before = route_count("render_provider_out_of_class_vertex_staging_staged");
+    let bytes_before = route_count("render_provider_out_of_class_vertex_staging_bytes");
+    let cut_before = route_count("render_provider_out_of_class_vertex_staging_reach_cut");
+    let slack_before = route_count("render_provider_out_of_class_vertex_staging_reach_slack_bytes");
+
+    fill(&mut owner, 0.0);
+    let quiet = frame("the non-indexed reach, quiet tail");
+    fill(&mut owner, f32::NAN);
+    let poison = frame("the non-indexed reach, NaN tail");
+
+    eprintln!(
+        "G1-C reach cut (non-indexed): a {TABLE_BYTES} byte table at 8 bytes a record, \
+         vertex_count 3 reads {REACH}; texel (0, 0) {:?}",
+        texel_at(&quiet, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&quiet, 0, 0),
+        FRAGMENT_TEXEL,
+        "the cut copy still carries the records the draw names"
+    );
+    assert_frames_equal("the non-indexed reach, both rails", &quiet, &quiet_engine);
+    assert_frames_equal(
+        "the non-indexed reach over a NaN tail, both rails",
+        &poison,
+        &poison_engine,
+    );
+    assert_frames_equal(
+        "the non-indexed reach against its own NaN tail",
+        &quiet,
+        &poison,
+    );
+    let staged = route_count("render_provider_out_of_class_vertex_staging_staged") - staged_before;
+    let bytes = route_count("render_provider_out_of_class_vertex_staging_bytes") - bytes_before;
+    let cut = route_count("render_provider_out_of_class_vertex_staging_reach_cut") - cut_before;
+    let slack =
+        route_count("render_provider_out_of_class_vertex_staging_reach_slack_bytes") - slack_before;
+    eprintln!(
+        "reach-cut census (non-indexed): binds={staged} bytes={bytes} cut={cut} slack={slack} \
+         (declared {TABLE_BYTES} B, copied {REACH} B)"
+    );
+    assert_eq!(staged, 2, "one copy a submission");
+    assert_eq!(
+        bytes,
+        2 * REACH,
+        "the copy is exactly the `draw_count × stride` the span proof weighs it against"
+    );
+    assert_eq!(cut, 2);
+    assert_eq!(slack, 2 * (TABLE_BYTES - REACH));
+}
