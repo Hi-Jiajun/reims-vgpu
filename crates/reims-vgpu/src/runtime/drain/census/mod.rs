@@ -703,11 +703,118 @@ pub(crate) enum FrameSpan {
     ProvFrameCloneResources = 41,
     /// `CommandCodec::encode_request` itself: the payload bytes.
     ProvFrameEncode = 42,
+    /// `provider_owner::plan_with_epoch`'s `bytes.to_vec()`: the staged lease's
+    /// own `Vec`, built **while the owner registry's mutex is held**.
+    ///
+    /// # Why the lease plan copies at all
+    ///
+    /// A `provider_owner::Request::Staged` carries `bytes: &'a [u8]`, and the
+    /// provider's own `StagedLease::new` wants the bytes owned — it holds them
+    /// until the completion uploads them. So the plan makes the owner's copy at
+    /// the one place it can: inside `plan_with_epoch`, on the calling thread,
+    /// with `state()`'s guard alive. The bytes it copies are ones this rail
+    /// already owns a moment earlier (the gate's staged copy — [`Self::LeaseGatherBytes`]
+    /// or a window copy), so this bar is a second copy of a buffer that exists
+    /// one frame up.
+    ///
+    /// It is priced apart from the provider's own upload because the fix is a
+    /// different one: hand the plan the `Vec` this rail already holds instead of
+    /// a borrow of it.
+    LeaseStagedCopy = 43,
+    /// `crate::backend::provider_render::stage_run_bytes`' own copy: the bytes
+    /// read out of the guest's live pages through a bind's runs.
+    ///
+    /// This is the gather's product on the owner side (`G1-A`): the class gate
+    /// makes it for every bind whose runs state no registered window, and it is
+    /// the bytes the staged lease above is minted over. Its lever is the only
+    /// one an owner-side change can take — the copy is what turns the guest's
+    /// pages into the declaration — so the round has to price it before any
+    /// reuse or pooling is worth proposing.
+    LeaseGatherBytes = 44,
+    /// `crate::backend::provider_render::gather_run_windows`' own list: the
+    /// per-bind `Vec<StageBufferWindow>` the run list is stated through.
+    ///
+    /// A list-shaped bind's windows are derived once per submission and read by
+    /// the owner plan, the trace's own declaration and the co-ordinates the
+    /// binds travel as. The list is small per element and the count is what
+    /// scales, which is why the count reading beside this bar matters more than
+    /// its bytes.
+    LeaseWindowGather = 45,
+    /// `provider_owner::plan_with_epoch`'s per-list `Vec<GuestRun>`: the run
+    /// list restated in the contract's own coordinates, one entry per window the
+    /// request states.
+    ///
+    /// Built by pushing into a fresh `Vec` for every list-shaped request, under
+    /// the same registry guard as [`Self::LeaseStagedCopy`].
+    LeaseRunGather = 46,
+    /// The three `plan.guest_runs(binding).to_vec()` copies the trace's own
+    /// `BufferSource::GuestRuns` declarations are built from — the attachment's
+    /// seed, the sampled seed and the landing view's list.
+    ///
+    /// The plan already owns these runs for the whole submission
+    /// (`provider_owner::Plan::guest_runs` returns a slice of them), so this
+    /// is the run-list twin of the staged copy above: the declaration wants an
+    /// owned list and the plan is holding the only one.
+    LeaseRunCopy = 47,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::ProvFrameEncode as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::LeaseRunCopy as usize + 1;
+
+/// One `Vec`-shaped construction the lease/run cut prices, with its own slot in
+/// the count/byte tables beside the span bar of the same name.
+///
+/// # Why counts and bytes rather than microseconds alone
+///
+/// [`FrameSpan`] answers "how long did this take", and for a copy made once per
+/// submission that is the whole reading. For the run-shaped meters it is not:
+/// the interesting number is **how many elements** were carried, and an element
+/// count is not a duration. So each meter reports two window counters — how many
+/// times the construction ran (`_n`) and how many bytes its payload held
+/// (`_bytes`) — and the corresponding span bar reports the microseconds. The
+/// element count is `_bytes / size_of::<T>()`: 24 for a contract `GuestRun`, 48
+/// for a `provider_owner::Window`, and for a `Vec<u8>` the two readings are
+/// the same number by construction.
+///
+/// Every counter is a **per-frame mean** on the line, like every other field
+/// there, so the meter is read against the same `frames` the bars are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub(crate) enum LeaseVecMeter {
+    /// [`FrameSpan::LeaseStagedCopy`]'s `Vec`.
+    StagedCopy = 0,
+    /// [`FrameSpan::LeaseGatherBytes`]'s `Vec`.
+    GatherBytes = 1,
+    /// [`FrameSpan::LeaseWindowGather`]'s `Vec`.
+    WindowGather = 2,
+    /// [`FrameSpan::LeaseRunGather`]'s `Vec`.
+    RunGather = 3,
+    /// [`FrameSpan::LeaseRunCopy`]'s `Vec`.
+    RunCopy = 4,
+}
+
+/// Number of [`LeaseVecMeter`] slots, derived from the enum the same way
+/// [`FRAME_SPANS`] is.
+const LEASE_VEC_METERS: usize = LeaseVecMeter::RunCopy as usize + 1;
+
+/// The emitted field-name stem of each meter, in slot order. The span bar is
+/// the same stem with `_us_mean` on it, so a reader pairs them by name.
+const LEASE_VEC_NAMES: [&str; LEASE_VEC_METERS] = [
+    "lease_staged_copy",
+    "lease_gather_bytes",
+    "lease_window_gather",
+    "lease_run_gather",
+    "lease_run_copy",
+];
+
+impl LeaseVecMeter {
+    /// This meter's slot in the count/byte tables, which is its discriminant.
+    #[inline]
+    pub(crate) fn slot(self) -> usize {
+        self as usize
+    }
+}
 
 impl FrameSpan {
     /// The bar a [`crate::runtime::chain_phase::Phase`] ordinal names.
@@ -803,6 +910,11 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "prov_frame_clone_trace_us_mean",
     "prov_frame_clone_resources_us_mean",
     "prov_frame_encode_us_mean",
+    "lease_staged_copy_us_mean",
+    "lease_gather_bytes_us_mean",
+    "lease_window_gather_us_mean",
+    "lease_run_gather_us_mean",
+    "lease_run_copy_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.
@@ -886,6 +998,16 @@ pub(crate) struct FrameProfileCensus {
     // microseconds per frame is not the same reading as microseconds per byte.
     wire_bytes: std::sync::atomic::AtomicU64,
     wire_bytes_sum: std::sync::atomic::AtomicU64,
+    // The lease/run cut's own `Vec` meters ([`LeaseVecMeter`]): how many times
+    // each construction ran and how many bytes it carried, cumulative, on the
+    // same differencing the wire counters take so a frame that straddles a
+    // report boundary is still counted once.
+    lease_vec_n: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
+    lease_vec_bytes: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
+    lease_vec_n_sum: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
+    lease_vec_bytes_sum: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
+    last_present_lease_vec_n: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
+    last_present_lease_vec_bytes: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
     // The previous frame's close; 0 before the first present.
     last_present_us: std::sync::atomic::AtomicU64,
     last_present_draws: std::sync::atomic::AtomicU64,
@@ -923,6 +1045,12 @@ impl FrameProfileCensus {
             wire_sum: AtomicU64::new(0),
             wire_bytes: AtomicU64::new(0),
             wire_bytes_sum: AtomicU64::new(0),
+            lease_vec_n: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
+            lease_vec_bytes: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
+            lease_vec_n_sum: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
+            lease_vec_bytes_sum: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
+            last_present_lease_vec_n: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
+            last_present_lease_vec_bytes: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
             last_present_us: AtomicU64::new(0),
             last_present_draws: AtomicU64::new(0),
             last_present_draw_us: AtomicU64::new(0),
@@ -981,6 +1109,18 @@ impl FrameProfileCensus {
         self.wire_bytes.fetch_add(bytes, Relaxed);
     }
 
+    /// Bank one [`LeaseVecMeter`]'s construction: how many elements it carried
+    /// and how many bytes its payload held.
+    ///
+    /// Called only through the module-level [`note_lease_vec`], which is where
+    /// the switch is read, so a profile that is off costs the call site one
+    /// relaxed load and no counter write.
+    pub(crate) fn note_lease_vec(&self, meter: LeaseVecMeter, n: u64, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.lease_vec_n[meter.slot()].fetch_add(n, Relaxed);
+        self.lease_vec_bytes[meter.slot()].fetch_add(bytes, Relaxed);
+    }
+
     /// Close the frame a present ends, and report when the window fills.
     ///
     /// `not_enabled` names the arm
@@ -1024,6 +1164,23 @@ impl FrameProfileCensus {
         let draw_us = self.draw_us.load(Relaxed);
         let wire = self.wire_frames.load(Relaxed);
         let wire_bytes = self.wire_bytes.load(Relaxed);
+        // The meters are differenced on the same edge as the wire counters, and
+        // on the same terms: the swap below is what arms the first present's
+        // baseline, so a frame that straddles a report boundary stays whole.
+        let mut lease_vec_n = [0u64; LEASE_VEC_METERS];
+        let mut lease_vec_bytes = [0u64; LEASE_VEC_METERS];
+        for (slot, (n, bytes)) in lease_vec_n
+            .iter_mut()
+            .zip(lease_vec_bytes.iter_mut())
+            .enumerate()
+        {
+            let cur = self.lease_vec_n[slot].load(Relaxed);
+            let prev = self.last_present_lease_vec_n[slot].swap(cur, Relaxed);
+            *n = cur.saturating_sub(prev);
+            let cur = self.lease_vec_bytes[slot].load(Relaxed);
+            let prev = self.last_present_lease_vec_bytes[slot].swap(cur, Relaxed);
+            *bytes = cur.saturating_sub(prev);
+        }
         // The sub-phase table is differenced the same way and on the same
         // terms, so a frame that straddles a report boundary stays whole.
         let mut frame_spans = [0u64; FRAME_SPANS];
@@ -1063,6 +1220,10 @@ impl FrameProfileCensus {
             .fetch_add(wire.saturating_sub(prev_wire), Relaxed);
         self.wire_bytes_sum
             .fetch_add(wire_bytes.saturating_sub(prev_wire_bytes), Relaxed);
+        for (slot, (n, bytes)) in lease_vec_n.iter().zip(lease_vec_bytes.iter()).enumerate() {
+            self.lease_vec_n_sum[slot].fetch_add(*n, Relaxed);
+            self.lease_vec_bytes_sum[slot].fetch_add(*bytes, Relaxed);
+        }
         self.host_sum_us.fetch_add(frame_host_us, Relaxed);
         self.host_max_us.fetch_max(frame_host_us, Relaxed);
         for (acc, us) in self.span_sum_us.iter().zip(frame_spans.iter()) {
@@ -1112,6 +1273,13 @@ impl FrameProfileCensus {
                 mean(wire_sum),
                 mean(wire_bytes_sum),
             );
+            for (slot, name) in LEASE_VEC_NAMES.iter().enumerate() {
+                line.push_str(&format!(
+                    " {name}_n={} {name}_bytes={}",
+                    mean(self.lease_vec_n_sum[slot].swap(0, Relaxed)),
+                    mean(self.lease_vec_bytes_sum[slot].swap(0, Relaxed)),
+                ));
+            }
             for (name, acc) in SPAN_NAMES.iter().zip(self.span_sum_us.iter()) {
                 let sum = acc.swap(0, Relaxed);
                 line.push_str(&format!(" {name}={}", mean(sum)));
@@ -1230,6 +1398,21 @@ pub(crate) fn note_frame_wire_bytes(bytes: u64) {
         return;
     }
     FRAME_PROFILE.note_wire_bytes(bytes);
+}
+
+/// Bank one [`LeaseVecMeter`]'s construction against the open frame.
+///
+/// `n` is how many times the construction ran (always 1 at the call sites: each
+/// one is a single `Vec`), and `bytes` is the payload it carried — the byte
+/// length for a `Vec<u8>`, and `len * size_of::<T>()` for a list of elements.
+///
+/// Charged at the construction's own site rather than at a later reader, so the
+/// count and the [`FrameSpan`] bar beside it are of the same events.
+pub(crate) fn note_lease_vec(meter: LeaseVecMeter, n: u64, bytes: u64) {
+    if !frame_profile_on() {
+        return;
+    }
+    FRAME_PROFILE.note_lease_vec(meter, n, bytes);
 }
 
 /// Bank one of [`crate::runtime::chain_phase`]'s bars, named by its ordinal.

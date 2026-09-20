@@ -49,6 +49,11 @@ use metal_api_vulkan::VulkanComputeProvider;
 
 use crate::observe::Decline as ObserveDecline;
 
+/// `size_of::<GuestRun>()` as the run-list meters' own unit: the seventh cut
+/// prices a run list by its elements, so `_bytes / GUEST_RUN_BYTES` is the run
+/// count the round read.
+const GUEST_RUN_BYTES: u64 = std::mem::size_of::<metal_api_core::provider::GuestRun>() as u64;
+
 /// What one device-loss teardown released, as the owner ledger saw it.
 ///
 /// The contract's guarantee is that a device loss releases every lease
@@ -1149,6 +1154,42 @@ fn checked_window(state: &State, window: Window) -> Result<(u64, u64), Decline> 
     Ok((offset, end))
 }
 
+/// The owner's own copy of one staged binding's bytes, made where the provider's
+/// [`StagedLease`] is minted.
+///
+/// # Why the plan is where this copy has to be made
+///
+/// [`Request::Staged`] carries `bytes: &'a [u8]` and [`StagedLease::new`] wants
+/// the bytes **owned** — the provider holds them until the completion that
+/// uploads them, which is later than this call. So the owner's `Vec` is made
+/// here, on the calling thread, with the registry guard of [`plan_with_epoch`]
+/// alive.
+///
+/// The bytes are ones this rail already held a moment earlier: the gate's staged
+/// copy (`provider_render::stage_run_bytes`) or the window copy the device's own
+/// granules forced (`R18`). That is what the seventh cut's meter prices apart
+/// from those producers — this bar is a **second** copy of a buffer that already
+/// exists one frame up, and its lever is to hand the plan the `Vec` the caller
+/// owns instead of a borrow of it.
+///
+/// Default off behind the frame profile: with `REIMS_VGPU_FRAME_PROFILE` unset
+/// both the span and the two counters are `None`/no-ops and this is exactly
+/// `bytes.to_vec()`, which is why the arm a round ran before this one exists is
+/// the arm it runs with the profile off.
+fn staged_lease_bytes(bytes: &[u8]) -> Vec<u8> {
+    use crate::runtime::drain::{frame_span, note_lease_vec, FrameSpan, LeaseVecMeter};
+    let _span = frame_span(FrameSpan::LeaseStagedCopy);
+    let copy = bytes.to_vec();
+    // Reported before the value moves into `StagedLease::new`, so the counters
+    // and the span are of the same construction.
+    note_lease_vec(
+        LeaseVecMeter::StagedCopy,
+        1,
+        u64::try_from(copy.len()).unwrap_or(u64::MAX),
+    );
+    copy
+}
+
 /// [`plan`] with the lease epoch stated by the caller.
 ///
 /// Production passes the provider's own `device_epoch()` — that is what
@@ -1398,6 +1439,13 @@ pub fn plan_with_epoch<'a>(
             if run_request.windows.first().map(|w| w.import) != Some(*import) {
                 continue;
             }
+            // The seventh cut's own meter: one fresh `Vec<GuestRun>` per
+            // list-shaped request, built here under the registry guard. The
+            // bar and the two counters are default off behind the frame
+            // profile; with it off this is the same `Vec::with_capacity` and
+            // the same pushes.
+            let _run_span =
+                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseRunGather);
             let mut runs = Vec::with_capacity(run_request.windows.len());
             for window in run_request.windows {
                 let Some(offset) = window
@@ -1428,6 +1476,13 @@ pub fn plan_with_epoch<'a>(
                     length: window.bytes_len,
                 });
             }
+            crate::runtime::drain::note_lease_vec(
+                crate::runtime::drain::LeaseVecMeter::RunGather,
+                1,
+                u64::try_from(runs.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(GUEST_RUN_BYTES),
+            );
             run_views.push(RunView {
                 binding: run_request.binding,
                 allocation,
@@ -1459,7 +1514,7 @@ pub fn plan_with_epoch<'a>(
                 offset: 0,
                 length,
             },
-            bytes.to_vec(),
+            staged_lease_bytes(bytes),
         ) {
             Ok(staged_lease) => staged_lease,
             Err(error) => {

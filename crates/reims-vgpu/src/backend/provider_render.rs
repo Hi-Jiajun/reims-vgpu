@@ -5112,6 +5112,35 @@ fn canonical_vertex_stream_count(attributes: &[VertexAttributeResource]) -> usiz
     heads.len()
 }
 
+/// The plan's own gathered runs, copied into the owned list one
+/// `BufferSource::GuestRuns` declaration carries.
+///
+/// # The run list the plan is already holding (the seventh cut's meter)
+///
+/// The contract's `BufferSource::GuestRuns` declaration carries an **owned**
+/// `Vec<GuestRun>`, while the owner plan holds the only list of them for the
+/// whole submission (`provider_owner::Plan::guest_runs` returns a slice). So
+/// every declaration is a `to_vec` of a list that already exists, made here
+/// through one helper so the round prices one construction rather than three
+/// call sites: [`FrameSpan::LeaseRunCopy`] and
+/// [`LeaseVecMeter::RunCopy`] are default off behind the frame profile, and
+/// with the profile off this is exactly the `to_vec` the three sites spelled
+/// before.
+fn copied_guest_runs(
+    runs: &[metal_api_core::provider::GuestRun],
+) -> Vec<metal_api_core::provider::GuestRun> {
+    let _span = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseRunCopy);
+    let copied = runs.to_vec();
+    crate::runtime::drain::note_lease_vec(
+        crate::runtime::drain::LeaseVecMeter::RunCopy,
+        1,
+        u64::try_from(copied.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(std::mem::size_of::<metal_api_core::provider::GuestRun>() as u64),
+    );
+    copied
+}
+
 /// The registered windows one zero-copy gather was cut from, in window order
 /// (`R9e`, E-TX6).
 ///
@@ -5173,6 +5202,12 @@ fn canonical_vertex_stream_count(attributes: &[VertexAttributeResource]) -> usiz
 /// asks the device for the import alone, which is the same answer the borrowed
 /// arm needs.
 fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>> {
+    // The seventh cut's own meter: the list this function builds is the run
+    // list restated in the owner rail's own window shape, and it is derived
+    // afresh on every submission that asks. Charged here rather than at the
+    // readers, so the count is of lists built and not of lists read.
+    let _span =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseWindowGather);
     let mut windows: Vec<StageBufferWindow> = Vec::new();
     let mut total = 0_u64;
     for stretch in source.window_stretches()? {
@@ -5203,6 +5238,13 @@ fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>>
     if windows.iter().any(|window| window.import != first) {
         return None;
     }
+    crate::runtime::drain::note_lease_vec(
+        crate::runtime::drain::LeaseVecMeter::WindowGather,
+        1,
+        u64::try_from(windows.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(std::mem::size_of::<StageBufferWindow>() as u64),
+    );
     Some(windows)
 }
 
@@ -5243,6 +5285,13 @@ fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
     if len == 0 || len > source.total_len {
         return None;
     }
+    // The seventh cut's own meter: this copy is the gather's product, one per
+    // bind whose runs state no registered window, and every reader of these
+    // bytes downstream (the staged lease's own `Vec`, the provider's upload)
+    // is a second copy of it. Default off behind the frame profile; with the
+    // profile off the span is `None` and the counters are not written.
+    let _span =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseGatherBytes);
     let mut out: Vec<u8> = Vec::with_capacity(usize::try_from(len).ok()?);
     let mut skip = source.source_offset;
     let mut copied = 0_u64;
@@ -5270,7 +5319,15 @@ fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
         out.extend_from_slice(bytes);
         copied += take as u64;
     }
-    (copied == len).then_some(out)
+    if copied != len {
+        return None;
+    }
+    crate::runtime::drain::note_lease_vec(
+        crate::runtime::drain::LeaseVecMeter::GatherBytes,
+        1,
+        u64::try_from(out.len()).unwrap_or(u64::MAX),
+    );
+    Some(out)
 }
 
 /// The attachment's own previous contents as the ordered list of owner windows
@@ -18795,13 +18852,12 @@ fn assemble_narrow_record(
     // the lease the plan just imported.
     let attachment_source = match &pass.load {
         NarrowLoad::Bytes(bytes) => BufferSource::OwnedBytes(bytes.to_vec()),
-        NarrowLoad::GuestRuns(_) => BufferSource::GuestRuns(
+        NarrowLoad::GuestRuns(_) => BufferSource::GuestRuns(copied_guest_runs(
             leases
                 .as_ref()
                 .and_then(|plan| plan.guest_runs(load_seed_owner_binding()))
-                .expect("the owner plan covers an admitted guest-runs seed")
-                .to_vec(),
-        ),
+                .expect("the owner plan covers an admitted guest-runs seed"),
+        )),
         NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => {
             BufferSource::OwnedBytes(vec![0u8; usize::try_from(pass.extent).unwrap_or(0)])
         }
@@ -19056,13 +19112,12 @@ fn assemble_narrow_record(
                     length,
                     access: buffer.access,
                     attribute_stride: None,
-                    source: BufferSource::GuestRuns(
+                    source: BufferSource::GuestRuns(copied_guest_runs(
                         leases
                             .as_ref()
                             .and_then(|plan| plan.guest_runs(binding))
-                            .expect("the owner plan states the runs of every admitted list")
-                            .to_vec(),
-                    ),
+                            .expect("the owner plan states the runs of every admitted list"),
+                    )),
                 },
             });
             next_view += 1;
@@ -19271,13 +19326,12 @@ fn assemble_narrow_record(
         // The declaring kernel's own interface: one buffer, read.
         access: BufferAccess::Read,
         attribute_stride: None,
-        source: BufferSource::GuestRuns(
+        source: BufferSource::GuestRuns(copied_guest_runs(
             leases
                 .as_ref()
                 .and_then(|plan| plan.guest_runs(landing_view_owner_binding()))
-                .expect("the owner plan covers an admitted landing view's runs")
-                .to_vec(),
-        ),
+                .expect("the owner plan covers an admitted landing view's runs"),
+        )),
     });
 
     let pass_descriptor = RenderPassDescriptor {
