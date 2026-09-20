@@ -5448,18 +5448,35 @@ fn finish_stream<M: HostMemory + HostOps>(
                 // through the host bus between two passes of one trace, which
                 // is exactly the shape a batch exists not to have.
                 if !last {
-                    let unified = req
-                        .colors
-                        .first()
-                        .map(|c| c.mapping_id != 0)
-                        .unwrap_or(false);
-                    if !unified {
-                        // A run whose member would have to carry its frame
-                        // through the host bus between two passes of one trace.
-                        // The walk can see it without asking anyone — the
-                        // mapping door is the request's own field — so this is a
-                        // refusal the run states itself rather than one it
-                        // discovers after a submission.
+                    // The one shape a run cannot carry: a member whose frame
+                    // has nowhere to stay.
+                    //
+                    // A member states `StoreOp::Resident` and the record after
+                    // it states `LoadOp::Resident` for the same image, which is
+                    // the whole of what makes a run one trace instead of N
+                    // submissions. The engine reaches such a frame by one of
+                    // two routes — the mapper-ref-texture mapping's own pages
+                    // (`mapping_id != 0`), or the GVA target's registry resident
+                    // (`target_gva != 0`) — and a record that names neither has
+                    // no image the next member could load: its pass would
+                    // materialize the frame on the host instead, and the run
+                    // would be N passes in one trace with two trips across the
+                    // bus between them, which is the cost the run exists to
+                    // avoid and not a shape any counter would explain.
+                    //
+                    // The walk decides this from the record's own request rather
+                    // than from an answer, because the decision has to be made
+                    // *before* anything is parked: a run this arm does not elect
+                    // runs the per-record path it ran before this increment,
+                    // with that path's own counters intact.
+                    let color0 = req.colors.first();
+                    let reaches_its_frame = color0.is_some_and(|c| c.mapping_id != 0)
+                        || color0.is_some_and(|c| c.target_gva != 0);
+                    if !reaches_its_frame {
+                        // Refused before the run is committed to: the record
+                        // this arm stops on is one whose own pass would publish,
+                        // and every member before it has parked into a run that
+                        // is now given back.
                         crate::runtime::drain::note_store_route(
                             "render_provider_batch_member_refused",
                         );
@@ -5474,18 +5491,19 @@ fn finish_stream<M: HostMemory + HostOps>(
                         ) {
                             crate::observe::fail(format!(
                                 "render_provider_batch_member_refused \
-                                 reason=run_member_leaves_the_mapping task={task_id} \
-                                 pipe={} di={di}/{}",
+                                 reason=run_member_reaches_no_image task={task_id} \
+                                 pipe={} di={di}/{} mid={} gva={:#x}",
                                 pd.pipeline_ref,
-                                draw_list.len()
+                                draw_list.len(),
+                                color0.map(|c| c.mapping_id).unwrap_or(0),
+                                color0.map(|c| c.target_gva).unwrap_or(0),
                             ));
                         }
                         batch.abandon();
                         match encode {
-                            (EncodeStatus::Parked, _) => {
-                                out.metal_draws_ok = out.metal_draws_ok.saturating_add(1);
-                            }
-                            _ => {
+                            (EncodeStatus::Parked, _) => {}
+                            (status, _) => {
+                                debug_assert!(false, "a run's member parked nothing: {status:?}");
                                 out.metal_draws_fail = out.metal_draws_fail.saturating_add(1);
                             }
                         }
