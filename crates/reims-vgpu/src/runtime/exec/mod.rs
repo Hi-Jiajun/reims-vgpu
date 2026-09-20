@@ -5790,19 +5790,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                 );
                 match encode {
                     (EncodeStatus::Ok, Some(rgba)) => {
-                        // G3-B/B-1c: where the record's own answer is read is
-                        // where the give-back census reads it too, so the two
-                        // cannot drift. A frame that carries the canonical
-                        // rail's own provenance is the provider's answer; every
-                        // other frame is the engine's readback.
-                        note_giveback_rerun(
-                            req,
-                            if req.resident_frame_published_by_provider {
-                                "render_batch_giveback_rerun_provider"
-                            } else {
-                                "render_batch_giveback_rerun_engine"
-                            },
-                        );
                         out.metal_draws_ok += 1;
                         // R23: a frame that comes back while the chain is
                         // resident is the chain moving back into bytes. The
@@ -5826,17 +5813,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                         chain_rgba = Some(rgba);
                     }
                     (EncodeStatus::Ok, None) if req.chain_resident_established => {
-                        // The same reading for a frame that stayed on a device
-                        // image: which registry holds it is the answer's own
-                        // out-flag (R42), not a second guess.
-                        note_giveback_rerun(
-                            req,
-                            if req.chain_resident_held_by_provider {
-                                "render_batch_giveback_rerun_provider"
-                            } else {
-                                "render_batch_giveback_rerun_engine"
-                            },
-                        );
                         // Resident render-pass chain intermediate: content stays
                         // on the engine target; the next record loads it there.
                         out.metal_draws_ok += 1;
@@ -5852,11 +5828,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                     (EncodeStatus::Ok, None) => {
-                        // An `Ok` with no frame anywhere: the draw ran and its
-                        // content has no reader, which is neither of the two
-                        // "a rail answered" arms and must not be folded into
-                        // either of them.
-                        note_giveback_rerun(req, "render_batch_giveback_rerun_no_frame");
                         // Intermediate must return color0 for chaining; treat as
                         // break so we do not composite later draws on a missing seed.
                         out.metal_draws_ok += 1;
@@ -5897,10 +5868,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                     (st @ EncodeStatus::NoMetal(_), _) => {
-                        // No rail answered this record on the walk the give-back
-                        // gave it: the draw is lost, and the census says so
-                        // under the arm that is a loss.
-                        note_giveback_rerun(req, "render_batch_giveback_rerun_skipped");
                         saw_nometal = true;
                         out.metal_draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
@@ -5924,7 +5891,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                     // terminal refusal, including the Metal-only carrier when
                     // that feature exists.
                     (st, _) => {
-                        note_giveback_rerun(req, "render_batch_giveback_rerun_skipped");
                         out.metal_draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         // If earlier GVA draws produced a chain image, land it
@@ -6748,15 +6714,19 @@ fn note_giveback_opened(requests: &mut [draw::DrawEncodeRequest], origin: usize,
 /// Read back one record's answer on the walk a give-back gave it
 /// (`REIMS_VGPU_BATCH_GIVEBACK_CENSUS`).
 ///
-/// `arm` is the walk's own classification of that answer, taken at the same
-/// `match` the answer itself is routed through — the place
-/// `render_provider_canonical` and `draws_skipped_after_engine_refusal` are
-/// already read from — so the two readings cannot disagree about which rail
-/// answered. The marker is cleared here, which is what makes a second charge
-/// for one record unrepresentable; whatever is still marked when the packet
-/// ends is charged under `render_batch_giveback_rerun_not_reached` by the
-/// packet's own tail.
-fn note_giveback_rerun(req: &mut draw::DrawEncodeRequest, arm: &'static str) {
+/// `arm` is charged where the answer itself is known, which is why this is
+/// called from the seam rather than from the walk's own tail: the walk sees a
+/// frame and a status, and `(Ok, None)` covers both "the provider kept the
+/// frame" and "the frame went into the guest's own pages", so a classification
+/// taken there cannot answer *which rail drew the record* — the question this
+/// census exists to answer. The seam knows (it is where
+/// `render_provider_canonical` and the engine's own rail count are charged),
+/// so the arm is charged there and this call only has to take the marker.
+///
+/// Taking the marker is what makes a second charge for one record
+/// unrepresentable; whatever is still marked when the packet ends is charged
+/// under `render_batch_giveback_rerun_not_reached` by the packet's own tail.
+pub(crate) fn note_giveback_rerun(req: &mut draw::DrawEncodeRequest, arm: &'static str) {
     if !req.gave_back_rerun {
         return;
     }

@@ -8395,7 +8395,10 @@ fn the_giveback_census_marks_only_the_records_the_park_had_walked_and_reads_back
     );
 
     // Each marked record reaches exactly one arm, and the second charge for one
-    // record is unrepresentable because the marker is taken.
+    // record is unrepresentable because the marker is taken. The arms are the
+    // seam's own three answers — the canonical provider drew it, the engine drew
+    // it, or its draw was skipped — and this suite names one call per arm
+    // because that is how the seam charges them.
     let provider_before = count(PROVIDER);
     let engine_before = count(ENGINE);
     note_giveback_rerun(&mut requests[1], PROVIDER);
