@@ -29133,6 +29133,38 @@ fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
         short_span_unwindowed.1
     );
 
+    // No window at all, and runs that stop short of the span the gather states:
+    // `G1-B` reads the runs of a windowless gather, and a copy that padded the
+    // rest would name bytes no record wrote — the arm's own sentence, in the
+    // same bucket.
+    let uncovered = answer(
+        "short-run unwindowed gathered texture",
+        SampledSource::GuestRuns(
+            engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                    base,
+                    2 * page as u64,
+                    0,
+                    extent / 2,
+                )
+                .expect("the run is inside the mapping")]),
+                source_offset: 0,
+                total_len: extent,
+                row_length_texels: 0,
+                pages: None,
+                direct_image: None,
+            },
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        ),
+    );
+    eprintln!("door: {}\n  {}", uncovered.0, uncovered.1);
+    assert_eq!(uncovered.0, "render_provider_out_of_class_texture_source");
+    assert!(
+        uncovered.1.contains("do not cover the 128 byte(s)"),
+        "the sentence names the span the runs miss: {}",
+        uncovered.1
+    );
+
     // Padded rows whose stride is *narrower* than one tightly packed row of the
     // texture (R36): those rows would overlap rather than carry padding, so
     // there is no copy this class could make. The stride is read as a texel

@@ -1279,27 +1279,11 @@ fn gathered_texture_source<'a>(
     extent: TextureExtent,
     fold: Option<crate::protocol::pixel_format::SwizzlePlan>,
 ) -> Result<NarrowTextureSource<'a>, OutOfClass> {
-    let SampledRows { tight, rows } =
+    let SampledRows { rows, .. } =
         sampled_rows(source, extent).map_err(|exit| texture_gather_refusal(index, &exit))?;
     let span = source.total_len;
-    let padded = stage_run_bytes(source, span).ok_or_else(|| {
-        texture_gather_refusal(
-            index,
-            &SampledGatherExit::Span {
-                span,
-                extent: tight,
-            },
-        )
-    })?;
-    // The census' own reading of this arm: one route per bind that took it and
-    // one byte total beside it — the gather's own span, which a padded source
-    // carries with its padding, so the two halves of the arm can be counted from
-    // the log rather than inferred.
-    crate::runtime::drain::note_store_route("render_provider_out_of_class_texture_source_gathered");
-    crate::runtime::drain::note_store_route_n(
-        "render_provider_out_of_class_texture_source_bytes",
-        u64::try_from(padded.len()).unwrap_or(u64::MAX),
-    );
+    let padded = stage_run_bytes(source, span)
+        .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
     let texels = match rows {
         // The repack's own shape check, the same one the window arm's copy
         // takes: the bytes on hand have to be the span the guest's stride and
@@ -1317,6 +1301,16 @@ fn gathered_texture_source<'a>(
         })?,
         None => padded,
     };
+    // The census' own reading of this arm, charged once the copy *is* the
+    // texture's own bytes: one route per bind that took it and one byte total
+    // beside it — the gather's own span, which a padded source carries with its
+    // padding, so the two halves of the arm can be counted from the log rather
+    // than inferred.
+    crate::runtime::drain::note_store_route("render_provider_out_of_class_texture_source_gathered");
+    crate::runtime::drain::note_store_route_n(
+        "render_provider_out_of_class_texture_source_bytes",
+        u64::try_from(texels.len()).unwrap_or(u64::MAX),
+    );
     Ok(match fold {
         Some(plan) => NarrowTextureSource::Gathered(fold_channel_plan(&plan, &texels)),
         None => NarrowTextureSource::Gathered(texels),
@@ -5742,6 +5736,10 @@ enum SampledGatherExit {
     /// The window does not cover the span this gather reads from the texture's
     /// first byte.
     Window { head: u64, span: u64, window: u64 },
+    /// The runs the gather carries do not cover the span it states (`G1-B`):
+    /// the copy the class makes out of them would have to pad bytes no record
+    /// wrote, so the shape is refused rather than filled.
+    Uncovered { span: u64 },
 }
 
 impl SampledGatherExit {
@@ -5786,6 +5784,10 @@ impl SampledGatherExit {
             Self::Window { head, span, window } => format!(
                 "the texture starts {head} byte(s) into a {window} byte window, which does not \
                  hold the {span} byte(s) this gather reads from its own first byte",
+            ),
+            Self::Uncovered { span } => format!(
+                "the runs the gather carries do not cover the {span} byte(s) its own window \
+                 states, and a copy that padded the rest would name bytes no record wrote"
             ),
         }
     }
@@ -16090,10 +16092,9 @@ fn narrow_class<'a>(
             // (`highest_index` answers `None` for a window that stops short, and
             // the affine gate then refuses the footprint).
             if !affine_index_read && matches!(index_source, StreamSource::Copied(_)) {
-                let width = match index.index_type {
-                    crate::backend::vulkan::engine::IndexType::U16 => 2,
-                    crate::backend::vulkan::engine::IndexType::U32 => 4,
-                };
+                // The width the contract itself states for the format this
+                // draw declared, rather than a second copy of the two numbers.
+                let width = index_format.bytes();
                 let required = u64::from(index.index_count).saturating_mul(width);
                 if index_source.len() < required {
                     return Err(OutOfClass::owned(
