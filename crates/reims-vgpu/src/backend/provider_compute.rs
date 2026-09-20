@@ -1504,20 +1504,25 @@ fn submit_narrow(
     // with no window behind it is imported as a staged lease. Both are imported
     // through the provider's own lease API before the trace exists, so a
     // refused import never reaches admission.
-    let requests: Vec<OwnerRequest<'_>> = bindings
+    // The compute half's bindings are borrows the walk holds
+    // (`(binding, _, bytes)` names a slice of the trace's own resource pool), so
+    // this rail states them as `StagedBytes::Borrowed` and the owner plan makes
+    // the lease's copy exactly as it did before the seventh cut: the arm that
+    // hands over a `Vec` is the render rail's, where the gate's own copies live.
+    let mut requests: Vec<OwnerRequest<'_>> = bindings
         .iter()
         .map(
             |(binding, _, bytes)| match windows.iter().find(|w| w.binding == *binding) {
                 Some(window) => OwnerRequest::Window(*window),
                 None => OwnerRequest::Staged(OwnerStaged {
                     binding: *binding,
-                    bytes,
+                    bytes: provider_owner::StagedBytes::Borrowed(bytes),
                 }),
             },
         )
         .collect();
     let leases =
-        provider_owner::plan(provider, &requests).map_err(ProviderComputeDecline::Owner)?;
+        provider_owner::plan(provider, &mut requests).map_err(ProviderComputeDecline::Owner)?;
 
     let mut resources = ResourceTableSnapshot::new();
     for (allocation, size, reservation) in leases.leases() {

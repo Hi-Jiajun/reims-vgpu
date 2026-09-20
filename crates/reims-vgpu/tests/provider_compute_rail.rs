@@ -21,7 +21,7 @@ use reims_vgpu::backend::provider_compute::{
     device_epoch, host_import_alignment, submit_compute, ComputeRailOutcome, ModuleSampler,
     ProviderComputeDecline,
 };
-use reims_vgpu::backend::provider_owner::{self, Region, Request, Staged, Window};
+use reims_vgpu::backend::provider_owner::{self, Region, Request, Staged, StagedBytes, Window};
 use reims_vgpu::backend::vulkan::engine::{
     ComputeBufferResource, ComputeDispatch, ComputeDispatchRegion, ComputeRequest,
 };
@@ -323,9 +323,9 @@ fn an_aborted_settle_keeps_a_lease_the_owner_ledger_still_holds() {
     let bytes = vec![0xA5u8; 64];
     let plan = provider_owner::plan(
         &provider,
-        &[Request::Staged(Staged {
+        &mut [Request::Staged(Staged {
             binding: 0,
-            bytes: &bytes,
+            bytes: StagedBytes::Borrowed(&bytes),
         })],
     )
     .expect("a staged binding imports as an owner lease");
@@ -356,9 +356,9 @@ fn an_aborted_settle_keeps_a_lease_the_owner_ledger_still_holds() {
     let second = vec![0x5Au8; 64];
     let plan = provider_owner::plan(
         &provider,
-        &[Request::Staged(Staged {
+        &mut [Request::Staged(Staged {
             binding: 0,
-            bytes: &second,
+            bytes: StagedBytes::Borrowed(&second),
         })],
     )
     .expect("a second staged import");
@@ -798,9 +798,9 @@ fn a_lease_from_a_previous_incarnation_is_refused_by_the_provider() {
     let bytes = vec![0u8; 64];
     let request = Request::Staged(Staged {
         binding: 0,
-        bytes: &bytes,
+        bytes: StagedBytes::Borrowed(&bytes),
     });
-    let decline = provider_owner::plan_with_epoch(&provider, stale, &[request])
+    let decline = provider_owner::plan_with_epoch(&provider, stale, &mut [request])
         .expect_err("the provider refuses a lease that names another incarnation");
     assert_eq!(decline.slug(), "owner_lease_import");
     assert!(

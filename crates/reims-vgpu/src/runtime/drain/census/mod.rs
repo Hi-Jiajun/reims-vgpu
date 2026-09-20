@@ -792,11 +792,19 @@ pub(crate) enum LeaseVecMeter {
     RunGather = 3,
     /// [`FrameSpan::LeaseRunCopy`]'s `Vec`.
     RunCopy = 4,
+    /// The bytes the staged arm **moved** instead of copying: the seventh cut's
+    /// own arm, and the pair to [`Self::StagedCopy`] the cut is read by.
+    ///
+    /// No bar of its own: a move reads no clock, and the time it does not spend
+    /// is the time [`FrameSpan::LeaseStagedCopy`] stops reading. In the round
+    /// that prices the cut, `StagedCopy` must fall to zero on the increment arm
+    /// while this one takes the same byte count the control arms read here.
+    StagedMoved = 5,
 }
 
 /// Number of [`LeaseVecMeter`] slots, derived from the enum the same way
 /// [`FRAME_SPANS`] is.
-const LEASE_VEC_METERS: usize = LeaseVecMeter::RunCopy as usize + 1;
+const LEASE_VEC_METERS: usize = LeaseVecMeter::StagedMoved as usize + 1;
 
 /// The emitted field-name stem of each meter, in slot order. The span bar is
 /// the same stem with `_us_mean` on it, so a reader pairs them by name.
@@ -806,6 +814,7 @@ const LEASE_VEC_NAMES: [&str; LEASE_VEC_METERS] = [
     "lease_window_gather",
     "lease_run_gather",
     "lease_run_copy",
+    "lease_staged_moved",
 ];
 
 impl LeaseVecMeter {
