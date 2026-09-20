@@ -986,6 +986,40 @@ pub fn render_pass_entry_snapshot(
     Ok(decoded.supports_render_pass_entry_snapshot)
 }
 
+/// Whether this provider executes a render pass that carries an **ordered list
+/// of draws**, and how many draws it takes in one (`research/docs/23` §3.3,
+/// G3-B/B-2), read back out of the response frame the provider would send.
+///
+/// The twelfth reading of the same one-snapshot rule ([`render_kept_frame_landing`],
+/// [`render_pixel_coordinate_sampler`], [`render_pass_entry_snapshot`]), and the
+/// one this rail's *assembly* needs: the run of kept records the walk elects can
+/// travel as one trace of N single-draw passes (what every device executes), or
+/// as **one pass carrying N draws** — which only a device that declares the arm
+/// can execute, and which is refused by name
+/// (`render_multi_draw_unsupported`) rather than narrowed to its first draw.
+///
+/// The answer is a **pair**, because the arm's own ceiling is a device fact as
+/// well as a contract one: `false`/`0` is the fail-closed answer a frame written
+/// before the arm existed decodes to, and the two sides of a declared device
+/// MUST judge the list against `min(contract ceiling, declared ceiling)`. A rail
+/// that read only the bit would hand a device a list longer than the one it
+/// stated it executes.
+///
+/// `0` beside `true` is not "unlimited": the contract's own reading
+/// ([`ProviderCapabilities::declares_render_multi_draw_support`]) takes the two
+/// fields together, so a frame that states the bit and no ceiling states no arm
+/// at all and the run keeps the shape it has always travelled as.
+pub fn render_multi_draw(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Result<(bool, u32), WireDecline> {
+    let decoded = capabilities_frame(epoch, capabilities)?;
+    Ok((
+        decoded.supports_render_multi_draw,
+        decoded.max_draws_per_pass,
+    ))
+}
+
 /// The provider's own capability snapshot as it comes back out of the frame
 /// the owner would receive.
 ///

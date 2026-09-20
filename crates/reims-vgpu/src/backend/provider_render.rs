@@ -919,14 +919,15 @@ use metal_api_core::provider::{
     CompiledComputePipeline, CompletionDisposition, CompletionPolicy, ComputePass, ComputeProvider,
     ComputeTrace, Dispatch, DispatchKind, DispatchType, FootprintProof, IndexBufferBinding,
     IndexFormat, InitialState, LoadOp, NoCopyLeaseImporter, OperationId, PresentDescriptor,
-    PresentMode, PresentTarget, RenderAttachment, RenderPassBlend, RenderPassDescriptor,
-    RenderPipelineContract, RenderPipelineStage, RenderSamplerBinding, ResourceTableSnapshot,
-    SamplerPolicy, SemanticDigest, StageBufferBinding, StageBufferView, StoreOp, TextureAccess,
-    TextureBindingContract, TextureFootprintProof, TextureFormat, TextureSource, TextureType,
-    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
-    VertexStep, ViewId, FULL_SCREEN_TRIANGLE_VERTICES, MAX_RENDER_SAMPLERS,
-    MAX_RENDER_STAGE_BUFFERS, MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES,
-    MAX_VERTEX_BUFFERS, PROVIDER_SCHEMA_VERSION,
+    PresentMode, PresentTarget, RenderAttachment, RenderDraw, RenderDrawsDescriptor,
+    RenderPassBlend, RenderPassDescriptor, RenderPipelineContract, RenderPipelineStage,
+    RenderSamplerBinding, ResourceTableSnapshot, SamplerPolicy, SemanticDigest, StageBufferBinding,
+    StageBufferView, StoreOp, TextureAccess, TextureBindingContract, TextureFootprintProof,
+    TextureFormat, TextureSource, TextureType, TextureView, TracePass, VertexAttribute,
+    VertexBufferLayout, VertexFormat, VertexLayout, VertexStep, ViewId,
+    FULL_SCREEN_TRIANGLE_VERTICES, MAX_RENDER_SAMPLERS, MAX_RENDER_STAGE_BUFFERS,
+    MAX_RENDER_TEXTURES, MAX_RENDER_TEXTURE_INDEX, MAX_SERIAL_RESOURCES, MAX_VERTEX_BUFFERS,
+    PROVIDER_SCHEMA_VERSION,
 };
 use metal_api_core::Device;
 use metal_api_vulkan::{RenderStage, TranslatedRenderPipelineRequest, TranslatedRenderStage};
@@ -19457,6 +19458,265 @@ fn assemble_narrow_record(
     Ok(record)
 }
 
+/// Whether `REIMS_VGPU_RENDER_MANY_DRAWS` asked a run of kept records to travel
+/// as **one pass carrying N draws** instead of N single-draw passes (G3-B/B-2).
+///
+/// **On by default since 2026-09-21**, on the same terms the run itself is on
+/// (`render_batch_enabled` in `runtime::exec`): the arm is a *device* answer as
+/// well as a switch, and a device that does not declare it — the native rail,
+/// and every capability frame written before the arm existed — keeps the shape
+/// the run has always travelled as, byte for byte. `REIMS_VGPU_RENDER_MANY_DRAWS`
+/// spelled `0/off/false/no` is the control arm a round runs the N-pass shape
+/// with, so the two arms differ in this one statement and nothing else.
+fn render_many_draws_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("REIMS_VGPU_RENDER_MANY_DRAWS")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("0" | "off" | "OFF" | "false" | "no" | "NO")
+        )
+    })
+}
+
+/// The device's own answer for the multi-draw arm, and the states the test
+/// instrument below can put it in — the same three states, for the same reason,
+/// as [`KEPT_FRAME_LANDING_ANSWER`]'s.
+const MANY_DRAWS_DEVICE: u8 = 0;
+const MANY_DRAWS_NOT_DECLARED: u8 = 1;
+const MANY_DRAWS_DECLARED: u8 = 2;
+
+/// Whether the multi-draw arm is read from the device's own frame
+/// ([`MANY_DRAWS_DEVICE`], what production runs) or from an answer a test
+/// stated.
+static MANY_DRAWS_ANSWER: AtomicU8 = AtomicU8::new(MANY_DRAWS_DEVICE);
+
+/// The guard [`override_render_multi_draw`] returns: it puts the previous
+/// answer back when it drops.
+pub struct ManyDrawsOverride {
+    previous: u8,
+}
+
+impl Drop for ManyDrawsOverride {
+    fn drop(&mut self) {
+        MANY_DRAWS_ANSWER.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the multi-draw arm as `declared` until the returned guard drops, or as
+/// the device's own answer for `None` (G3-B/B-2).
+///
+/// `Some(true)` states the arm the canonical Vulkan provider declares — the
+/// contract's own ceiling — and `Some(false)` states a device that executes no
+/// list at all, which is what the native rail and every capability frame
+/// written before the arm existed decode to. The fallback those answers keep is
+/// the run's N-pass shape, so the instrument can prove both shapes land the
+/// same bytes without a second device.
+pub fn override_render_multi_draw(declared: Option<bool>) -> ManyDrawsOverride {
+    let answer = match declared {
+        None => MANY_DRAWS_DEVICE,
+        Some(false) => MANY_DRAWS_NOT_DECLARED,
+        Some(true) => MANY_DRAWS_DECLARED,
+    };
+    ManyDrawsOverride {
+        previous: MANY_DRAWS_ANSWER.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// How many draws one pass may carry on this device, as the device itself
+/// states it (G3-B/B-2).
+///
+/// Read out of the capability frame the provider would send rather than from
+/// the in-process snapshot, for the reason every reading in [`provider_wire`]
+/// is: the assembly below hands the provider a *statement*, and a ceiling the
+/// owner→provider frame cannot carry is a ceiling no provider's own admission
+/// would enforce. The contract's ceiling and the device's answer are one number
+/// on the canonical Vulkan provider (`MAX_DRAWS_PER_PASS`), and a device that
+/// states a lower one is judged by the lower one.
+///
+/// `None` is every arm that states no list at all: a frame that declares no
+/// arm, a device whose ceiling is zero (the contract reads the bit and the
+/// ceiling together, `declares_render_multi_draw_support`), and a frame this
+/// process could not cross. All of them keep the run in the shape it has always
+/// travelled as — the switch is asked by the caller, so a round reads "the
+/// device said no" apart from "the switch said no".
+fn declared_draws_per_pass(provider: &metal_api_vulkan::VulkanComputeProvider) -> Option<u32> {
+    let capabilities = provider.capabilities();
+    let (declared, ceiling) = match MANY_DRAWS_ANSWER.load(Ordering::Relaxed) {
+        MANY_DRAWS_DEVICE => {
+            provider_wire::render_multi_draw(provider.device_epoch(), &capabilities).ok()?
+        }
+        MANY_DRAWS_NOT_DECLARED => (false, 0),
+        _ => (
+            true,
+            u32::try_from(metal_api_core::provider::MAX_DRAWS_PER_PASS).unwrap_or(u32::MAX),
+        ),
+    };
+    (declared && ceiling > 0).then_some(ceiling)
+}
+
+/// The run's keepers as **one pass carrying N draws** (G3-B/B-2), or `None`
+/// when the run travels as the N single-draw passes B-1 assembles.
+///
+/// # The list is the run's *keeping prefix*
+///
+/// A list is **one render pass instance**, and a render pass instance states
+/// one store. The run's keeping records all state the same one
+/// (`StoreOp::Resident`): each of them keeps its frame in the run's own image
+/// so that the record after it — a pass of its own in the N-pass shape — can
+/// load it again. Inside one pass instance the attachment carries from one draw
+/// to the next by construction, so those keeps are exactly what the arm
+/// subsumes, and every statement of the pass state stays the head's: the head's
+/// own store, the head's load (the image as of before the run's first draw,
+/// which is the statement the walk makes on every member after the head), the
+/// head's attachments and raster.
+///
+/// A run's **publishing tail states a store the list cannot state**. It is at
+/// most one record — the walk's election ends a run at the first record whose
+/// frame does not stay in the run's image — and it keeps the pass it has always
+/// had. Collapsing it into the list would move its `Store` onto the head's
+/// attachment, and the trace would then render into the run's identity while
+/// declaring neither `LoadOp::Resident` nor `StoreOp::Resident` for it: the
+/// provider refuses exactly that shape fail-closed
+/// (`resident_target_undeclared`, `metal-api-vulkan`'s `render.rs`) whenever it
+/// still holds the identity's image, which is a whole-run give-back rather than
+/// a slower answer. A run whose own tail keeps its frame — every record of the
+/// run keeps — is therefore the case that travels as one pass end to end, and
+/// `render_batch_many_draws_publisher` counts the runs that left their
+/// publishing tail on a pass of its own.
+///
+/// # What the arm cannot carry
+///
+/// Three shapes keep the run's keepers in their N-pass form, each under its own
+/// named reading rather than executed as something else. None of them is a
+/// refusal: the run is what the walk elected, and a run that travels as N
+/// passes is the shape every round before this increment measured.
+///
+/// * **no device arm** — the frame declares none, or one narrower than this
+///   run's keeping prefix (`render_batch_many_draws_unsupported` /
+///   `..._over_ceiling`);
+/// * **a member that states a present** — the list arm states no present action,
+///   and the E side refuses a list that carries one by name
+///   (`render_multi_draw_present_unsupported`, `..._present`);
+/// * **a member that does not begin from the run's image** — the arm has one
+///   load and it is the head's, so a member that would have loaded something
+///   else (the walk states a resident load on every member after the head, and
+///   this reading is what keeps that a checked fact rather than an assumption)
+///   travels as passes (`..._member_not_resident`);
+/// * **a member whose pass state disagrees with the head's** — attachments,
+///   raster, depth or stencil surface (`..._state_mismatch`). The contract
+///   makes the agreement structural for a hand-built plan; this is the
+///   assembly's own reading of its own records.
+fn many_draws_pass(
+    provider: &metal_api_vulkan::VulkanComputeProvider,
+    records: &[NarrowRecord],
+) -> Option<(usize, RenderDrawsDescriptor)> {
+    // A run is at least two records: one record is the shape every single
+    // submission has always had, and the arm exists to share one pass between
+    // draws. The walk elects runs of two or more, so this is the same
+    // statement, read here rather than assumed.
+    if records.len() < 2 {
+        return None;
+    }
+    if !render_many_draws_enabled() {
+        crate::runtime::drain::note_store_route("render_batch_many_draws_off");
+        return None;
+    }
+    let Some(ceiling) = declared_draws_per_pass(provider) else {
+        crate::runtime::drain::note_store_route("render_batch_many_draws_unsupported");
+        return None;
+    };
+    // The list's own extent: the run's keeping prefix. A one-draw list is the
+    // pass every single-record submission has always stated, so it is not a
+    // list this arm has anything to say about.
+    let carried = records
+        .iter()
+        .take_while(|record| record.facts.keeps_frame)
+        .count();
+    if carried < 2 {
+        return None;
+    }
+    if carried > usize::try_from(ceiling).unwrap_or(usize::MAX) {
+        crate::runtime::drain::note_store_route("render_batch_many_draws_over_ceiling");
+        return None;
+    }
+    let members = &records[..carried];
+    let head = members
+        .first()
+        .expect("a list of two draws states a first record");
+    for (index, record) in members.iter().enumerate() {
+        if record.facts.present {
+            crate::runtime::drain::note_store_route("render_batch_many_draws_present");
+            return None;
+        }
+        if index > 0 && !record.facts.loads_resident {
+            crate::runtime::drain::note_store_route("render_batch_many_draws_member_not_resident");
+            return None;
+        }
+        if !same_pass_state(&head.pass_descriptor, &record.pass_descriptor) {
+            crate::runtime::drain::note_store_route("render_batch_many_draws_state_mismatch");
+            return None;
+        }
+    }
+    let draws: Vec<RenderDraw> = members
+        .iter()
+        .skip(1)
+        .map(|record| record.pass_descriptor.draw())
+        .collect();
+    if carried < records.len() {
+        crate::runtime::drain::note_store_route("render_batch_many_draws_publisher");
+    }
+    crate::runtime::drain::note_store_route("render_batch_draws_per_pass_passes");
+    crate::runtime::drain::note_store_route_n(
+        "render_batch_draws_per_pass_draws",
+        u64::try_from(carried).unwrap_or(u64::MAX),
+    );
+    crate::runtime::drain::note_store_route(match carried {
+        0..=2 => "render_batch_draws_per_pass_2",
+        3..=4 => "render_batch_draws_per_pass_3_4",
+        5..=8 => "render_batch_draws_per_pass_5_8",
+        9..=16 => "render_batch_draws_per_pass_9_16",
+        _ => "render_batch_draws_per_pass_over_16",
+    });
+    Some(RenderDrawsDescriptor {
+        head: head.pass_descriptor.clone(),
+        tail: draws,
+    })
+    .map(|list| (carried, list))
+}
+
+/// Whether two records of a run state the same **pass state** (G3-B/B-2).
+///
+/// The pass state is everything a list states once for all of its draws:
+/// the colour attachments' identity, format and extent, the raster, and the
+/// depth and stencil surfaces. What is deliberately *not* compared is the store
+/// arm: the list carries the run's keeping records, whose store arm is the one
+/// the head states (`StoreOp::Resident`), so the arm is a property of the list
+/// rather than a field two of its draws could disagree about — and a record
+/// that states another arm is a record the list does not carry at all.
+fn same_pass_state(head: &RenderPassDescriptor, member: &RenderPassDescriptor) -> bool {
+    let same_attachments = head.color_attachments.len() == member.color_attachments.len()
+        && head
+            .color_attachments
+            .iter()
+            .zip(member.color_attachments.iter())
+            .all(|(first, draw)| {
+                first.view_id == draw.view_id
+                    && first.allocation_id == draw.allocation_id
+                    && first.format == draw.format
+                    && first.width == draw.width
+                    && first.height == draw.height
+            });
+    same_attachments
+        && head.multisample == member.multisample
+        && head.depth_resolve == member.depth_resolve
+        && head.depth == member.depth
+        && head.stencil == member.stencil
+        && head.stencil_resolve == member.stencil_resolve
+}
+
 /// The trace one batch of assembled records states (G3-B/B-1).
 ///
 /// The composition rules are the ones a single record's trace always used, read
@@ -19484,7 +19744,17 @@ fn narrow_trace(
     // The views this trace has already declared, keyed by the view id alone —
     // which is what the contract's pool is keyed by.
     let mut declared: Vec<ViewId> = Vec::new();
-    for record in records {
+    // G3-B/B-2: the one pass the run's keeping records travel as, when the
+    // device executes the multi-draw arm — and how many records that pass
+    // carries. It is stated at the position of its *last* draw: every declaring
+    // pass and every in-flight production of the run has to stand before the
+    // pass that reads them, and a production restated by a later record of the
+    // run is declared before the draw that samples it exactly as it is in the
+    // N-pass shape. Every record after the list keeps the pass it has always
+    // had (the run's publishing tail, at most one by the walk's election).
+    let mut many_draws = many_draws_pass(provider, records);
+    let listed = many_draws.as_ref().map_or(0, |(carried, _)| *carried);
+    for (index, record) in records.iter().enumerate() {
         declare_pipeline(&mut pipelines, &record.declaring);
         declare_pipeline(&mut pipelines, &record.render_pipeline);
         for pipeline in &record.production_pipelines {
@@ -19504,7 +19774,18 @@ fn narrow_trace(
         for production in &record.in_flight {
             trace_passes.push(TracePass::Render(production.descriptor.clone()));
         }
-        trace_passes.push(TracePass::Render(record.pass_descriptor.clone()));
+        // The run's own draws: the ones the list carries are stated by it, once,
+        // at its last draw's position — every other record keeps the pass it has
+        // always had, which is the shape (and the bytes) every round before this
+        // increment submitted.
+        if index + 1 == listed {
+            let (_, list) = many_draws
+                .take()
+                .expect("the list is stated at the position of its own last draw");
+            trace_passes.push(TracePass::RenderDraws(list));
+        } else if index >= listed {
+            trace_passes.push(TracePass::Render(record.pass_descriptor.clone()));
+        }
     }
     // E-TX14: the kept frame's own delivery, in the one position the contract
     // makes resolvable — *after* the pass that kept it, so the entry resolves an
