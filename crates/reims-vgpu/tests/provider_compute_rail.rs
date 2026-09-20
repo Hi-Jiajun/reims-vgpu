@@ -1478,6 +1478,24 @@ fn the_texture_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
         "and produces no frame at all"
     );
     provider_wire::capture_submission_frames(false);
+
+    // The frame re-encoded out of the pair the provider's decoder produced,
+    // twice: once from copies of that pair (the path this rail ran before
+    // sp13) and once from the pair itself, moved into the request. The copy is
+    // the only difference between the two encoders.
+    let copied = provider_wire::submit_frame(&trace, &resources)
+        .expect("the copying encoder re-encodes the frame it produced");
+    let moved = provider_wire::submit_frame_owned(trace, resources)
+        .expect("the moving encoder encodes the same request");
+    assert_eq!(
+        copied, *frame,
+        "the frame is a fixed point of the owner's encoder and the provider's decoder"
+    );
+    assert_eq!(
+        moved, copied,
+        "the frame is the same bytes whether its inputs were copied or moved: \
+         REIMS_VGPU_SUBMIT_FRAME_OWNED cannot change what the guest sees"
+    );
 }
 
 /// The provider's own gate for the declaration this rail states

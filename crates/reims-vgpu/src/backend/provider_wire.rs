@@ -1051,6 +1051,64 @@ pub fn submit_frame(
         .map_err(|error| WireDecline::new("submit_frame", error))
 }
 
+/// Encode one submission's trace and resource snapshot as the frame an owner
+/// sends, out of the two halves the caller already owns.
+///
+/// [`submit_frame`] copies both halves into the request the encoder reads and
+/// then drops them; this one builds the same request by **moving** them. The
+/// copy is the whole difference between the two functions, so they are one
+/// encoder with two call shapes — the codec reads a reference either way, and
+/// the bytes are a function of the values rather than of where they live.
+///
+/// The caller can give the originals up because what its admission and its
+/// submission consume is the pair the frame **decodes back to**: the owner
+/// states the pass by writing the bytes and then reads them with the provider's
+/// own reader, which is the property this rail exists to keep honest. Copying
+/// the inputs to produce those bytes buys nothing but the copy.
+///
+/// Selected by [`submit_frame_owned_enabled`] at the call sites rather than by a
+/// second code path in the caller, so the arm a round ran before this exists is
+/// the arm that runs with the switch off.
+pub fn submit_frame_owned(
+    trace: ComputeTrace,
+    resources: ResourceTableSnapshot,
+) -> Result<Vec<u8>, WireDecline> {
+    use crate::runtime::drain::{frame_span, FrameSpan};
+    let request = CommandRequest::Submit { trace, resources };
+    let _encode = frame_span(FrameSpan::ProvFrameEncode);
+    CommandCodec::encode_request(&request)
+        .inspect(|frame| note_frame(frame))
+        .map_err(|error| WireDecline::new("submit_frame", error))
+}
+
+/// Whether `REIMS_VGPU_SUBMIT_FRAME_OWNED` asked for the two halves to be moved
+/// into the frame instead of copied into it.
+///
+/// **Off by default.** The switch is read once, at the first call: a round that
+/// wants the arm sets it in its launcher, and a round that does not leaves it
+/// unset — which is the same bytes, because the frame is a function of the
+/// values and not of the copy. Set `REIMS_VGPU_SUBMIT_FRAME_OWNED=1` (also
+/// `on`, `true`, `yes`) for the moved arm.
+pub(crate) fn submit_frame_owned_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_submit_frame_owned(
+            std::env::var("REIMS_VGPU_SUBMIT_FRAME_OWNED")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The switch's own parser, apart from the process-global it caches into so a
+/// unit test can read every spelling without a switch it cannot put back.
+fn parse_submit_frame_owned(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
 /// Decode a submission frame with the provider's own decoder, which is what a
 /// provider process runs before its admission sees anything.
 pub fn carried_submission(
@@ -1141,6 +1199,35 @@ pub fn wire_counts() -> WireCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The switch reads the spellings a launcher writes and nothing else.
+    ///
+    /// Read through the parser rather than through the environment: the
+    /// process-global cache is deliberately not writable, and a test that could
+    /// put it back would be the only thing that ever did.
+    #[test]
+    fn the_moved_frame_switch_is_off_unless_it_is_asked_for() {
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("no"),
+        ] {
+            assert!(!parse_submit_frame_owned(off), "{off:?} is not an ask");
+        }
+        for on in [
+            Some("1"),
+            Some("on"),
+            Some("ON"),
+            Some("true"),
+            Some("yes"),
+            Some(" on "),
+        ] {
+            assert!(parse_submit_frame_owned(on), "{on:?} is an ask");
+        }
+    }
 
     /// A frame of the wrong kind is refused by name rather than read as a
     /// submission: the two directions of the channel share one codec, and a

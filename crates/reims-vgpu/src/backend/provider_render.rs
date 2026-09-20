@@ -19642,7 +19642,11 @@ fn finish_narrow_records(
         let framed = {
             let _span =
                 crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvAdmitFrame);
-            provider_wire::submit_frame(&trace, &resources)
+            if provider_wire::submit_frame_owned_enabled() {
+                provider_wire::submit_frame_owned(trace, resources)
+            } else {
+                provider_wire::submit_frame(&trace, &resources)
+            }
         };
         let frame = framed.map_err(|decline| {
             abort_narrow_leases(&mut leases, provider);
