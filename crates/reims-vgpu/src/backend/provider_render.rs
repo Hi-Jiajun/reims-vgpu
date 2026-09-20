@@ -12782,6 +12782,20 @@ pub enum ProviderRenderDecline {
     Owner(provider_owner::Decline),
 }
 
+impl ProviderRenderDecline {
+    /// Whether the owner rail's own plan refused this pass (G3-B/B-1c).
+    ///
+    /// The one question a batch's refusal census asks about a decline's
+    /// *cause*: a run the owner plan will not import is a run whose records
+    /// read a registration the plan has already given to another member, while
+    /// every other decline is about the trace, the pipeline or the completion.
+    /// Read off the variant the refusal was built from rather than off the
+    /// slug's text, so a new owner-side slug cannot fall out of the split.
+    pub fn is_owner(&self) -> bool {
+        matches!(self, Self::Owner(_))
+    }
+}
+
 impl Decline for ProviderRenderDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -18366,14 +18380,38 @@ pub fn park_render(
         RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted) => {
             RenderParkOutcome::Parked
         }
-        RenderRailOutcome::NotInNarrowClass(reason) => RenderParkOutcome::OutOfClass(reason),
-        RenderRailOutcome::ProviderDeclined(decline) => RenderParkOutcome::Declined(decline),
+        RenderRailOutcome::NotInNarrowClass(reason) => {
+            // G3-B/B-1c: one count per refused record under the cause that
+            // refused it. The fail line beside it dedupes on `(pipeline, slug)`,
+            // so the population a cause refuses is exactly what the log cannot
+            // answer — and the two causes a widening order has to choose
+            // between (a shape the *class* will not keep, and a shape the
+            // *owner plan* will not import) read apart.
+            crate::runtime::exec::note_giveback_refusal(
+                "render_batch_giveback_refused_member_out_of_class",
+                None,
+            );
+            RenderParkOutcome::OutOfClass(reason)
+        }
+        RenderRailOutcome::ProviderDeclined(decline) => {
+            crate::runtime::exec::note_giveback_refusal(
+                "render_batch_giveback_refused_member_declined",
+                decline
+                    .is_owner()
+                    .then_some("render_batch_giveback_refused_member_owner"),
+            );
+            RenderParkOutcome::Declined(decline)
+        }
         // The park step submits nothing, so a completion cannot be reached.
         // Stated rather than left out so the mapping is total, and answered as a
         // refusal: a completion here would be a submission this call did not
         // make.
         RenderRailOutcome::ProviderCompleted(_)
         | RenderRailOutcome::ProviderCompletedResident(_) => {
+            crate::runtime::exec::note_giveback_refusal(
+                "render_batch_giveback_refused_member_impossible",
+                None,
+            );
             RenderParkOutcome::Declined(ProviderRenderDecline::TraceAdmission {
                 detail: "the park step answered with a completion it could not have made"
                     .to_string(),
@@ -18414,6 +18452,10 @@ pub fn park_and_finish_render(
         RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted) => {}
         RenderRailOutcome::NotInNarrowClass(reason) => {
             batch.abandon();
+            crate::runtime::exec::note_giveback_refusal(
+                "render_batch_giveback_refused_tail_out_of_class",
+                None,
+            );
             return Err(ProviderRenderDecline::TraceAdmission {
                 detail: format!(
                     "the run's publishing tail left the class it was probed into: {}",
@@ -18423,12 +18465,22 @@ pub fn park_and_finish_render(
         }
         RenderRailOutcome::ProviderDeclined(decline) => {
             batch.abandon();
+            crate::runtime::exec::note_giveback_refusal(
+                "render_batch_giveback_refused_tail",
+                decline
+                    .is_owner()
+                    .then_some("render_batch_giveback_refused_tail_owner"),
+            );
             return Err(decline);
         }
         // The park step submits nothing, so a completion cannot be reached.
         RenderRailOutcome::ProviderCompleted(_)
         | RenderRailOutcome::ProviderCompletedResident(_) => {
             batch.abandon();
+            crate::runtime::exec::note_giveback_refusal(
+                "render_batch_giveback_refused_tail_out_of_class",
+                None,
+            );
             return Err(ProviderRenderDecline::TraceAdmission {
                 detail: "the park step answered with a completion it could not have made"
                     .to_string(),

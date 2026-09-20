@@ -1271,11 +1271,27 @@ pub fn encode_draw_chain_handoff<M: HostMemory + HostOps>(
             });
         crate::observe::fail(format!(
             "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
-             pipe={} model_pipeline={model_pipeline} vtx={} refused_by={} {target} clear={clear}",
+             pipe={} model_pipeline={model_pipeline} vtx={} refused_by={} {target} clear={clear}{}",
             req.pipeline_ref,
             req.vertex_count,
-            engine_outcome.slug()
+            engine_outcome.slug(),
+            // G3-B/B-1c: a record this walk is re-walking because a run was
+            // given back is marked here, so the slug this line ranks
+            // (`refused_by=`) can be split into "the first walk of a record the
+            // park refused" and "the re-walk the give-back owed it". With the
+            // park's own refusals no longer reported on this channel, every
+            // marked line is the second kind: a re-run that reached no rail.
+            if req.gave_back_rerun {
+                " giveback=1"
+            } else {
+                ""
+            }
         ));
+        // G3-B/B-1c: and the re-walk itself is charged under the arm that is a
+        // loss, here, for the same reason the provider's arm is charged where
+        // the provider answers and the engine's where the engine draws: this
+        // tail is the only place that knows no rail drew the record.
+        crate::runtime::exec::note_giveback_rerun(req, "render_batch_giveback_rerun_skipped");
         // The line above dedupes on `(pipeline, slug)` and the count does
         // not, so the two answer different questions and only this one can
         // be added up. Reading the line count as the draw count understates
@@ -7735,6 +7751,22 @@ impl ChainHandoff<'_> {
     }
 }
 
+/// G3-B/B-1c: one answer from the canonical provider, and the give-back
+/// census's own reading of it.
+///
+/// The three places this seam charges `render_provider_canonical` are the three
+/// arms a provider answer can take (published bytes, a kept frame that landed,
+/// and a kept frame that did not), and they are also the only places that
+/// *know* the record was answered by the provider rather than by the engine.
+/// Charged through one function so a fourth arm cannot be added without taking
+/// the give-back census's provider arm with it — the split the census exists to
+/// answer is exactly "who answered this record", and a site that charged only
+/// the older counter would read as a record no rail answered.
+fn note_provider_answer(req: &mut DrawEncodeRequest) {
+    crate::runtime::drain::note_store_route("render_provider_canonical");
+    crate::runtime::exec::note_giveback_rerun(req, "render_batch_giveback_rerun_provider");
+}
+
 /// The class-only answer, defined on the always-compiled draw module so the
 /// backend trait can name it on a host with no Vulkan rail at all (R42).
 pub use super::ChainProbe;
@@ -12346,18 +12378,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // flags the next record reads) is reached by the tail's
                     // answer exactly as it is reached by a submission of its
                     // own, with no second copy to keep in step.
-                    *engine_answer = Some(
-                        match provider_render::park_and_finish_render(&inputs, &resources, batch) {
-                            Ok(outcome) => outcome,
-                            // A run the provider refused gives every one of its
-                            // records back: the walk reads this refusal off the
-                            // batch and re-runs them on the per-record path.
-                            Err(decline) => {
-                                batch.note_refusal(format!("run_refused: {decline:?}"));
-                                RenderRailOutcome::ProviderDeclined(decline)
-                            }
-                        },
-                    );
+                    // A run the provider would not carry gives every one of its
+                    // records back, and the walk reads that refusal off the
+                    // batch it owns and re-runs them on the per-record path.
+                    //
+                    // The refusal leaves this arm as the *parked* status, not as
+                    // this record's own answer (G3-B/B-1c). Nothing of the run
+                    // was submitted, so there is no answer: the tail is a record
+                    // whose first walk assembled a member of a run that was then
+                    // given back, and the per-record path below is about to
+                    // walk and answer it. Handing the decline out as the
+                    // record's own answer priced it as a draw the engine
+                    // refused — `linux_m2v_draw_failure`, the Store route over a
+                    // frame that does not exist, and the red line
+                    // `draws_skipped_after_engine_refusal` — for a draw that was
+                    // never lost. That counter means "the engine refused this
+                    // draw and the pass landed its clear instead", and a record
+                    // the walk answers below is not one. The member arm above
+                    // has always returned this way; the tail returns the same
+                    // way now, so one refusal has one reporting shape.
+                    match provider_render::park_and_finish_render(&inputs, &resources, batch) {
+                        Ok(outcome) => *engine_answer = Some(outcome),
+                        Err(decline) => {
+                            batch.note_refusal(format!("run_refused: {decline:?}"));
+                            return Ok(M2vDrawSpan::Parked);
+                        }
+                    }
                 }
             }
             // G3-B/B-1: the run's tail already has its answer — the run's one
@@ -12385,7 +12431,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             match outcome {
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
-                    crate::runtime::drain::note_store_route("render_provider_canonical");
+                    note_provider_answer(req);
                     // fp3 probe, pure observation: *which* caller rail withheld
                     // this record's readback, and how many bytes the canonical
                     // rail had to publish anyway because this seam cannot fetch
@@ -12650,7 +12696,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         crate::runtime::chain_phase::enter(
                             crate::runtime::chain_phase::Phase::Store,
                         );
-                        crate::runtime::drain::note_store_route("render_provider_canonical");
+                        note_provider_answer(req);
                         crate::runtime::drain::note_frame_draw_rail(
                             crate::runtime::drain::FrameDrawRail::Provider,
                         );
@@ -12698,7 +12744,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // `TargetIdentity` the provider's pair is minted from — so
                     // the two namespaces cannot drift apart.
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
-                    crate::runtime::drain::note_store_route("render_provider_canonical");
+                    note_provider_answer(req);
                     crate::runtime::drain::note_frame_draw_rail(
                         crate::runtime::drain::FrameDrawRail::Provider,
                     );
@@ -12866,6 +12912,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // than at the seam's return, because the seam's span also covers the
         // provider path above and cannot name which rail executed it.
         crate::runtime::drain::note_frame_draw_rail(crate::runtime::drain::FrameDrawRail::Engine);
+        // G3-B/B-1c: the same fact for a record a give-back handed to the
+        // per-record path — the engine drew this one. Charged here for the same
+        // reason as the rail count above: this is the only place that knows
+        // which of the two rails ran the record.
+        crate::runtime::exec::note_giveback_rerun(req, "render_batch_giveback_rerun_engine");
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan
