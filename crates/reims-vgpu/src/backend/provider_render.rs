@@ -1491,6 +1491,19 @@ impl WindowCopies {
             .find(|(label, _)| *label == binding)
             .map(|(_, bytes)| bytes.as_slice())
     }
+
+    /// Give up every copy this pass made, for the requests that will hand the
+    /// `Vec`s themselves to the owner plan.
+    ///
+    /// Only the seventh cut's arm calls this: the plan's lease is minted around
+    /// the buffer rather than a copy of it, so the copy made here is the *only*
+    /// one the submission pays for. The whole carrier is taken rather than one
+    /// entry at a time because the requests that receive these `Vec`s hold a
+    /// shared borrow of the carrier for the rest of the call ([`Self::bytes`]),
+    /// and a `&mut` method could not be called beside them.
+    fn take_all(&mut self) -> Vec<(u32, Vec<u8>)> {
+        std::mem::take(&mut self.entries)
+    }
 }
 
 /// The class's own copy of one sampled texture's tightly packed extent, under
@@ -5112,6 +5125,35 @@ fn canonical_vertex_stream_count(attributes: &[VertexAttributeResource]) -> usiz
     heads.len()
 }
 
+/// The plan's own gathered runs, copied into the owned list one
+/// `BufferSource::GuestRuns` declaration carries.
+///
+/// # The run list the plan is already holding (the seventh cut's meter)
+///
+/// The contract's `BufferSource::GuestRuns` declaration carries an **owned**
+/// `Vec<GuestRun>`, while the owner plan holds the only list of them for the
+/// whole submission (`provider_owner::Plan::guest_runs` returns a slice). So
+/// every declaration is a `to_vec` of a list that already exists, made here
+/// through one helper so the round prices one construction rather than three
+/// call sites: [`FrameSpan::LeaseRunCopy`] and
+/// [`LeaseVecMeter::RunCopy`] are default off behind the frame profile, and
+/// with the profile off this is exactly the `to_vec` the three sites spelled
+/// before.
+fn copied_guest_runs(
+    runs: &[metal_api_core::provider::GuestRun],
+) -> Vec<metal_api_core::provider::GuestRun> {
+    let _span = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseRunCopy);
+    let copied = runs.to_vec();
+    crate::runtime::drain::note_lease_vec(
+        crate::runtime::drain::LeaseVecMeter::RunCopy,
+        1,
+        u64::try_from(copied.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(std::mem::size_of::<metal_api_core::provider::GuestRun>() as u64),
+    );
+    copied
+}
+
 /// The registered windows one zero-copy gather was cut from, in window order
 /// (`R9e`, E-TX6).
 ///
@@ -5173,6 +5215,12 @@ fn canonical_vertex_stream_count(attributes: &[VertexAttributeResource]) -> usiz
 /// asks the device for the import alone, which is the same answer the borrowed
 /// arm needs.
 fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>> {
+    // The seventh cut's own meter: the list this function builds is the run
+    // list restated in the owner rail's own window shape, and it is derived
+    // afresh on every submission that asks. Charged here rather than at the
+    // readers, so the count is of lists built and not of lists read.
+    let _span =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseWindowGather);
     let mut windows: Vec<StageBufferWindow> = Vec::new();
     let mut total = 0_u64;
     for stretch in source.window_stretches()? {
@@ -5203,6 +5251,13 @@ fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>>
     if windows.iter().any(|window| window.import != first) {
         return None;
     }
+    crate::runtime::drain::note_lease_vec(
+        crate::runtime::drain::LeaseVecMeter::WindowGather,
+        1,
+        u64::try_from(windows.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(std::mem::size_of::<StageBufferWindow>() as u64),
+    );
     Some(windows)
 }
 
@@ -5243,6 +5298,13 @@ fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
     if len == 0 || len > source.total_len {
         return None;
     }
+    // The seventh cut's own meter: this copy is the gather's product, one per
+    // bind whose runs state no registered window, and every reader of these
+    // bytes downstream (the staged lease's own `Vec`, the provider's upload)
+    // is a second copy of it. Default off behind the frame profile; with the
+    // profile off the span is `None` and the counters are not written.
+    let _span =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseGatherBytes);
     let mut out: Vec<u8> = Vec::with_capacity(usize::try_from(len).ok()?);
     let mut skip = source.source_offset;
     let mut copied = 0_u64;
@@ -5270,7 +5332,15 @@ fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
         out.extend_from_slice(bytes);
         copied += take as u64;
     }
-    (copied == len).then_some(out)
+    if copied != len {
+        return None;
+    }
+    crate::runtime::drain::note_lease_vec(
+        crate::runtime::drain::LeaseVecMeter::GatherBytes,
+        1,
+        u64::try_from(out.len()).unwrap_or(u64::MAX),
+    );
+    Some(out)
 }
 
 /// The attachment's own previous contents as the ordered list of owner windows
@@ -14267,7 +14337,7 @@ fn submit_render_inner(
     // is what the caller has to read: a record in a run is answered by the
     // run's one completion, never by its own.
     if let Some(batch) = park {
-        return match batch.park(inputs, req, &pass, &copies, &texture_copies) {
+        return match batch.park(inputs, req, &pass, &mut copies, &texture_copies) {
             RenderParkOutcome::Parked => {
                 RenderRailOutcome::ProviderDeclined(ProviderRenderDecline::ClassProbeRouted)
             }
@@ -14275,7 +14345,7 @@ fn submit_render_inner(
             RenderParkOutcome::Declined(decline) => RenderRailOutcome::ProviderDeclined(decline),
         };
     }
-    match submit_narrow(inputs, req, &pass, &copies, &texture_copies) {
+    match submit_narrow(inputs, req, &pass, &mut copies, &texture_copies) {
         Ok(RenderCompletion::Writeback(output)) => RenderRailOutcome::ProviderCompleted(output),
         Ok(RenderCompletion::Resident(frame)) => {
             RenderRailOutcome::ProviderCompletedResident(ResidentFrame {
@@ -18195,7 +18265,7 @@ impl RenderBatch {
         inputs: &RenderRailInputs<'_>,
         req: &DrawRequest,
         pass: &NarrowPass<'_>,
-        copies: &WindowCopies,
+        copies: &mut WindowCopies,
         texture_copies: &TextureCopies,
     ) -> RenderParkOutcome {
         let rail = match rail() {
@@ -18729,7 +18799,7 @@ fn assemble_narrow_record(
     inputs: &RenderRailInputs<'_>,
     req: &DrawRequest,
     pass: &NarrowPass<'_>,
-    copies: &WindowCopies,
+    copies: &mut WindowCopies,
     texture_copies: &TextureCopies,
     assembly: &mut NarrowAssembly,
 ) -> Result<NarrowRecord, ProviderRenderDecline> {
@@ -18795,13 +18865,12 @@ fn assemble_narrow_record(
     // the lease the plan just imported.
     let attachment_source = match &pass.load {
         NarrowLoad::Bytes(bytes) => BufferSource::OwnedBytes(bytes.to_vec()),
-        NarrowLoad::GuestRuns(_) => BufferSource::GuestRuns(
+        NarrowLoad::GuestRuns(_) => BufferSource::GuestRuns(copied_guest_runs(
             leases
                 .as_ref()
                 .and_then(|plan| plan.guest_runs(load_seed_owner_binding()))
-                .expect("the owner plan covers an admitted guest-runs seed")
-                .to_vec(),
-        ),
+                .expect("the owner plan covers an admitted guest-runs seed"),
+        )),
         NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => {
             BufferSource::OwnedBytes(vec![0u8; usize::try_from(pass.extent).unwrap_or(0)])
         }
@@ -19056,13 +19125,12 @@ fn assemble_narrow_record(
                     length,
                     access: buffer.access,
                     attribute_stride: None,
-                    source: BufferSource::GuestRuns(
+                    source: BufferSource::GuestRuns(copied_guest_runs(
                         leases
                             .as_ref()
                             .and_then(|plan| plan.guest_runs(binding))
-                            .expect("the owner plan states the runs of every admitted list")
-                            .to_vec(),
-                    ),
+                            .expect("the owner plan states the runs of every admitted list"),
+                    )),
                 },
             });
             next_view += 1;
@@ -19271,13 +19339,12 @@ fn assemble_narrow_record(
         // The declaring kernel's own interface: one buffer, read.
         access: BufferAccess::Read,
         attribute_stride: None,
-        source: BufferSource::GuestRuns(
+        source: BufferSource::GuestRuns(copied_guest_runs(
             leases
                 .as_ref()
                 .and_then(|plan| plan.guest_runs(landing_view_owner_binding()))
-                .expect("the owner plan covers an admitted landing view's runs")
-                .to_vec(),
-        ),
+                .expect("the owner plan covers an admitted landing view's runs"),
+        )),
     });
 
     let pass_descriptor = RenderPassDescriptor {
@@ -20362,7 +20429,7 @@ fn submit_narrow(
     inputs: &RenderRailInputs<'_>,
     req: &DrawRequest,
     pass: &NarrowPass<'_>,
-    copies: &WindowCopies,
+    copies: &mut WindowCopies,
     texture_copies: &TextureCopies,
 ) -> Result<RenderCompletion, ProviderRenderDecline> {
     let rail = rail().map_err(IntoRender::into_render)?;
@@ -20853,13 +20920,33 @@ fn window_request(binding: u32, window: StageBufferWindow) -> provider_owner::Re
 /// `copies` decides alone, because it is filled only for the binds whose view
 /// pointer the device's granules turned away — and a bind that has a copy is by
 /// construction one the borrowed arm cannot state.
+///
+/// # The seventh cut's arm
+///
+/// With `REIMS_VGPU_STAGED_BYTES_OWNED` on, the copies have already been taken
+/// out of the carrier into `handed` (`plan_owner_leases`' own first step) and
+/// the request states one of them as `StagedBytes::Owned`: the owner plan then
+/// mints the lease around this pass's own buffer instead of copying it a second
+/// time (`provider_owner`'s `staged_lease_bytes`). With the switch off `handed`
+/// is empty and the borrow below is exactly the one this function made before
+/// the cut.
 fn window_arm_request<'a>(
     binding: u32,
     window: StageBufferWindow,
     copies: &'a WindowCopies,
+    handed: &mut Vec<(u32, Vec<u8>)>,
 ) -> provider_owner::Request<'a> {
+    if let Some(position) = handed.iter().position(|(label, _)| *label == binding) {
+        return provider_owner::Request::Staged(provider_owner::Staged {
+            binding,
+            bytes: provider_owner::StagedBytes::Owned(handed.swap_remove(position).1),
+        });
+    }
     match copies.bytes(binding) {
-        Some(bytes) => provider_owner::Request::Staged(provider_owner::Staged { binding, bytes }),
+        Some(bytes) => provider_owner::Request::Staged(provider_owner::Staged {
+            binding,
+            bytes: provider_owner::StagedBytes::Borrowed(bytes),
+        }),
         None => window_request(binding, window),
     }
 }
@@ -20918,7 +21005,7 @@ fn plan_owner_leases(
     provider: &metal_api_vulkan::VulkanComputeProvider,
     pass: &NarrowPass<'_>,
     resources: &mut ResourceTableSnapshot,
-    copies: &WindowCopies,
+    copies: &mut WindowCopies,
 ) -> Result<Option<provider_owner::Plan>, ProviderRenderDecline> {
     // One source of truth with the relay's boundary (R42): a pass that does not
     // travel the wire has no plan, and a pass that does has one. The predicate
@@ -20927,6 +21014,25 @@ fn plan_owner_leases(
     if !pass.travels_the_owner_wire() {
         return Ok(None);
     }
+    // The seventh cut's own first step: with `REIMS_VGPU_STAGED_BYTES_OWNED` on,
+    // every copy this pass made is moved out of its carrier *before* any request
+    // borrows what is left of it. Nothing is copied here — the `Vec`s are the
+    // ones the gate already filled — and with the switch off the carrier is
+    // untouched and `handed` is empty, so every request below borrows exactly
+    // the slice it borrowed before the cut.
+    //
+    // The two carriers are read in one order by both the switch arms: a binding
+    // with a handed-over copy states it, and a binding without one falls back to
+    // the borrow (which, with the switch on, is a binding this pass made no copy
+    // for at all).
+    let mut handed: Vec<(u32, Vec<u8>)> = if provider_owner::staged_bytes_owned_enabled() {
+        copies.take_all()
+    } else {
+        Vec::new()
+    };
+    // From here on the carrier is only read (`WindowCopies::bytes`), which is
+    // what lets the requests hold slices of it for the rest of the call.
+    let copies: &WindowCopies = copies;
     // E-TX6's stage-buffer list, built before the requests that borrow it: the
     // plan states a run list as `Window`s inside one registration's lease, and
     // the requests hold slices of these lists, so nothing may move them after
@@ -20956,7 +21062,9 @@ fn plan_owner_leases(
     for buffer in &pass.stage_buffers {
         let binding = stage_buffer_owner_binding(buffer.stage, buffer.index);
         match (buffer.borrowed_window(), buffer.run_list()) {
-            (Some(window), _) => requests.push(window_arm_request(binding, window, copies)),
+            (Some(window), _) => {
+                requests.push(window_arm_request(binding, window, copies, &mut handed))
+            }
             (None, Some(_)) => {
                 // The run-list arm: one request per list, under the binding its
                 // own stage and index name, over the `Window`s built above. The
@@ -20976,21 +21084,29 @@ fn plan_owner_leases(
                     binding,
                     // The gate admits a bind with neither windows nor staged bytes
                     // only under its own name, so this arm is total here.
-                    bytes: buffer
-                        .bytes
-                        .as_deref()
-                        .expect("a stage buffer without a window carries the owner's staged bytes"),
+                    //
+                    // The bytes live inside the pass this function only borrows
+                    // (`NarrowPass::stage_buffers`), so this is the one staged arm
+                    // the seventh cut cannot hand over: the plan copies them, and
+                    // the round's `lease_staged_copy` meter is where that shows.
+                    bytes: provider_owner::StagedBytes::Borrowed(buffer.bytes.as_deref().expect(
+                        "a stage buffer without a window carries the owner's staged bytes",
+                    )),
                 }))
             }
         }
     }
     requests.extend(pass.vertex_windows().map(|(binding, window)| {
-        window_arm_request(vertex_stream_owner_binding(binding), window, copies)
+        window_arm_request(
+            vertex_stream_owner_binding(binding),
+            window,
+            copies,
+            &mut handed,
+        )
     }));
-    requests.extend(
-        pass.index_window()
-            .map(|window| window_arm_request(index_stream_owner_binding(), window, copies)),
-    );
+    requests.extend(pass.index_window().map(|window| {
+        window_arm_request(index_stream_owner_binding(), window, copies, &mut handed)
+    }));
     // R28: the sampled textures' windows are the fourth shape of the same
     // plan, under their own label namespace. Both of their arms are leases —
     // the borrowed window, or the owner's staged copy of the extent
@@ -20999,7 +21115,7 @@ fn plan_owner_leases(
     // stream does, and its declaration names the lease this plan imports.
     requests.extend(
         pass.texture_windows()
-            .map(|(binding, window)| window_arm_request(binding, window, copies)),
+            .map(|(binding, window)| window_arm_request(binding, window, copies, &mut handed)),
     );
     // R32: the attachment's own guest-run seed, as the list arm of the same
     // plan. Its windows are read through the borrowed lease only: the provider
@@ -21044,7 +21160,8 @@ fn plan_owner_leases(
             windows: &landing_windows,
         }));
     }
-    let plan = provider_owner::plan(provider, &requests).map_err(ProviderRenderDecline::Owner)?;
+    let plan =
+        provider_owner::plan(provider, &mut requests).map_err(ProviderRenderDecline::Owner)?;
     for (allocation, size, reservation) in plan.leases() {
         if let Err(error) = resources.insert_allocation(AllocationRecord {
             allocation_id: allocation,

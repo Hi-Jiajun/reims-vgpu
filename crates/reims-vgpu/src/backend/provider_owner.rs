@@ -49,6 +49,11 @@ use metal_api_vulkan::VulkanComputeProvider;
 
 use crate::observe::Decline as ObserveDecline;
 
+/// `size_of::<GuestRun>()` as the run-list meters' own unit: the seventh cut
+/// prices a run list by its elements, so `_bytes / GUEST_RUN_BYTES` is the run
+/// count the round read.
+const GUEST_RUN_BYTES: u64 = std::mem::size_of::<metal_api_core::provider::GuestRun>() as u64;
+
 /// What one device-loss teardown released, as the owner ledger saw it.
 ///
 /// The contract's guarantee is that a device loss releases every lease
@@ -107,12 +112,60 @@ pub struct Window {
     pub bytes_len: u64,
 }
 
+/// The bytes one staged request states, in the two arms the plan can mint a
+/// lease from.
+///
+/// # Why the arm is stated by the caller rather than decided by the plan
+///
+/// `StagedLease::new` wants the bytes **owned** — the provider holds them until
+/// the completion that uploads them — so a submission has to end up with a
+/// `Vec<u8>` of them either way. What this type records is *which* `Vec` that
+/// is: the one this rail already made in the class gate ([`Self::Owned`]), or a
+/// copy the plan still has to make out of a borrow ([`Self::Borrowed`]).
+///
+/// The owner of the bytes is the only code that can answer that, which is why
+/// the arm travels in the request instead of being re-derived here: the gate
+/// holds a window's copy in [`WindowCopies`], and a `Vec` it has handed over
+/// cannot be read again.
+///
+/// The switch (`REIMS_VGPU_STAGED_BYTES_OWNED`, off by default) decides whether
+/// a caller that *does* hold such a `Vec` hands it over; with the switch off
+/// every request is [`Self::Borrowed`] and the plan's copy is the one it always
+/// made.
+#[derive(Clone, Debug)]
+pub enum StagedBytes<'a> {
+    /// The `Vec` this rail already holds, moved into the lease.
+    ///
+    /// The bytes are the ones the class gate copied for a window the device's
+    /// granules turned away (`R18`) or read out of the guest's live pages for a
+    /// run list (`G1-A`), so a lease minted from this arm is minted around the
+    /// **same** `Vec` the submission would otherwise have copied a second time
+    /// and then dropped.
+    Owned(Vec<u8>),
+    /// A borrow of bytes this rail does not own: the plan copies them, which is
+    /// the arm every round before the seventh cut ran.
+    Borrowed(&'a [u8]),
+}
+
+impl StagedBytes<'_> {
+    /// Bytes this request states, whichever arm carries them.
+    fn len(&self) -> u64 {
+        match self {
+            Self::Owned(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Self::Borrowed(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// One binding whose bytes the owner holds for the duration of this call: the
 /// staged copy this rail already gathered, with no registered window behind it.
-#[derive(Clone, Copy, Debug)]
+///
+/// Not `Copy` since the seventh cut: the [`StagedBytes::Owned`] arm carries the
+/// `Vec` itself, so a request that states it is the only one that can.
+#[derive(Clone, Debug)]
 pub struct Staged<'a> {
     pub binding: u32,
-    pub bytes: &'a [u8],
+    pub bytes: StagedBytes<'a>,
 }
 
 /// One binding whose bytes are an ordered list of registered windows
@@ -142,7 +195,7 @@ pub struct Runs<'a> {
 }
 
 /// What one narrow-class binding offers the owner rail.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Request<'a> {
     /// The bytes came from one registered guest RAM window; they may be
     /// imported without copying when the device supports it.
@@ -1075,7 +1128,7 @@ fn release_import(provider: &VulkanComputeProvider, hold: &Hold) -> Result<(), D
 /// either a complete plan or no import at all.
 pub fn plan<'a>(
     provider: &VulkanComputeProvider,
-    requests: &[Request<'a>],
+    requests: &mut [Request<'a>],
 ) -> Result<Plan, Decline> {
     plan_with_epoch(provider, provider.device_epoch().get(), requests)
 }
@@ -1149,6 +1202,90 @@ fn checked_window(state: &State, window: Window) -> Result<(u64, u64), Decline> 
     Ok((offset, end))
 }
 
+/// The owner's bytes for one staged binding, in the arm the request stated.
+///
+/// # Why the plan is where the copy had to be made, and why it need not be
+///
+/// [`StagedLease::new`] wants the bytes **owned** — the provider holds them
+/// until the completion that uploads them, which is later than this call — so a
+/// submission ends up holding a `Vec<u8>` either way. What the seventh cut
+/// changed is where that `Vec` comes from:
+///
+/// - [`StagedBytes::Owned`]: the caller handed over the `Vec` it had already
+///   built (the class gate's copy of a window the granules turned away, or the
+///   bytes a gather read out of the guest's live pages). This arm **moves** it,
+///   and the copy the plan used to make — on the calling thread, with the
+///   registry guard of [`plan_with_epoch`] alive — is gone.
+/// - [`StagedBytes::Borrowed`]: the caller only has a borrow, so the owner's
+///   `Vec` is made here exactly as it was before the cut.
+///
+/// The two arms hand `StagedLease::new` the same bytes: the move is a move of
+/// the buffer the copy would have been taken from.
+///
+/// Every reading is default off behind the frame profile, and both arms are
+/// read under the same two meters — `LeaseVecMeter::StagedCopy` for the bytes
+/// that had to be copied and `LeaseVecMeter::StagedMoved` for the bytes that
+/// did not — so one round says which arm ran and how much it carried. With
+/// `REIMS_VGPU_FRAME_PROFILE` unset this function is `bytes.to_vec()` for a
+/// borrowed request and the identity for an owned one, and no clock is read.
+fn staged_lease_bytes(bytes: StagedBytes<'_>) -> Vec<u8> {
+    use crate::runtime::drain::{frame_span, note_lease_vec, FrameSpan, LeaseVecMeter};
+    let _span = frame_span(FrameSpan::LeaseStagedCopy);
+    match bytes {
+        StagedBytes::Owned(bytes) => {
+            note_lease_vec(
+                LeaseVecMeter::StagedMoved,
+                1,
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            );
+            bytes
+        }
+        StagedBytes::Borrowed(bytes) => {
+            let copy = bytes.to_vec();
+            // Reported before the value moves into `StagedLease::new`, so the
+            // counters and the span are of the same construction.
+            note_lease_vec(
+                LeaseVecMeter::StagedCopy,
+                1,
+                u64::try_from(copy.len()).unwrap_or(u64::MAX),
+            );
+            copy
+        }
+    }
+}
+
+/// Whether `REIMS_VGPU_STAGED_BYTES_OWNED` asked a caller that holds a staged
+/// binding's `Vec` to hand it over instead of lending a slice of it.
+///
+/// **Off by default, and off is the arm every round before the seventh cut
+/// ran**: with the switch off the requests are all [`StagedBytes::Borrowed`]
+/// and [`staged_lease_bytes`] makes the copy it always made, byte for byte.
+/// Set `REIMS_VGPU_STAGED_BYTES_OWNED=1` (also `on`, `true`, `yes`) for the arm
+/// that moves the caller's own buffer into the lease.
+///
+/// Read once, at the first call, like the rail's other mechanism switches: the
+/// answer cannot change inside a process, and the gate sits on a path that runs
+/// once per staged binding.
+pub(crate) fn staged_bytes_owned_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_staged_bytes_owned(
+            std::env::var("REIMS_VGPU_STAGED_BYTES_OWNED")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The switch's own parser, apart from the process-global it caches into, so a
+/// unit test can read every spelling without a switch it cannot put back.
+fn parse_staged_bytes_owned(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
 /// [`plan`] with the lease epoch stated by the caller.
 ///
 /// Production passes the provider's own `device_epoch()` — that is what
@@ -1160,7 +1297,7 @@ fn checked_window(state: &State, window: Window) -> Result<(u64, u64), Decline> 
 pub fn plan_with_epoch<'a>(
     provider: &VulkanComputeProvider,
     epoch: u64,
-    requests: &[Request<'a>],
+    requests: &mut [Request<'a>],
 ) -> Result<Plan, Decline> {
     let alignment = provider.no_copy_alignment();
     let mut state = lock();
@@ -1177,7 +1314,7 @@ pub fn plan_with_epoch<'a>(
     // lease its registration already mints, which is why the grouping above and
     // this list are one answer rather than two.
     let mut run_requests: Vec<Runs<'_>> = Vec::new();
-    for request in requests {
+    for request in requests.iter() {
         match request {
             Request::Window(window) => {
                 channel(window.binding, true, alignment)?;
@@ -1190,12 +1327,13 @@ pub fn plan_with_epoch<'a>(
             }
             Request::Staged(staged_request) => {
                 channel(staged_request.binding, false, alignment)?;
-                if staged_request.bytes.is_empty() {
+                let length = staged_request.bytes.len();
+                if length == 0 {
                     return Err(Decline::StagedEmpty {
                         binding: staged_request.binding,
                     });
                 }
-                staged.push((staged_request.binding, staged_request.bytes.len() as u64));
+                staged.push((staged_request.binding, length));
             }
             // The list arm (`research/docs/23` §113, E-TX6). Every window is
             // checked exactly as a single-window request's is, and the grouping
@@ -1343,7 +1481,7 @@ pub fn plan_with_epoch<'a>(
             window: Some(window),
             released: false,
         });
-        for request in requests {
+        for request in requests.iter() {
             let Request::Window(request) = request else {
                 continue;
             };
@@ -1398,6 +1536,13 @@ pub fn plan_with_epoch<'a>(
             if run_request.windows.first().map(|w| w.import) != Some(*import) {
                 continue;
             }
+            // The seventh cut's own meter: one fresh `Vec<GuestRun>` per
+            // list-shaped request, built here under the registry guard. The
+            // bar and the two counters are default off behind the frame
+            // profile; with it off this is the same `Vec::with_capacity` and
+            // the same pushes.
+            let _run_span =
+                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseRunGather);
             let mut runs = Vec::with_capacity(run_request.windows.len());
             for window in run_request.windows {
                 let Some(offset) = window
@@ -1428,6 +1573,13 @@ pub fn plan_with_epoch<'a>(
                     length: window.bytes_len,
                 });
             }
+            crate::runtime::drain::note_lease_vec(
+                crate::runtime::drain::LeaseVecMeter::RunGather,
+                1,
+                u64::try_from(runs.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(GUEST_RUN_BYTES),
+            );
             run_views.push(RunView {
                 binding: run_request.binding,
                 allocation,
@@ -1442,13 +1594,23 @@ pub fn plan_with_epoch<'a>(
     for (binding, length) in staged {
         let lease = LeaseId::new(state.lease());
         let allocation = AllocationId::new(state.allocate());
+        // The request is asked *mutably* for its bytes because the arm that
+        // owns them hands the `Vec` over rather than lending it: a lease minted
+        // around the caller's own buffer is a lease the submission does not pay
+        // to copy. The borrow arm is left in place by the same swap, and the
+        // empty slice it is replaced with states nothing — the loop below is the
+        // only reader of either arm.
         let bytes = requests
-            .iter()
+            .iter_mut()
             .find_map(|request| match request {
-                Request::Staged(staged) if staged.binding == binding => Some(staged.bytes),
+                Request::Staged(staged) if staged.binding == binding => Some(std::mem::replace(
+                    &mut staged.bytes,
+                    StagedBytes::Borrowed(&[]),
+                )),
                 _ => None,
             })
             .expect("a staged binding was collected above");
+        let bytes = staged_lease_bytes(bytes);
         let staged_lease = match StagedLease::new(
             LeaseReservation {
                 lease: BufferLease {
@@ -1459,7 +1621,7 @@ pub fn plan_with_epoch<'a>(
                 offset: 0,
                 length,
             },
-            bytes.to_vec(),
+            bytes,
         ) {
             Ok(staged_lease) => staged_lease,
             Err(error) => {
@@ -1870,5 +2032,65 @@ mod tests {
             !state.ledger.release_ready(bound),
             "and the lease is not release-ready until its token retires"
         );
+    }
+
+    /// The seventh cut's two arms hand the lease the same bytes.
+    ///
+    /// The cut is a move of the caller's own buffer instead of a copy of a
+    /// borrow, so the reading it has to survive is byte-level: whatever
+    /// `StagedLease::new` is given must be the bytes the request stated. The
+    /// copy arm is the arm every round before the cut ran; the move arm is the
+    /// one the switch selects. Neither is allowed to change a byte, and the
+    /// moved arm is not allowed to leave a copy behind (`to_vec` would be a
+    /// second allocation the round would not see).
+    #[test]
+    fn the_staged_arms_hand_the_lease_the_same_bytes() {
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(4_096).collect();
+        let borrowed = staged_lease_bytes(StagedBytes::Borrowed(&bytes));
+        assert_eq!(borrowed, bytes, "the borrow arm copies the request's bytes");
+        assert_ne!(
+            borrowed.as_ptr(),
+            bytes.as_ptr(),
+            "the borrow arm's brace is the copy: it is not the caller's buffer"
+        );
+
+        // The move arm's own identity: the `Vec` the lease is minted around is
+        // the one the caller handed over, pointer and all — which is what makes
+        // it a move rather than a copy the round would not see.
+        let handed = bytes.clone();
+        let handed_ptr = handed.as_ptr();
+        let moved = staged_lease_bytes(StagedBytes::Owned(handed));
+        assert_eq!(
+            moved.as_ptr(),
+            handed_ptr,
+            "the move arm hands the caller's own buffer to the lease"
+        );
+        assert_eq!(moved, bytes, "the move arm hands over the same bytes");
+    }
+
+    /// The switch is off for every spelling but the four that mean "on".
+    ///
+    /// Read apart from the process-global it caches into, so a test can read
+    /// every spelling without a switch it cannot put back — the same shape the
+    /// rail's other mechanism switches are read by.
+    #[test]
+    fn the_staged_bytes_switch_is_off_unless_it_is_asked_for() {
+        for value in [
+            None,
+            Some(""),
+            Some("off"),
+            Some("0"),
+            Some("no"),
+            Some("ON!"),
+            Some("tru"),
+        ] {
+            assert!(!parse_staged_bytes_owned(value), "{value:?} is not an arm");
+        }
+        for value in ["1", "on", "true", "yes", " ON ", "Yes"] {
+            assert!(
+                parse_staged_bytes_owned(Some(value)),
+                "{value:?} asks for the handover arm"
+            );
+        }
     }
 }
