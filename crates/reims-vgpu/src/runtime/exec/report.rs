@@ -649,6 +649,108 @@ pub(super) fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
         }
     }
 }
+
+/// Report the run lengths a *batch* of kept frames would carry (G3-B/B-0).
+///
+/// `keep` is [`super::chain_relay_keep_plan`]'s own answer — "this record's
+/// frame may stay in the provider's image for the record after it" — so a
+/// maximal run of `true` entries names exactly the records one submission scope
+/// would carry: the keepers plus the record that loads the last kept frame.
+///
+/// The bands are the same shape the `stream_draws_*` bands have
+/// ([`note_stream_draw_drops`]): one distribution says how many draws a guest
+/// command buffer carries, this one says how many of those draws can share a
+/// submission. `declarations` is the run's own serial-pool lower bound — every
+/// member names the shared attachment view, so the batch's declaration list is
+/// at least its record count and grows with whatever each member declares
+/// beside it — and `over_budget` names the runs past the emulator's own
+/// `MAX_SERIAL_RESOURCES` wall (64), which are the runs whose batch has to be
+/// shortened rather than silently truncated.
+pub(super) fn note_render_batch_plan(keep: &[bool]) {
+    // Mirrored from the emulator's `MAX_SERIAL_RESOURCES`, because the reading
+    // wants the answer before the assembly exists.
+    const SERIAL_RESOURCE_BUDGET: u64 = 64;
+    let mut index = 0;
+    while index < keep.len() {
+        if !keep[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < keep.len() && keep[index] {
+            index += 1;
+        }
+        // The run carries the keepers and the record that loads the last kept
+        // frame, which is the whole submission scope.
+        let records = u64::try_from(index - start + 1).unwrap_or(u64::MAX);
+        crate::runtime::drain::note_store_route("render_batch_plan_runs");
+        crate::runtime::drain::note_store_route(match records {
+            0..=1 => "render_batch_plan_records_1",
+            2 => "render_batch_plan_records_2",
+            3..=4 => "render_batch_plan_records_3_4",
+            5..=8 => "render_batch_plan_records_5_8",
+            9..=16 => "render_batch_plan_records_9_16",
+            _ => "render_batch_plan_records_over_16",
+        });
+        crate::runtime::drain::note_store_route_n("render_batch_plan_draws", records);
+        crate::runtime::drain::note_store_route_n("render_batch_plan_declarations", records);
+        if records > SERIAL_RESOURCE_BUDGET {
+            crate::runtime::drain::note_store_route("render_batch_plan_over_budget");
+            crate::runtime::drain::note_store_route_n(
+                "render_batch_plan_over_budget_draws",
+                records,
+            );
+        }
+    }
+}
+
+/// Report whether one stream's head could load the frame the *previous* stream
+/// left in the provider's image (G3-B/B-0).
+///
+/// The keep plan only reaches inside one exec packet, so the largest batch it
+/// can state is that packet's own chain. A frame-level run — the shape that
+/// would divide a frame's cost by ten or more — needs the next stream's head to
+/// name the same image the previous stream's tail stored into, and nothing in
+/// this device recorded whether that ever happens. The two pairs are the same
+/// `(allocation, view)` mint the probes report, so the question is asked in the
+/// one place both answers exist: this stream's head, against the tail of the
+/// stream before it.
+///
+/// A reader divides `match` by (`match + mismatch`) for the cross-stream rate
+/// the next increment would buy. `first` is the boot's opening stream, which has
+/// nothing to compare against; a stream that left no tail at all (every record
+/// out of class) keeps the last known tail in place rather than clearing it,
+/// so the pair it actually left in the provider's image is still the one the
+/// next stream is measured against.
+pub(super) fn note_render_batch_stream_identity(
+    head: Option<(u64, u64)>,
+    tail: Option<(u64, u64)>,
+) {
+    use std::cell::Cell;
+    thread_local! {
+        /// Whether any stream has been seen on this thread, and the attachment
+        /// pair the last one that had a tail left behind.
+        static PREVIOUS_TAIL: (Cell<bool>, Cell<Option<(u64, u64)>>) =
+            (const { Cell::new(false) }, const { Cell::new(None) });
+    }
+    let (seen, previous) =
+        PREVIOUS_TAIL.with(|(seen, previous)| (seen.replace(true), previous.get()));
+    if let Some(tail) = tail {
+        PREVIOUS_TAIL.with(|(_, previous)| previous.set(Some(tail)));
+    }
+    let Some(head) = head else {
+        return;
+    };
+    match (seen, previous) {
+        (false, _) => crate::runtime::drain::note_store_route("render_batch_stream_first"),
+        (true, Some(previous)) if previous == head => {
+            crate::runtime::drain::note_store_route("render_batch_stream_identity_match")
+        }
+        (true, _) => {
+            crate::runtime::drain::note_store_route("render_batch_stream_identity_mismatch")
+        }
+    }
+}
 crate::observe::decline_display!(ChainAbandonDecline);
 
 /// One-shot (per `pipeline_ref` x reason) always-on line for a failed draw
