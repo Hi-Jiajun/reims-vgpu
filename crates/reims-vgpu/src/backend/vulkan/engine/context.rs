@@ -1416,6 +1416,12 @@ impl DeviceContext {
         // the process reads as a slow device unless the narrowing is on the
         // same page as the capabilities.
         crate::observe::off(crate::config::report_line());
+        // The read-side probe's own positive control, beside the line that says
+        // whether the operator turned it on: a boot whose `read_guard_selftest`
+        // line is absent ran no read-side probe, and a `read_after_release`
+        // reading from it would be unreadable without that being obvious. It
+        // touches a detached page record, so it perturbs nothing.
+        crate::runtime::released_pages::note_selftest();
         // Warm-start the pipeline cache from the previous boot's blob. Cold
         // pipeline compiles are the remaining pre-convergence stall class
         // (~256 ms first use per pipeline); the blob is keyed by the device's

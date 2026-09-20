@@ -142,6 +142,226 @@ pub fn note_levels(state: &crate::model::DeviceState) {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// The read side
+// ---------------------------------------------------------------------------
+//
+// # What the guards above leave unobserved
+//
+// Everything in this module so far watches a **write**: the release arms a
+// page, the write census judges it where the write is recorded, and the drain
+// reports whichever writes named an armed page. On the three panicking boots of
+// the 2026-09-20 full-import round that reading was zero — no write this device
+// recorded landed on a released page, and every panic-named page that a kernel
+// slide could convert sat two to three frames outside the whole boot's write
+// footprint.
+//
+// That leaves the other direction: this device **reading** a page the guest has
+// taken back. A reader served from such a page is not reading a stale copy of
+// its own data — the guest is entitled to have handed the page to something
+// else, including its own page tables — so whatever it derives from those bytes
+// is derived from somebody else's memory. Nothing here observed that, and it is
+// the shape the remaining evidence points at.
+//
+// # The check, and what makes its zero an answer
+//
+// The marker for an armed page already exists in the write census cell
+// ([`crate::runtime::host_writes::HostWrites::released_at`]), so the check is
+// one lookup per page of a read that names its pages. What a named reader owes
+// is therefore: name the pages it is about to read, ask each one, and report
+// the ones the guest has released.
+//
+// Four counters make the zero readable rather than silent:
+//
+// * `read_guard_reads` — every named read this probe was called for while it is
+//   on, and `read_guard_unarmed_reads` the subset that ran with nothing armed
+//   to judge it against. Without these, a boot whose guest never released a
+//   page and a boot whose wiring is dead read alike: both are zero everywhere
+//   below.
+// * `read_guard_checked_reads` / `read_guard_checked_pages` — how many named
+//   reads were checked and over how many pages. A boot with hits is not a boot
+//   with zero here, and a zero *here* would mean the probe never ran.
+// * `read_guard_unnamed_reads` — a reader that could not name its pages. That
+//   is not a clean sweep: it is a read this probe could not judge, and it is
+//   reported instead of being counted as quiet.
+// * `read_after_release` plus one `read_after_release_<reader>` per reader —
+//   pages found armed, and by which reader.
+//
+// Each hit is also one `read_after_release` line on the always-on channel,
+// latched per `(reader, page)`, carrying the release epoch and the reader's own
+// description of the read. The line is the finding; the counters are what say
+// how much of the boot the finding was measured against.
+
+/// Whether the read-side probe observes anything this boot.
+///
+/// Affirmative spelling only, unlike [`crate::runtime::node_guard::enabled`]:
+/// the check is a page walk per named read, and a boot that is not the
+/// read-side round must not pay it or perturb the race it exists to watch.
+/// `unset`, `off` and an unrecognized value all mean "do not observe".
+pub fn reads_guarded() -> bool {
+    // The tests below are the only caller that may answer this without the
+    // environment, because the crate reads the switch once per process and a
+    // fixture cannot un-cache that. This changes nothing a boot can reach: it
+    // is compiled out of every arm but `cfg(test)`.
+    #[cfg(test)]
+    if FORCED_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::config::switch(crate::config::READ_GUARD) == crate::config::Switch::On
+    })
+}
+
+#[cfg(test)]
+static FORCED_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Census route naming one reader's hits, derived from the reader's own settle
+/// slug so the probe cannot grow a second vocabulary for the same sites.
+///
+/// `settle_buffer_guest_read` becomes `read_after_release_buffer_guest_read`.
+/// Derived once per site and leaked, because [`crate::runtime::drain::note_store_route`]
+/// takes a `&'static str` and a reader that has to allocate its own route name
+/// would pay that on every checked read.
+pub fn site_route(site: crate::runtime::render_writeback::SettleSite) -> &'static str {
+    use crate::runtime::render_writeback::SettleSite;
+    static ROUTES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let routes = ROUTES.get_or_init(|| {
+        SettleSite::ALL
+            .iter()
+            .map(|site| {
+                let slug = site.route();
+                let reader = slug.strip_prefix("settle_").unwrap_or(slug);
+                Box::leak(format!("read_after_release_{reader}").into_boxed_str()) as &'static str
+            })
+            .collect()
+    });
+    let index = SettleSite::ALL
+        .iter()
+        .position(|candidate| *candidate == site)
+        .unwrap_or(0);
+    routes[index]
+}
+
+/// Route naming the bind-time check: a draw-time buffer window this device is
+/// about to serve, whose pages are resolved from the window rather than from a
+/// settle site.
+pub const BIND_ROUTE: &str = "read_after_release_buffer_bind";
+
+/// Check one named read's pages against the released set.
+///
+/// `pages` is the caller's own resolve of everything it is about to read, and
+/// runs **only** when this probe is on and something is armed — the whole point
+/// of the shape, because that resolve is a page-table walk and the common answer
+/// on every other boot is that nothing is armed at all. `None` from it means the
+/// caller could not name its window, which is counted as undecided rather than
+/// as quiet; a short list would license the pages it omitted.
+///
+/// `describe` runs only on a hit, so a reader may put its task, span and
+/// resource into the line without paying for the string on every read.
+pub fn note_read(
+    writes: &crate::runtime::host_writes::HostWrites,
+    route: &'static str,
+    pages: impl FnOnce() -> Option<Vec<u64>>,
+    describe: impl Fn() -> String,
+) {
+    if !reads_guarded() {
+        return;
+    }
+    // Counted before the armed-set test, because the two answers a reader has
+    // to tell apart are "the probe saw reads and nothing was armed" and "the
+    // probe saw no reads at all". The first is a reading about the boot's
+    // unmap traffic; the second means the wiring is dead. One atomic add on a
+    // path that is already a hash lookup when the set is empty.
+    crate::runtime::drain::note_store_route("read_guard_reads");
+    if writes.armed_pages() == 0 {
+        crate::runtime::drain::note_store_route("read_guard_unarmed_reads");
+        return;
+    }
+    let Some(pages) = pages() else {
+        crate::runtime::drain::note_store_route("read_guard_unnamed_reads");
+        return;
+    };
+    if pages.is_empty() {
+        crate::runtime::drain::note_store_route("read_guard_unnamed_reads");
+        return;
+    }
+    crate::runtime::drain::note_store_route("read_guard_checked_reads");
+    crate::runtime::drain::note_store_route_n("read_guard_checked_pages", pages.len() as u64);
+    let mut reported: Vec<u64> = Vec::new();
+    let mut hits = 0u64;
+    for &gpa in &pages {
+        let Some(released_at) = writes.released_at(gpa) else {
+            continue;
+        };
+        if reported.contains(&gpa) {
+            continue;
+        }
+        reported.push(gpa);
+        hits += 1;
+        crate::runtime::drain::note_store_route(route);
+        // The latch is per `(reader, page)`, so one page read by two readers is
+        // two lines and one page read twice by the same reader is one.
+        if !crate::observe::first_sight(route, gpa) {
+            continue;
+        }
+        crate::observe::fail(format!(
+            "{route} reason=read_after_release gpa={gpa:#x} released_at={released_at} \
+             armed={} pages={} ({}; this device read a guest page the guest had already taken \
+             back and has not mapped again, so the bytes it read belong to whatever the guest \
+             put there next — the read side of the ordering the release guards watch on the \
+             write side. This probe observes and never decides: the guest-visible behavior of \
+             this boot is unchanged)",
+            writes.armed_pages(),
+            pages.len(),
+            describe(),
+        ));
+    }
+    crate::runtime::drain::note_store_route_n("read_after_release", hits);
+}
+
+/// The probe's own positive control, run once when the guard is on.
+///
+/// The zero this probe reports is only worth something if the query it reports
+/// it with answers both ways on this build, and the write-side guards learned
+/// that lesson the expensive way: a rate gate written inline against the clock
+/// could only be checked by a boot. This runs against a detached
+/// [`crate::runtime::host_writes::HostWrites`] — it arms a page nothing else
+/// can see, asks for it, disarms it and asks again — so it proves the lookup
+/// without touching the device's own armed population or perturbing a single
+/// judgment the boot makes.
+pub fn note_selftest() {
+    use crate::runtime::host_writes::HostWrites;
+
+    if !reads_guarded() {
+        return;
+    }
+    let page = 0x1000u64;
+    let mut probe = HostWrites::new(crate::model::PAGE_SHIFT_X86);
+    probe.release_page(page);
+    let armed = probe.released_at(page);
+    let disarmed = if probe.released_at(page + 0x1000).is_none() {
+        "miss"
+    } else {
+        "HIT-WITHOUT-A-RELEASE"
+    };
+    let cleared = {
+        probe.remap_page(page);
+        probe.released_at(page).is_none()
+    };
+    crate::observe::off(format!(
+        "read_guard_selftest armed_query={} on_released_elsewhere={} after_remap={} \
+         (armed_query must be hit and the other two miss; a boot in which this line is absent \
+         ran no read-side probe)",
+        match armed {
+            Some(_) => "hit",
+            None => "MISS-WITHOUT-A-RELEASE",
+        },
+        disarmed,
+        if cleared { "miss" } else { "HIT-AFTER-REMAP" },
+    ));
+}
+
 /// The census interval every levels line in this device shares.
 ///
 /// One second, so `released_pages_levels`, `cache_levels`, `store_routes` and
@@ -176,10 +396,230 @@ fn claim_census_interval(last_ms: &std::sync::atomic::AtomicU64, now_ms: u64) ->
 #[cfg(test)]
 mod tests {
     use crate::runtime::host_writes::HostWrites;
+    use crate::runtime::render_writeback::SettleSite;
 
     use super::*;
 
     const P: u64 = 4096;
+
+    /// The probe on, for the duration of one test.
+    ///
+    /// The read of the switch is cached per process, so a fixture that set the
+    /// environment and put it back could not turn the probe on for its own
+    /// window. The override is `cfg(test)`, so no arm can reach it.
+    struct ForcedOn;
+
+    impl ForcedOn {
+        fn arm() -> Self {
+            FORCED_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for ForcedOn {
+        fn drop(&mut self) {
+            FORCED_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn route_count(route: &str) -> u64 {
+        crate::runtime::drain::store_route_count(route)
+    }
+
+    /// A reader of a page the guest has released is the finding: one line naming
+    /// the reader, the page and the release epoch, the reader's own route
+    /// counted, and the checked counters moved so the zero case stays readable.
+    #[test]
+    fn a_read_of_a_released_page_is_reported_against_the_reader() {
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        let mut w = HostWrites::default();
+        w.release_page(9 * P);
+        let checked_before = route_count("read_guard_checked_reads");
+        let pages_before = route_count("read_guard_checked_pages");
+        let total_before = route_count("read_after_release");
+        let reader_before = route_count(BIND_ROUTE);
+
+        note_read(
+            &w,
+            BIND_ROUTE,
+            || Some(vec![3 * P, 9 * P]),
+            || "reader=fixture task=1".to_string(),
+        );
+
+        let line = cap.one(BIND_ROUTE);
+        assert!(line.contains("reason=read_after_release"), "{line}");
+        assert!(line.contains(&format!("gpa={:#x}", 9 * P)), "{line}");
+        assert!(!line.contains(&format!("gpa={:#x}", 3 * P)), "{line}");
+        assert!(line.contains("reader=fixture task=1"), "{line}");
+        assert_eq!(route_count(BIND_ROUTE) - reader_before, 1);
+        assert_eq!(route_count("read_after_release") - total_before, 1);
+        assert_eq!(route_count("read_guard_checked_reads") - checked_before, 1);
+        assert_eq!(route_count("read_guard_checked_pages") - pages_before, 2);
+    }
+
+    /// The negative control: a read of pages the guest still holds is checked
+    /// and quiet, and the check is counted. Without this a zero reader could not
+    /// tell "nothing read a released page" from "nothing was read".
+    #[test]
+    fn a_read_of_a_page_the_guest_still_holds_is_checked_and_quiet() {
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        let mut w = HostWrites::default();
+        w.release_page(9 * P);
+        let checked_before = route_count("read_guard_checked_reads");
+        let reader_before = route_count(BIND_ROUTE);
+
+        note_read(
+            &w,
+            BIND_ROUTE,
+            || Some(vec![4 * P]),
+            || "unused".to_string(),
+        );
+
+        assert!(cap.lines().is_empty(), "{:?}", cap.lines());
+        assert_eq!(route_count(BIND_ROUTE), reader_before);
+        assert_eq!(route_count("read_guard_checked_reads") - checked_before, 1);
+    }
+
+    /// A reader that cannot name its window is undecided, not quiet — the same
+    /// direction the write census refuses in. An empty window is the same
+    /// answer: a read over no page this probe could judge.
+    #[test]
+    fn a_reader_that_cannot_name_its_pages_is_counted_and_not_called_quiet() {
+        let _on = ForcedOn::arm();
+        let _cap = crate::observe::FailCapture::start();
+        let mut w = HostWrites::default();
+        w.release_page(9 * P);
+        let unnamed_before = route_count("read_guard_unnamed_reads");
+
+        note_read(&w, BIND_ROUTE, || None, || "unused".to_string());
+        note_read(&w, BIND_ROUTE, || Some(Vec::new()), || "unused".to_string());
+
+        assert_eq!(route_count("read_guard_unnamed_reads") - unnamed_before, 2);
+    }
+
+    /// The probe is off unless the switch is spelled on, and off means **off**:
+    /// the reader's own resolve does not run, so a boot that is not watching
+    /// pays neither the walk nor the check.
+    #[test]
+    fn the_probe_runs_nothing_when_it_is_off() {
+        let cap = crate::observe::FailCapture::start();
+        let mut w = HostWrites::default();
+        w.release_page(9 * P);
+        let checked_before = route_count("read_guard_checked_reads");
+        let mut resolves = 0u32;
+
+        note_read(
+            &w,
+            BIND_ROUTE,
+            || {
+                resolves += 1;
+                Some(vec![9 * P])
+            },
+            || "unused".to_string(),
+        );
+
+        assert_eq!(resolves, 0, "the resolve must not run with the probe off");
+        assert_eq!(route_count("read_guard_checked_reads"), checked_before);
+        assert!(cap.lines().is_empty(), "{:?}", cap.lines());
+    }
+
+    /// With nothing armed there is nothing a read could hit, and the resolve is
+    /// not paid for either — but the call is still counted, so the two zero
+    /// readings ("saw reads, nothing armed" and "saw nothing") stay apart.
+    #[test]
+    fn the_probe_pays_nothing_while_the_armed_set_is_empty() {
+        let _on = ForcedOn::arm();
+        let w = HostWrites::default();
+        let mut resolves = 0u32;
+        let reads_before = route_count("read_guard_reads");
+        let unarmed_before = route_count("read_guard_unarmed_reads");
+        let checked_before = route_count("read_guard_checked_reads");
+        note_read(
+            &w,
+            BIND_ROUTE,
+            || {
+                resolves += 1;
+                Some(vec![9 * P])
+            },
+            || "unused".to_string(),
+        );
+        assert_eq!(resolves, 0);
+        assert_eq!(route_count("read_guard_reads") - reads_before, 1);
+        assert_eq!(route_count("read_guard_unarmed_reads") - unarmed_before, 1);
+        assert_eq!(route_count("read_guard_checked_reads"), checked_before);
+        assert_eq!(w.armed_pages(), 0);
+    }
+
+    /// The route a reader's hits are counted under is derived from that
+    /// reader's own settle slug, so the probe cannot grow a second name for a
+    /// site — and two readers cannot share one.
+    #[test]
+    fn the_probes_routes_are_derived_from_the_readers_own_slugs() {
+        assert_eq!(
+            site_route(SettleSite::BufferGuestRead),
+            "read_after_release_buffer_guest_read"
+        );
+        let routes: Vec<&'static str> = SettleSite::ALL.iter().copied().map(site_route).collect();
+        assert_eq!(routes.len(), SettleSite::ALL.len());
+        let unique: std::collections::HashSet<&'static str> = routes.iter().copied().collect();
+        assert_eq!(unique.len(), routes.len(), "two readers share one route");
+        for route in routes {
+            assert!(route.starts_with("read_after_release_"), "{route}");
+        }
+        assert!(
+            crate::config::ALL.contains(&crate::config::READ_GUARD),
+            "the switch must be on the boot line"
+        );
+    }
+
+    /// The probe's own control answers both ways on this build, and says so on
+    /// a line a boot can be read for.
+    #[test]
+    fn the_selftest_answers_both_ways_and_says_so() {
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        note_selftest();
+        // An `off` line, so the slug is the second token and `one` (which
+        // matches the first) would find nothing.
+        let lines = cap.lines();
+        let line = lines
+            .iter()
+            .find(|line| line.contains("read_guard_selftest"))
+            .unwrap_or_else(|| panic!("no read_guard_selftest line in {lines:?}"))
+            .clone();
+        assert!(line.contains("armed_query=hit"), "{line}");
+        assert!(line.contains("on_released_elsewhere=miss"), "{line}");
+        assert!(line.contains("after_remap=miss"), "{line}");
+    }
+
+    /// A read of a page the guest released reports once per reader and page,
+    /// however many times the same reader reads it.
+    #[test]
+    fn one_page_read_twice_reports_once_and_disarms_nothing() {
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        let mut w = HostWrites::default();
+        w.release_page(9 * P);
+        note_read(&w, BIND_ROUTE, || Some(vec![9 * P]), || "first".to_string());
+        note_read(
+            &w,
+            BIND_ROUTE,
+            || Some(vec![9 * P]),
+            || "second".to_string(),
+        );
+        assert_eq!(cap.lines().len(), 1, "{:?}", cap.lines());
+        assert_eq!(
+            w.armed_pages(),
+            1,
+            "a read is not a write: the page stays armed for the write guard"
+        );
+        assert!(
+            w.take_released_writes().is_empty(),
+            "the read-side probe must not manufacture a write finding"
+        );
+    }
 
     /// A released page nobody writes to reports nothing and stays armed — it is
     /// waiting for a write that may still come.

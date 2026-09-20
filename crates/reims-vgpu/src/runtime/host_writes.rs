@@ -261,6 +261,20 @@ impl HitSink<'_> {
 }
 
 impl PageEpochs {
+    /// See [`HostWrites::released_at`]: the released marker for one page, or
+    /// `None` when this page is not armed.
+    ///
+    /// The same cell [`Self::arm`] writes and [`Self::disarm`] clears, read
+    /// instead of written, so a reader of it pays one chunk lookup and one cell
+    /// load and no sweep exists on either side.
+    fn released_at(&self, page: u64) -> Option<u64> {
+        let chunk = self.chunks.get(&(page / EPOCHS_PER_CHUNK as u64))?;
+        let released = chunk.released.as_deref()?;
+        let slot = (page % EPOCHS_PER_CHUNK as u64) as usize;
+        let epoch = released[slot];
+        (epoch != 0).then_some(epoch)
+    }
+
     fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64, page_shift: u32) {
         let Self {
             chunks,
@@ -562,6 +576,24 @@ impl HostWrites {
     /// The guest has mapped `gpa` again, so writing to it is legitimate.
     pub fn remap_page(&mut self, gpa: u64) {
         self.pages.disarm(gpa >> self.page_shift);
+    }
+
+    /// The epoch at which the guest released `gpa`, or `None` while the page is
+    /// not armed.
+    ///
+    /// This is the query the read-side probe asks once per page of a named
+    /// read, which is why it is a cell read rather than a walk: the answer is
+    /// `None` on every page of every boot that is not watching for one, and it
+    /// has to cost what a missed page costs the write census, which is the same
+    /// one hash lookup.
+    ///
+    /// `Some(epoch)` means the guest took this page back at `epoch` and has not
+    /// mapped it again under any task since. It does **not** mean the page is
+    /// unreachable through a live mapping — see the residue in
+    /// [`crate::runtime::released_pages`] — so a hit is the start of a reading
+    /// and not a verdict of its own.
+    pub fn released_at(&self, gpa: u64) -> Option<u64> {
+        self.pages.released_at(gpa >> self.page_shift)
     }
 
     /// Take the findings recorded since the last drain.
