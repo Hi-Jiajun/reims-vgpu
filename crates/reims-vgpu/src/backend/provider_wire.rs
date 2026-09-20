@@ -1020,16 +1020,35 @@ fn capabilities_frame(
 /// pipeline contract's stage-buffer declarations, the pass's own views, the
 /// three binding sources — travels inside this frame or the encode refuses by
 /// name.
+///
+/// # The two copies (sp13, 2026-09-21)
+///
+/// The encoder takes the request **by reference** and reads the trace and the
+/// resource table out of it, so the owned `CommandRequest::Submit` below exists
+/// only to be read once: its two deep copies are made, the bytes are written
+/// out of them, and then both are dropped while the caller decodes a second
+/// owned pair out of the frame. The three spans this function charges — a copy
+/// of the trace, a copy of the resource table, and the encode itself — are what
+/// says which of the three the frame's microseconds are in before any of them
+/// is moved rather than copied.
 pub fn submit_frame(
     trace: &ComputeTrace,
     resources: &ResourceTableSnapshot,
 ) -> Result<Vec<u8>, WireDecline> {
-    CommandCodec::encode_request(&CommandRequest::Submit {
-        trace: trace.clone(),
-        resources: resources.clone(),
-    })
-    .inspect(|frame| note_frame(frame))
-    .map_err(|error| WireDecline::new("submit_frame", error))
+    use crate::runtime::drain::{frame_span, FrameSpan};
+    let trace = {
+        let _span = frame_span(FrameSpan::ProvFrameCloneTrace);
+        trace.clone()
+    };
+    let resources = {
+        let _span = frame_span(FrameSpan::ProvFrameCloneResources);
+        resources.clone()
+    };
+    let request = CommandRequest::Submit { trace, resources };
+    let _encode = frame_span(FrameSpan::ProvFrameEncode);
+    CommandCodec::encode_request(&request)
+        .inspect(|frame| note_frame(frame))
+        .map_err(|error| WireDecline::new("submit_frame", error))
 }
 
 /// Decode a submission frame with the provider's own decoder, which is what a
@@ -1108,6 +1127,7 @@ pub(crate) fn note_capability_frame() {
 
 pub(crate) fn note_submit_frame() {
     SUBMIT_FRAMES.fetch_add(1, Ordering::Relaxed);
+    crate::runtime::drain::note_frame_wire_frame();
 }
 
 /// The two counters above.
