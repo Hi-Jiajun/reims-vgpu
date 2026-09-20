@@ -166,7 +166,14 @@
 //!   `..._texture_source`, and a pass whose such bind crosses the
 //!   owner→provider frame also needs the frame to carry its declarations, which
 //!   the class reads out of the frame's own capability answer
-//!   (`..._texture_wire`);
+//!   (`..._texture_wire`). `G1-B` narrows "one no registration covers" to the
+//!   gather whose span is not the extent: a sampled gather the registration
+//!   ledger names **no window** for at all is read out of the runs the source
+//!   already carries ([`gathered_texture_source`] → [`stage_run_bytes`]),
+//!   repacked by the same derivation the window arms use, and stated as the
+//!   trace's own bytes — one `g1a` boot read 3 486 of them
+//!   (`evidence/gate3-census-g1a-2026-09-20`, 14.8 a window), the whole
+//!   `..._texture_source` population of that round;
 //! - **a sampled texture whose texels are the trace's own production** (R22,
 //!   E-TX3/`research/docs/23` §110): a request whose bind resolved to a GPU
 //!   target (`SampledSource::Target`) leaves for the provider once a pass of
@@ -625,6 +632,11 @@
 //!   whose window cannot be read keeps it under
 //!   `render_provider_out_of_class_vertex_alignment`; a device without
 //!   host-pointer import answers `render_provider_out_of_class_vertex_import`.
+//!   G1-B narrows the first of those to the scatter the ledger *does* name
+//!   windows for: a gather it names none for at all is read out of the source's
+//!   own runs ([`stream_run_bytes`]) and stated as the trace's own bytes, and
+//!   the two new routes (`..._vertex_staging_staged` / `..._vertex_staging_bytes`)
+//!   say how many binds and how many bytes the CPU gather carried.
 //!
 //! R11 wires the *index* half, and it is the same two arms a third time: an
 //! indexed draw binds exactly one index buffer, and the draw path resolves it
@@ -647,6 +659,13 @@
 //!   bind *and* whose window cannot be read keeps it under
 //!   `render_provider_out_of_class_index_alignment`, and a device without
 //!   host-pointer import answers `render_provider_out_of_class_index_import`.
+//!   G1-B takes the same arm the vertex half takes for a gather the ledger names
+//!   no window for, and that is the bucket's whole production population: with
+//!   `host_pointer_import=disabled_by_env` the ledger derives no window for any
+//!   bind, and one `g1a` boot read **102 588** refusals here
+//!   (`evidence/gate3-census-g1a-2026-09-20`, 434.7 a window) against the two
+//!   the control arm read. The routes are `..._index_staging_staged` /
+//!   `..._index_staging_bytes`.
 //!
 //! R47 makes the index view the bytes an affine stage-buffer proof is evaluated
 //! over ([`stage_buffer_affine_counts`]): staged bytes are read where they
@@ -658,7 +677,10 @@
 //! The count this class proves and the count the provider proves are then one
 //! arithmetic over one frozen range. An index view with no source this rail can
 //! state keeps the draw on the engine under the index stream's own name, and a
-//! count the bytes in hand do not state keeps it under the footprint's.
+//! count the bytes in hand do not state keeps it under the footprint's. G1-B's
+//! arm feeds the same proof from the same read as the stream's own
+//! ([`stream_run_bytes`], cached in `NarrowStageBuffers::index_bytes`), so a
+//! gather with no window is bounded, stated and executed over one copy.
 //!
 //! R32 puts the attachment's own load seed in the same channel. The two shapes
 //! that carry one are the two the request's seed door resolves: the surface's
@@ -1202,6 +1224,97 @@ fn read_gathered_window(index: u32, window: StageBufferWindow) -> Result<Vec<u8>
             )
         },
     )
+}
+
+/// The sampled-texture bucket's own refusal for a gather this rail may not
+/// state (`R28`, `R36`, `G1-B`).
+///
+/// One spelling for the two readers that ask, so the sentence a boot's log
+/// carries is the same one whichever arm found the fact: the window arm
+/// ([`sampled_gather_window`]) and `G1-B`'s copy arm
+/// ([`gathered_texture_source`]), whose second half is the exit's own sentence.
+fn texture_gather_refusal(index: u32, exit: &SampledGatherExit) -> OutOfClass {
+    OutOfClass::owned(
+        "render_provider_out_of_class_texture_source",
+        format!(
+            "a draw whose `[[texture({})]]` texels are gathered from guest memory stays on the \
+             engine when the gather is not one registered window covering the texture's own \
+             tightly packed extent: the canonical contract states a lease-backed sampled texture \
+             as the texture's extent at the reservation's own start \
+             (`TextureSource::BorrowedNoCopy`, or the owner's staged copy of exactly those \
+             bytes), and {}",
+            index,
+            exit.sentence(),
+        ),
+    )
+}
+
+/// The texels a sampled gather holds when the registration ledger names **no
+/// window** for it at all (`G1-B`).
+///
+/// The texture half of the arm the two buffer streams took in the same
+/// increment, on the same fact and with the same reading: with
+/// `host_pointer_import=disabled_by_env` the ledger fills no `pages` for any
+/// gather, so a sampled bind arrives with neither a window the seam can state
+/// (`sampled_gather_window` answers [`SampledGatherExit::Unregistered`]) nor a
+/// lease to mint — and the one carrier of these texels is the source's own runs,
+/// the live host aliases of the guest's pages the engine's CPU staging arm walks
+/// beside it.
+///
+/// The bytes are read at the span the gather states and repacked the way the
+/// window arms repack them, out of one derivation ([`sampled_rows`]): the
+/// tightly packed extent for a tight gather, and the guest's padded rows dropped
+/// for a padded one, with R41's channel plan folded in last when the bind's lane
+/// asks for it. One route pair counts the binds and the bytes, and nothing is
+/// cached — the copy is made once per submission, the freshness the GPU gather
+/// arm has.
+///
+/// `Err` is the bucket's own refusal, with the exit the reader found quoted: a
+/// span that is not the extent the declaration states, rows that do not tile
+/// it, or runs that stop short of the bind are all shapes no copy may pad or
+/// guess at.
+fn gathered_texture_source<'a>(
+    index: u32,
+    source: &GuestRunSource,
+    extent: TextureExtent,
+    fold: Option<crate::protocol::pixel_format::SwizzlePlan>,
+) -> Result<NarrowTextureSource<'a>, OutOfClass> {
+    let SampledRows { rows, .. } =
+        sampled_rows(source, extent).map_err(|exit| texture_gather_refusal(index, &exit))?;
+    let span = source.total_len;
+    let padded = stage_run_bytes(source, span)
+        .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
+    let texels = match rows {
+        // The repack's own shape check, the same one the window arm's copy
+        // takes: the bytes on hand have to be the span the guest's stride and
+        // row count tile, and a copy is never a shorter one.
+        Some(rows) => rows.depad(&padded).ok_or_else(|| {
+            texture_gather_refusal(
+                index,
+                &SampledGatherExit::PaddedRowCount {
+                    span,
+                    stride: rows.stride,
+                    tight_row: rows.tight_row,
+                    rows: rows.rows,
+                },
+            )
+        })?,
+        None => padded,
+    };
+    // The census' own reading of this arm, charged once the copy *is* the
+    // texture's own bytes: one route per bind that took it and one byte total
+    // beside it — the gather's own span, which a padded source carries with its
+    // padding, so the two halves of the arm can be counted from the log rather
+    // than inferred.
+    crate::runtime::drain::note_store_route("render_provider_out_of_class_texture_source_gathered");
+    crate::runtime::drain::note_store_route_n(
+        "render_provider_out_of_class_texture_source_bytes",
+        u64::try_from(texels.len()).unwrap_or(u64::MAX),
+    );
+    Ok(match fold {
+        Some(plan) => NarrowTextureSource::Gathered(fold_channel_plan(&plan, &texels)),
+        None => NarrowTextureSource::Gathered(texels),
+    })
 }
 
 /// The bytes one pass copies out of its window-backed binds (`R18`, `R28`),
@@ -3752,75 +3865,74 @@ fn sampled_textures<'a>(
                 // stride the guest states and the row *this* view states
                 // (R36). One arithmetic feeds the lease window, the check and
                 // the copy, so the three cannot disagree.
-                let gather = sampled_gather_window(
-                    source,
-                    TextureExtent {
-                        width: image.width,
-                        height: image.height,
-                        // The lane's width, as everywhere the bytes on hand are
-                        // measured: a folded bind gathers the one-byte texels the
-                        // plan is folded into (R41).
-                        bytes_per_texel: lane.bytes_per_texel(),
-                    },
-                );
-                let gather = match gather {
-                    Ok(gather) => gather,
-                    Err(exit) => {
-                        return Err(OutOfClass::owned(
-                            "render_provider_out_of_class_texture_source",
-                            format!(
-                                "a draw whose `[[texture({})]]` texels are gathered from guest \
-                                 memory stays on the engine when the gather is not one registered \
-                                 window covering the texture's own tightly packed extent: the \
-                                 canonical contract states a lease-backed sampled texture as the \
-                                 texture's extent at the reservation's own start \
-                                 (`TextureSource::BorrowedNoCopy`, or the owner's staged copy of \
-                                 exactly those bytes), and {}",
-                                declaration.index,
-                                exit.sentence(),
-                            ),
-                        ));
-                    }
+                let extent = TextureExtent {
+                    width: image.width,
+                    height: image.height,
+                    // The lane's width, as everywhere the bytes on hand are
+                    // measured: a folded bind gathers the one-byte texels the
+                    // plan is folded into (R41).
+                    bytes_per_texel: lane.bytes_per_texel(),
                 };
-                match gather.rows {
-                    // The guest's own rows are padded (R36): the class gate
-                    // repacks them into the texture's tightly packed extent
-                    // before anything is declared, because every lease window
-                    // this rail can cut names the reservation's own bytes —
-                    // which for a padded gather are the rows *with* their
-                    // padding.
-                    //
-                    // R41's fold takes the same two shapes and adds one step:
-                    // the class gate reads the guest's rows out of the
-                    // registration, folds the format's own channel plan into
-                    // them and declares the four-byte lane — so no lease is
-                    // minted for either arm and the window is read for its
-                    // bytes rather than bound ([`FoldedTexels`]).
-                    Some(rows) => match fold {
-                        Some(plan) => NarrowTextureSource::Folded {
-                            plan,
-                            texels: FoldedTexels::Rows {
+                let gather = match sampled_gather_window(source, extent) {
+                    Ok(gather) => Some(gather),
+                    // G1-B: the ledger names **no window** for this gather at
+                    // all — `pages` is absent, which is what
+                    // `host_pointer_import=disabled_by_env` produces for every
+                    // gather, or the one run it does carry holds no window —
+                    // and then the runs the source already holds are the only
+                    // carrier of these texels. They are read here
+                    // ([`stage_run_bytes`], the same walk the engine's own CPU
+                    // staging arm performs for the same bind) and stated as the
+                    // trace's own bytes, exactly as R36's repacked rows and
+                    // R41's folded plan are: one arm per shape below, not a
+                    // third way to bind a texture.
+                    Err(SampledGatherExit::Unregistered) => None,
+                    Err(exit) => return Err(texture_gather_refusal(declaration.index, &exit)),
+                };
+                match gather {
+                    Some(gather) => match gather.rows {
+                        // The guest's own rows are padded (R36): the class gate
+                        // repacks them into the texture's tightly packed extent
+                        // before anything is declared, because every lease window
+                        // this rail can cut names the reservation's own bytes —
+                        // which for a padded gather are the rows *with* their
+                        // padding.
+                        //
+                        // R41's fold takes the same two shapes and adds one step:
+                        // the class gate reads the guest's rows out of the
+                        // registration, folds the format's own channel plan into
+                        // them and declares the four-byte lane — so no lease is
+                        // minted for either arm and the window is read for its
+                        // bytes rather than bound ([`FoldedTexels`]).
+                        Some(rows) => match fold {
+                            Some(plan) => NarrowTextureSource::Folded {
+                                plan,
+                                texels: FoldedTexels::Rows {
+                                    window: gather.window,
+                                    rows,
+                                },
+                            },
+                            None => NarrowTextureSource::Depadded {
                                 window: gather.window,
                                 rows,
                             },
                         },
-                        None => NarrowTextureSource::Depadded {
-                            window: gather.window,
-                            rows,
-                        },
-                    },
-                    None => match fold {
-                        Some(plan) => NarrowTextureSource::Folded {
-                            plan,
-                            texels: FoldedTexels::Window {
+                        None => match fold {
+                            Some(plan) => NarrowTextureSource::Folded {
+                                plan,
+                                texels: FoldedTexels::Window {
+                                    window: gather.window,
+                                },
+                            },
+                            None => NarrowTextureSource::Window {
+                                binding: texture_owner_binding(declaration.index),
                                 window: gather.window,
                             },
                         },
-                        None => NarrowTextureSource::Window {
-                            binding: texture_owner_binding(declaration.index),
-                            window: gather.window,
-                        },
                     },
+                    // The windowless arm `G1-B` adds: the gather's own bytes, the
+                    // rows it states, and the fold the bind's lane asked for.
+                    None => gathered_texture_source(declaration.index, source, extent, fold)?,
                 }
             }
         };
@@ -5420,10 +5532,19 @@ struct SampledGather {
 /// that met it ([`SampledGatherExit`]) rather than one sentence for five
 /// shapes: the census reads the bucket, and a reader of the refusal reads which
 /// condition the stream is behind.
-fn sampled_gather_window(
+/// The rows one sampled gather's own span states, at the extent its declaration
+/// carries (`R36`, `G1-B`): `None` for the tight shape a lease window names, and
+/// the padded rows this class repacks when the guest stated a stride.
+///
+/// One derivation for the two readers, so a stride, a row count or a span this
+/// rail states cannot differ between what it binds and what it copies: the
+/// window arm ([`sampled_gather_window`], which needs the row count to decide
+/// *whether* a lease states these bytes at all) and `G1-B`'s copy arm (which
+/// needs it to repack them).
+fn sampled_rows(
     source: &GuestRunSource,
     extent: TextureExtent,
-) -> Result<SampledGather, SampledGatherExit> {
+) -> Result<SampledRows, SampledGatherExit> {
     let span = source.total_len;
     // The texture's own tightly packed row and extent: the two numbers a lease
     // window names, and the two a padded gather's copy is assembled from. An
@@ -5440,20 +5561,6 @@ fn sampled_gather_window(
             span,
             extent: tight_row,
         })?;
-    let Some(runs) = source.pages.as_ref() else {
-        return Err(SampledGatherExit::Unregistered);
-    };
-    let [only] = runs.as_slice() else {
-        return Err(SampledGatherExit::Scattered { runs: runs.len() });
-    };
-    // `single_stretch`'s own rule, one fact at a time: the window has to be the
-    // *first* run's bytes, which is what `window_offset == 0` names.
-    if only.window_offset != 0 {
-        return Err(SampledGatherExit::Scattered { runs: runs.len() });
-    }
-    let Some(window) = only.window else {
-        return Err(SampledGatherExit::Unregistered);
-    };
     // The span the gather's own window covers, and the stride when the guest's
     // rows are padded: the tightly packed extent is the whole answer when
     // `bufferRowLength` is zero, and a padded source states a row count this
@@ -5504,6 +5611,46 @@ fn sampled_gather_window(
             }
             Some(rows)
         }
+    };
+    Ok(SampledRows { tight, rows })
+}
+
+/// The two numbers one sampled gather's own span states (`G1-B`): the texture's
+/// tightly packed extent in bytes, and the padded rows when the guest stated a
+/// stride for them.
+struct SampledRows {
+    /// The bytes the texture's own extent holds — the number every trace-owned
+    /// arm carries and the number the window arm reads out of a registration.
+    tight: u64,
+    /// The guest's padded rows (`R36`), when `bufferRowLength` states a stride.
+    rows: Option<PaddedRows>,
+}
+
+/// The one window a sampled gather's registration names, when it names exactly
+/// one covering the texture's own bytes (`R28`, `R36`).
+fn sampled_gather_window(
+    source: &GuestRunSource,
+    extent: TextureExtent,
+) -> Result<SampledGather, SampledGatherExit> {
+    let span = source.total_len;
+    // The rows the source's own span states, and the extent they are repacked
+    // into: the same derivation `G1-B`'s copy arm takes, so a padded gather's
+    // stride and row count cannot be one thing where a lease would be cut and
+    // another where the runs are read.
+    let SampledRows { tight, rows } = sampled_rows(source, extent)?;
+    let Some(runs) = source.pages.as_ref() else {
+        return Err(SampledGatherExit::Unregistered);
+    };
+    let [only] = runs.as_slice() else {
+        return Err(SampledGatherExit::Scattered { runs: runs.len() });
+    };
+    // `single_stretch`'s own rule, one fact at a time: the window has to be the
+    // *first* run's bytes, which is what `window_offset == 0` names.
+    if only.window_offset != 0 {
+        return Err(SampledGatherExit::Scattered { runs: runs.len() });
+    }
+    let Some(window) = only.window else {
+        return Err(SampledGatherExit::Unregistered);
     };
     // The run states how many bytes it asked for, and this rail reads the whole
     // span out of it: a padded gather's window carries its padding, so the
@@ -5589,6 +5736,10 @@ enum SampledGatherExit {
     /// The window does not cover the span this gather reads from the texture's
     /// first byte.
     Window { head: u64, span: u64, window: u64 },
+    /// The runs the gather carries do not cover the span it states (`G1-B`):
+    /// the copy the class makes out of them would have to pad bytes no record
+    /// wrote, so the shape is refused rather than filled.
+    Uncovered { span: u64 },
 }
 
 impl SampledGatherExit {
@@ -5634,22 +5785,29 @@ impl SampledGatherExit {
                 "the texture starts {head} byte(s) into a {window} byte window, which does not \
                  hold the {span} byte(s) this gather reads from its own first byte",
             ),
+            Self::Uncovered { span } => format!(
+                "the runs the gather carries do not cover the {span} byte(s) its own window \
+                 states, and a copy that padded the rest would name bytes no record wrote"
+            ),
         }
     }
 }
 
 /// Where one admitted stream's bytes come from, arm by arm (`R9q`, `R11`,
-/// `R47`).
+/// `R47`, `G1-B`).
 ///
-/// The same two arms one stage buffer has ([`NarrowStageBuffer`]), on the same
+/// The same three arms one stage buffer has ([`NarrowStageBuffer`]), on the same
 /// rule: a stream the request already holds as staged bytes travels as
-/// trace-owned bytes, and a stream the draw path resolved through the zero-copy
+/// trace-owned bytes, a stream the draw path resolved through the zero-copy
 /// rail travels as the registered window its bind was cut from — the
 /// `BufferSource::BorrowedNoCopy` arm of the lease channel, imported by
 /// [`plan_owner_leases`] before the trace exists, exactly as a stage buffer's
-/// window is. Nothing is copied on either arm: the staged arm's bytes are the
-/// allocation the request already holds, and the window arm's are the owner's
-/// own mapping.
+/// window is — and, since `G1-B`, a gather the registration ledger names no
+/// window for at all travels as the copy this rail makes out of the runs the
+/// source already carries (`BufferSource::OwnedBytes`, the arm R47 gave the
+/// index stream and this increment gave the vertex stream too). Nothing is
+/// copied on the first two arms: the staged arm's bytes are the allocation the
+/// request already holds, and the window arm's are the owner's own mapping.
 ///
 /// One enum and not two, because the draw path hands both a vertex stream and
 /// an index buffer through the same zero-copy resolution
@@ -5662,17 +5820,26 @@ enum StreamSource<'a> {
     Staged(&'a [u8]),
     /// The registered guest RAM window the bind's bytes were cut from.
     Window(StageBufferWindow),
-    /// The bytes this class read out of that window's registration and states as
-    /// the trace's own (`R47`).
+    /// The bytes this class read and states as the trace's own (`R47`,
+    /// `G1-B`).
     ///
-    /// The third arm, and the index stream's alone: an affine stage-buffer
-    /// footprint is proved over the draw's own index values, and a *snapshot*
-    /// admits a trace before any registry exists — so the arm a provider's own
-    /// rail would resolve (the lease) is one the wire may not carry under that
-    /// declaration (`render_stage_buffer_footprint_unsupported`, E's
-    /// `admit_render_passes`). The bytes are the ones the window names, read by
-    /// [`read_index_window`] at the gate that proved the footprint, so the trace
-    /// and the proof state one frozen range.
+    /// Two readers mint this arm, and the same fact stands behind both: bytes
+    /// this rail has read have no registration arm the *admission* can carry.
+    ///
+    /// - **R47's affine read**: an affine stage-buffer footprint is proved over
+    ///   the draw's own index values, and a *snapshot* admits a trace before any
+    ///   registry exists — so the arm a provider's own rail would resolve (the
+    ///   lease) is one the wire may not carry under that declaration
+    ///   (`render_stage_buffer_footprint_unsupported`, E's
+    ///   `admit_render_passes`). The bytes are the ones the window names, read
+    ///   by [`read_index_window`] at the gate that proved the footprint, so the
+    ///   trace and the proof state one frozen range.
+    /// - **G1-B's windowless gather**: the ledger derives no window for the
+    ///   source at all (`host_pointer_import=disabled_by_env` is the production
+    ///   pose, and then it derives none for *any* bind), so the bytes are the
+    ///   runs' own, read by [`stream_run_bytes`] — the same bytes the engine's
+    ///   CPU staging arm gathers for the same bind — and the trace states them
+    ///   exactly as it states the request's own copy.
     Copied(Vec<u8>),
 }
 
@@ -5692,10 +5859,11 @@ impl StreamSource<'_> {
 
     /// The bytes this arm states as the trace's own, when it states any.
     ///
-    /// The request's staged copy and R47's copy out of a window's registration
-    /// are both views over the trace's own allocation; a window that still
-    /// travels as the owner's lease has none of its own — its bytes stay in the
-    /// registration and cross as that lease.
+    /// The request's staged copy, R47's copy out of a window's registration and
+    /// G1-B's copy out of a windowless gather's runs are all views over the
+    /// trace's own allocation; a window that still travels as the owner's lease
+    /// has none of its own — its bytes stay in the registration and cross as
+    /// that lease.
     fn trace_owned(&self) -> Option<&[u8]> {
         match self {
             Self::Staged(bytes) => Some(bytes),
@@ -5705,16 +5873,89 @@ impl StreamSource<'_> {
     }
 }
 
-/// The bytes one stream may be stated from, arm by arm (`R9q`, `R11`).
+/// The two census routes one stream shape's gathered-from-runs arm is counted
+/// under (`G1-B`).
+///
+/// One pair per stream shape rather than one pair for both, because the two are
+/// two shapes of one request: a draw has one index stream and up to four vertex
+/// streams, so a boot that reads one total could not say which half the copy
+/// serves — and the buckets they answer for are apart for the same reason
+/// (`..._index_staging` against `..._vertex_staging`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamStagingRoutes {
+    /// One count per bind that took the arm.
+    staged: &'static str,
+    /// The byte total beside it: how much the CPU gather carries for this shape.
+    bytes: &'static str,
+}
+
+/// The routes an index stream's own copy out of a windowless gather is read
+/// under, beside the bucket it lifts (`..._index_staging`).
+const INDEX_STREAM_STAGING: StreamStagingRoutes = StreamStagingRoutes {
+    staged: "render_provider_out_of_class_index_staging_staged",
+    bytes: "render_provider_out_of_class_index_staging_bytes",
+};
+
+/// The routes a vertex stream's own copy out of a windowless gather is read
+/// under, beside the bucket it lifts (`..._vertex_staging`).
+const VERTEX_STREAM_STAGING: StreamStagingRoutes = StreamStagingRoutes {
+    staged: "render_provider_out_of_class_vertex_staging_staged",
+    bytes: "render_provider_out_of_class_vertex_staging_bytes",
+};
+
+/// The bytes a stream's gather holds when the registration ledger derives no
+/// window for it at all (`G1-B`).
+///
+/// The stream half of `G1-A`'s arm, on the same fact and with the same
+/// reading: on a host whose device answer is
+/// `host_pointer_import=disabled_by_env` the ledger fills no `pages` for any
+/// gather, so every stream bind arrives with no window the seam can state
+/// (`gather_single_window` answers `None`) and the one carrier of these bytes
+/// is the source's own runs — the live host aliases of the guest's pages the
+/// engine's CPU staging arm walks beside it
+/// (`exec.rs`'s `write_staging_from_runs`).
+///
+/// The window test is [`gather_run_windows`]' own answer rather than
+/// [`gather_single_window`]'s: a source the ledger *does* name windows for is
+/// not this arm — one window is the borrowed arm above it, and a list of them
+/// is a scatter this class has no declaration for (the streams state one
+/// contiguous range, and the stage buffers' ordered run list is the arm that
+/// states several). Those keep the engine by name exactly as they did before
+/// this increment; what moves is the shape whose ledger says *no window at
+/// all*, which is every gathered stream in the production pose.
+///
+/// `None` is a source whose runs cannot cover `source_offset..+total_len`
+/// ([`stage_run_bytes`]' own fail-closed answer: no padding, no half copy), and
+/// each caller turns it into its own shape's named refusal.
+fn stream_run_bytes(source: &GuestRunSource, routes: StreamStagingRoutes) -> Option<Vec<u8>> {
+    if gather_run_windows(source).is_some() {
+        return None;
+    }
+    let copy = stage_run_bytes(source, source.total_len)?;
+    // The census' own reading of this arm: one route per bind that took it and
+    // one byte total beside it, so a boot can say how much of the streams' own
+    // traffic the CPU gather carries and what it costs per bind.
+    crate::runtime::drain::note_store_route(routes.staged);
+    crate::runtime::drain::note_store_route_n(
+        routes.bytes,
+        u64::try_from(copy.len()).unwrap_or(u64::MAX),
+    );
+    Some(copy)
+}
+
+/// The bytes one stream may be stated from, arm by arm (`R9q`, `R11`,
+/// `G1-B`).
 ///
 /// The decision itself, so the two shapes that reach it cannot disagree about
-/// which arms exist: staged bytes are trace-owned, and a zero-copy bind is the
+/// which arms exist: staged bytes are trace-owned, a zero-copy bind is the
 /// window the seam derives from the source's own gather
-/// ([`gather_single_window`]).
-/// `None` is every gather the seam cannot cut one window from — scattered over
-/// stretches, never registered under the current epoch, or with a bind reaching
-/// past its stretch's window — and each caller turns it into its own shape's
-/// named refusal, because the census reads the shape that crossed the device.
+/// ([`gather_single_window`]), and a gather that derivation answers `None` for —
+/// and that the ledger names no window for at all — is read out of its own runs
+/// and stated as the trace's own ([`stream_run_bytes`]).
+/// `None` is every gather this rail has no arm for — scattered over stretches
+/// the ledger names windows for, or with runs that do not cover the bind — and
+/// each caller turns it into its own shape's named refusal, because the census
+/// reads the shape that crossed the device.
 ///
 /// The single-window narrowing is deliberate and is *not* the stage-buffer
 /// arm's list (`E-TX6`): a stream is a fetch table or an index array the guest
@@ -5725,11 +5966,19 @@ impl StreamSource<'_> {
 /// the same declaration over arms the index stream's affine read-back (R47) and
 /// the texturing rails' reservation-start rule both read a single window
 /// through; the stage buffers' list arrives without either, which is why this
-/// increment stops there.
-fn stream_source(content: &BufferContent) -> Option<StreamSource<'_>> {
+/// increment stops there. `G1-B` does not widen that narrowing — it answers the
+/// arm the ledger leaves with *no* window, which is the arm the production pose
+/// puts every gathered stream in.
+fn stream_source<'a>(
+    content: &'a BufferContent,
+    routes: StreamStagingRoutes,
+) -> Option<StreamSource<'a>> {
     match content {
         BufferContent::Bytes(bytes) => Some(StreamSource::Staged(bytes)),
-        BufferContent::GuestRuns(source) => gather_single_window(source).map(StreamSource::Window),
+        BufferContent::GuestRuns(source) => match gather_single_window(source) {
+            Some(window) => Some(StreamSource::Window(window)),
+            None => stream_run_bytes(source, routes).map(StreamSource::Copied),
+        },
     }
 }
 
@@ -5748,19 +5997,22 @@ fn gather_single_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
     }
 }
 
-/// The source one request attribute's bytes may be stated from (`R9q`).
+/// The source one request attribute's bytes may be stated from (`R9q`,
+/// `G1-B`).
 ///
 /// Staged bytes are the pre-R9q arm unchanged. A zero-copy bind leaves through
-/// the window the seam derives from its own gather ([`gather_single_window`]); a
-/// gather the seam cannot cut one window from — scattered over stretches,
-/// never registered under the current epoch, or with a bind reaching past its
-/// stretch's window — keeps the draw on the engine under
-/// `render_provider_out_of_class_vertex_staging`, which is the bucket every
-/// gather answered with before this increment. The narrowing is the arm, not
-/// the rule: the class only claims a gather it can state as one contiguous
-/// registered window, and everything else stays where it was.
+/// the window the seam derives from its own gather ([`gather_single_window`]);
+/// a bind the ledger names no window for at all is read out of its own runs
+/// ([`stream_run_bytes`]) and stated as the trace's own. What still keeps the
+/// draw on the engine under `render_provider_out_of_class_vertex_staging` —
+/// the bucket every gather answered with before `R9q` — is the gather this rail
+/// has no arm for: a scatter over stretches the ledger *does* name windows for,
+/// or runs that do not cover the bind. Those two keep this refusal's own
+/// sentence, byte for byte; `G1-B`'s coverage half (a stream it read whose bytes
+/// do not cover the draw's span) answers the same slug with its own detail, so
+/// a census reads one bucket with two facts in it.
 fn vertex_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, OutOfClass> {
-    stream_source(content).ok_or_else(|| {
+    stream_source(content, VERTEX_STREAM_STAGING).ok_or_else(|| {
         OutOfClass::new(
             "render_provider_out_of_class_vertex_staging",
             "a vertex stream the GPU gathers from guest RAM stays on the engine when the \
@@ -5778,21 +6030,28 @@ fn vertex_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, Out
 /// indexed draw's buffer through the same zero-copy rail
 /// (`load_index_content_reason` → `load_buffer_content_resolved`), so an index
 /// bind can arrive as a gather for exactly the same reason a vertex bind does,
-/// and the window it can be stated from is derived by the same
-/// [`gather_single_window`]. Staged bytes are the pre-R11 arm unchanged; a gather the
-/// seam cannot cut one window from keeps the draw on the engine under
-/// `render_provider_out_of_class_index_staging`, the bucket every index gather
-/// answered with before this increment.
+/// and the arms it can be stated from are the same three: the same
+/// [`gather_single_window`], and the same [`stream_run_bytes`] for a gather the
+/// ledger names no window for. Staged bytes are the pre-R11 arm unchanged; what
+/// keeps the draw on the engine under
+/// `render_provider_out_of_class_index_staging` is the gather with neither arm —
+/// the bucket every index gather answered with before this increment.
 fn index_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, OutOfClass> {
-    stream_source(content).ok_or_else(index_staging_refusal)
+    stream_source(content, INDEX_STREAM_STAGING).ok_or_else(index_staging_refusal)
 }
 
 /// The index stream's own refusal for a gather no one registered window covers
-/// (`R11`).
+/// (`R11`, `G1-B`).
 ///
 /// One spelling for the two readers that ask the question: the index stream's
 /// own arm ([`index_stream_source`]) and the affine footprint's read of the same
-/// bytes ([`stage_buffer_affine_counts`]).
+/// bytes ([`stage_buffer_affine_counts`]). The sentence is `R11`'s, byte for
+/// byte: `G1-B` leaves the shapes it answers exactly where they were — the
+/// ledger names windows for a scatter this rail has no declaration for, and a
+/// source whose runs stop short of the bind is one no copy may pad — and the
+/// arms the increment *does* move carry their own details (the index view whose
+/// bytes do not cover the draw's indices, and the vertex stream whose bytes do
+/// not cover the draw's span).
 fn index_staging_refusal() -> OutOfClass {
     OutOfClass::new(
         "render_provider_out_of_class_index_staging",
@@ -8226,12 +8485,13 @@ fn highest_index(
 /// the same number.
 ///
 /// `Err` is the third answer, and it is about the index *view* rather than the
-/// number: a gather no one registered window covers, or a window whose bytes
-/// the owner rail will not hand back, is a shape with no source this rail can
-/// state ([`index_staging_refusal`]) — answered by name, because a proof
+/// number: a gather the rail has no arm for — one the ledger names *more* than
+/// one window for, or one whose runs stop short of the bind — or a window whose
+/// bytes the owner rail will not hand back, is a shape with no source this rail
+/// can state ([`index_staging_refusal`]) — answered by name, because a proof
 /// bounded on a guess is exactly what the contract refuses.
 ///
-/// # Why the window's bytes travel with the trace (`R47`)
+/// # Why the bytes the read returns travel with the trace (`R47`, `G1-B`)
 ///
 /// Reading them is not enough. A trace is admitted by a *snapshot* before any
 /// registry exists (`metal-api-core`'s `admit_render_passes` →
@@ -8239,7 +8499,8 @@ fn highest_index(
 /// refuses an affine footprint over an index view the trace does not carry by
 /// name (`render_stage_buffer_footprint_unsupported`: "the first stage-buffer
 /// increment does not evaluate" it). So the bytes this function reads out of a
-/// window are handed to the index arm, which states them as the trace's own
+/// window — or, since `G1-B`, out of a gather's own runs when the ledger names
+/// no window for it — are handed to the index arm, which states them as the trace's own
 /// ([`StreamSource::Copied`]) — the same arm the staged path already travels as,
 /// with the same bytes. Nothing the guest writes after this read can move the
 /// count the provider checks, which is what makes the two rails' arithmetic one
@@ -8259,21 +8520,27 @@ fn stage_buffer_affine_counts(
     let Some(index) = req.indexed.as_ref() else {
         return Ok(Some([u64::from(req.vertex_count), instances]));
     };
-    // The index view's own bytes, arm by arm (R11): staged bytes are the
-    // request's own allocation, and a zero-copy bind's window is read out of
-    // the registration that names it — once per gate evaluation, cached in
-    // `index_bytes`. A view this rail cannot read is refused here, by the index
-    // stream's own name, rather than bounded on a number nobody stated.
+    // The index view's own bytes, arm by arm (R11, G1-B): staged bytes are the
+    // request's own allocation, a zero-copy bind's window is read out of the
+    // registration that names it, and a gather the ledger names no window for
+    // is read out of the runs the source already carries — once per gate
+    // evaluation, cached in `index_bytes`, so the count this proof is bounded
+    // by and the bytes the index arm then states as the trace's own are one
+    // read of one range. A view this rail cannot read is refused here, by the
+    // index stream's own name, rather than bounded on a number nobody stated.
     let bytes: &[u8] = match &index.content {
         BufferContent::Bytes(bytes) => bytes.as_slice(),
         BufferContent::GuestRuns(source) => {
             if index_bytes.is_none() {
-                let window = gather_single_window(source).ok_or_else(index_staging_refusal)?;
-                *index_bytes = Some(read_index_window(window)?);
+                *index_bytes = Some(match gather_single_window(source) {
+                    Some(window) => read_index_window(window)?,
+                    None => stream_run_bytes(source, INDEX_STREAM_STAGING)
+                        .ok_or_else(index_staging_refusal)?,
+                });
             }
             index_bytes
                 .as_deref()
-                .expect("the window's bytes were read into the cache just above")
+                .expect("the index view's bytes were read into the cache just above")
         }
     };
     // The same reader the class's own span gate uses, so the highest index an
@@ -9772,6 +10039,7 @@ fn production_recordable(req: &DrawRequest, pass: &NarrowPass<'_>) -> bool {
             texture.source,
             NarrowTextureSource::Bytes(_)
                 | NarrowTextureSource::Frame(_)
+                | NarrowTextureSource::Gathered(_)
                 | NarrowTextureSource::Window { .. }
                 | NarrowTextureSource::Depadded { .. }
                 | NarrowTextureSource::Folded { .. }
@@ -13714,6 +13982,21 @@ enum NarrowTextureSource<'a> {
         /// Where the one-byte texels come from, at the lane's own width.
         texels: FoldedTexels<'a>,
     },
+    /// The texels this rail read out of the bind's **own live runs**, because
+    /// the gather carries no registration window at all (`G1-B`): the sampled
+    /// sibling of the two buffer streams' copy arm.
+    ///
+    /// The bytes are already in hand — the class gate read them
+    /// ([`stage_run_bytes`], the same walk the engine's CPU staging arm
+    /// performs) and made whatever the bind's own shape asked for: a tight
+    /// gather's extent, the guest's padded rows dropped, and R41's channel plan
+    /// folded last — so this variant carries finished texels and no window to
+    /// read later. The declaration states them through
+    /// `TextureSource::OwnedBytes`, exactly as the request's own copy, R24's
+    /// frame, R36's repacked rows and R41's folded plan do: no lease is minted
+    /// for this arm either, so a pass whose only guest-backed bind is one of
+    /// these keeps the in-process path.
+    Gathered(Vec<u8>),
 }
 
 /// Where the one-byte texels of a folded bind come from (R41).
@@ -13769,6 +14052,7 @@ impl NarrowTextureSource<'_> {
     ) -> Option<&'a [u8]> {
         match self {
             Self::Bytes(bytes) | Self::Frame(bytes) => Some(bytes),
+            Self::Gathered(bytes) => Some(bytes.as_slice()),
             Self::Depadded { .. } | Self::Folded { .. } => texture_copies.bytes(index),
             // E-TX15's snapshot carries no bytes of its own: what it reads is
             // the attachment's image, on the device, and the declaration names
@@ -15778,6 +16062,10 @@ fn narrow_class<'a>(
             // lease and the declaration would be refused by name there
             // (`render_stage_buffer_footprint_unsupported`). Every other
             // window-backed index bind keeps the lease arm it had.
+            // Whether the arm below is R47's read of a window (the bytes an
+            // affine proof already weighed) or the one this gate finds by
+            // itself — the fact the `G1-B` coverage rule further down reads.
+            let affine_index_read = index_window_bytes.is_some();
             let index_source = match index_window_bytes {
                 Some(bytes) => StreamSource::Copied(bytes),
                 None => index_stream_source(&index.content)?,
@@ -15787,6 +16075,44 @@ fn narrow_class<'a>(
                     "render_provider_out_of_class_index_empty",
                     "an empty index stream stays on the engine",
                 ));
+            }
+            // G1-B: the index bytes this increment reads itself owe the
+            // provider's own index-footprint rule.
+            //
+            // Admission proves the index view holds the `index_count` indices
+            // the draw names, at the format's own width
+            // (`render_index_buffer_footprint_unsupported`), before it decodes
+            // one — and a provider decline is not a fallback: the draw is
+            // *skipped* rather than run on the engine (`runtime/draw/vulkan.rs`).
+            // So a stream this rail read out of a gather may not be the reason
+            // the class hands admission a pass it can only lose. Only this
+            // increment's own arm is weighed here: the staged and window arms
+            // are the shapes the class has always admitted, and R47's read is
+            // proved by the very arithmetic that made it read the bytes
+            // (`highest_index` answers `None` for a window that stops short, and
+            // the affine gate then refuses the footprint).
+            if !affine_index_read && matches!(index_source, StreamSource::Copied(_)) {
+                // The width the contract itself states for the format this
+                // draw declared, rather than a second copy of the two numbers.
+                let width = index_format.bytes();
+                let required = u64::from(index.index_count).saturating_mul(width);
+                if index_source.len() < required {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_index_staging",
+                        format!(
+                            "an index stream the GPU gathers from guest RAM stays on the engine \
+                             when the bytes this rail read out of the gather do not cover the \
+                             draw's own indices: the gather holds {} byte(s) for the {} index \
+                             value(s) the draw names at {width} byte(s) each ({required} byte(s)), \
+                             and admission proves the index view against exactly that extent \
+                             (`render_index_buffer_footprint_unsupported`) — a refusal there is a \
+                             lost draw rather than a fallback, so this class does not hand \
+                             admission a pass it can only lose",
+                            index_source.len(),
+                            index.index_count,
+                        ),
+                    ));
+                }
             }
             // The highest vertex this draw's own index bytes name, read once
             // here because the surplus-stream span proof below needs it and this
@@ -15936,6 +16262,67 @@ fn narrow_class<'a>(
         }
     }
 
+    // G1-B: the streams this increment *reads* owe the provider's own coverage
+    // proof, and this is the one place both of its numbers are in hand.
+    //
+    // R-VI1's rule below is scoped to the *surplus* streams on its own reading:
+    // the same proof over a stream the module reads is a gap this class has
+    // always had, for every arm it has always admitted. A stream G1-B newly
+    // reads is not one of those arms — this rail read these bytes itself, and a
+    // draw it hands admission without the coverage admission proves
+    // (`render_vertex_buffer_footprint_unsupported`: every index the draw names
+    // has to land inside `view.length / stride`, per non-per-instance stream) is
+    // a draw the class *loses* rather than one it leaves on the engine. So a
+    // copy-arm stream is weighed here, over the highest vertex the draw's own
+    // index bytes name, and answered by the stream's own bucket name when it
+    // does not cover that span.
+    //
+    // The number is the one the surplus rule reads, so the two rules cannot
+    // disagree about the span. `None` is the index stream that still travels as
+    // the owner's lease (`R11`): this rail has not read those index values, so a
+    // copy-arm stream beside one cannot be proved at all — and a proof that
+    // cannot be made is not one to guess at, so that draw keeps the engine too.
+    // Both halves fail closed in the same direction: the engine draws, nothing
+    // is skipped.
+    if req.indexed.is_some() {
+        for stream in &vertex_streams {
+            if !matches!(stream.source, StreamSource::Copied(_)) {
+                continue;
+            }
+            let capacity = stream.source.len() / stream.stride.max(1);
+            let Some(highest) = index_highest else {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_vertex_staging",
+                    format!(
+                        "a vertex stream the GPU gathers from guest RAM stays on the engine when \
+                         the draw's own index stream is one this rail has not read: the stream's \
+                         bytes are the runs this class just read ({capacity} record(s) of {} \
+                         byte(s)), while the index stream still travels as the owner's lease — so \
+                         the span admission proves every declared stream against is not in hand, \
+                         and a draw handed over on a guess the provider may refuse is a lost draw \
+                         rather than a fallback",
+                        stream.stride,
+                    ),
+                ));
+            };
+            if highest >= capacity {
+                return Err(OutOfClass::owned(
+                    "render_provider_out_of_class_vertex_staging",
+                    format!(
+                        "a vertex stream the GPU gathers from guest RAM stays on the engine when \
+                         the bytes this rail read out of the gather do not cover the draw's own \
+                         span: the stream holds {capacity} record(s) of {} byte(s) while the \
+                         draw's index stream names vertex {highest}, and admission proves every \
+                         declared stream against that span \
+                         (`render_vertex_buffer_footprint_unsupported`) — a refusal there is a \
+                         lost draw rather than a fallback, so this class does not hand admission \
+                         a pass it can only lose",
+                        stream.stride,
+                    ),
+                ));
+            }
+        }
+    }
     // R-VI1: a declared attribute the vertex stage never reads may not be able
     // to *refuse* the draw it is ignored by. Admission proves every stream the
     // pipeline declares against the draw's own span — the highest vertex the
@@ -16837,6 +17224,7 @@ fn submit_narrow(
             // number.
             NarrowTextureSource::Bytes(_)
             | NarrowTextureSource::Frame(_)
+            | NarrowTextureSource::Gathered(_)
             | NarrowTextureSource::Depadded { .. }
             | NarrowTextureSource::Folded { .. } => (
                 ViewId::new(next_view),
@@ -19326,30 +19714,54 @@ mod stage_buffer_affine_count_tests {
         );
     }
 
-    /// R47: the index view this proof reads is the one the index stream itself
-    /// is stated from, and a view that is no source at all is refused **by
-    /// name** — never bounded on a guess.
+    /// R47 and `G1-B`: the index view this proof reads is the one the index
+    /// stream itself is stated from, and a view with no *readable* source is
+    /// refused **by name** — never bounded on a guess.
     ///
-    /// The two refusals are the two facts behind `index_staging`: a gather no
-    /// one registered window covers (`pages` absent, the synthetic and
-    /// unimported reading), and a window whose import the owner rail does not
-    /// hold. Both answer the index stream's own bucket, which is also what the
-    /// same draw answers when no affine declaration asks for these bytes at
-    /// all — one shape, one name.
+    /// Two facts behind `index_staging`. A gather the registration ledger names
+    /// no window for is read out of its own runs since `G1-B` — the runs are
+    /// live host aliases (`GuestRun`'s own obligation, which is why the fixture
+    /// below points at a real buffer and not at an address) — so the count this
+    /// proof is bounded by is the one those bytes state. A source whose runs
+    /// stop short of the view is a copy that would have to pad bytes no record
+    /// wrote, and it answers the index stream's own bucket — which is also what
+    /// the same draw answers when no affine declaration asks for these bytes at
+    /// all: one shape, one name.
     #[test]
     fn an_index_view_with_no_source_is_refused_under_the_index_streams_own_name() {
-        let gathered = BufferContent::GuestRuns(GuestRunSource {
-            runs: std::sync::Arc::new(vec![
-                GuestRun::whole(0x1000, 12).expect("a fixture run covers its own span")
-            ]),
-            source_offset: 0,
-            total_len: 12,
-            row_length_texels: 0,
-            pages: None,
-            direct_image: None,
-        });
-        let error = counts(&indexed(gathered, 3, 0))
-            .expect_err("a gather no registered window covers has no source");
+        // The indices the counts are read out of, in a mapping the reader may
+        // dereference: `{ 0, 5, 2 }` names vertex 5, so the indexed arm's axis 0
+        // is six vertices.
+        let indices: Vec<u8> = [0u32, 5, 2]
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        let gathered = |runs: Vec<GuestRun>, total_len: u64| {
+            BufferContent::GuestRuns(GuestRunSource {
+                runs: std::sync::Arc::new(runs),
+                source_offset: 0,
+                total_len,
+                row_length_texels: 0,
+                pages: None,
+                direct_image: None,
+            })
+        };
+        let live = |len: u64| {
+            GuestRun::whole(indices.as_ptr() as usize, len).expect("the buffer covers the run")
+        };
+
+        assert_eq!(
+            counts(&indexed(
+                gathered(vec![live(indices.len() as u64)], 12),
+                3,
+                0
+            )),
+            Ok(Some([6, 1])),
+            "a windowless gather is read out of its own runs since G1-B, and the count is theirs"
+        );
+
+        let error = counts(&indexed(gathered(vec![live(4)], 12), 3, 0))
+            .expect_err("a gather whose runs stop short of the view has no source");
         assert_eq!(error.slug(), "render_provider_out_of_class_index_staging");
         assert!(
             error.detail().contains("not one registered window"),

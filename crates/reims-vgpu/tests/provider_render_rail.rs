@@ -22199,18 +22199,23 @@ fn an_affine_stage_buffer_is_proved_over_the_window_a_zero_copy_index_view_names
     );
 }
 
-/// R47's fail-closed half: an index view this rail has no source for keeps the
-/// draw on the engine **by name**, with no submission behind it.
+/// R47's fail-closed half, beside `G1-B`'s: an index view this rail has no
+/// readable source for keeps the draw on the engine **by name**, with no
+/// submission behind it.
 ///
 /// The two facts are the two the index stream itself answers
-/// (`index_staging`): a gather no one registered window covers — the reading
-/// the ledger leaves when it derived no window at all — and a window whose
-/// bytes the owner rail will not hand back. The second is the one R47 adds to
-/// this bucket: the proof needs the bytes the *view* reads, and a registration
-/// that does not hold them is a count nothing states. Answered rather than
-/// skipped, because the alternative is not a guess but a lost draw: the owner
-/// plan would refuse the same window later, and a provider decline on an
-/// in-class draw is a frame nobody lands.
+/// (`index_staging`): a gather whose runs stop short of the view — the shape
+/// `G1-B` answers with the bucket's own unchanged sentence, because a copy may
+/// not pad bytes no record wrote — and a window whose bytes the owner rail will
+/// not hand back. The second is the one R47 adds to this bucket: the proof needs
+/// the bytes the *view* reads, and a registration that does not hold them is a
+/// count nothing states. Answered rather than skipped, because the alternative
+/// is not a guess but a lost draw: the owner plan would refuse the same window
+/// later, and a provider decline on an in-class draw is a frame nobody lands.
+///
+/// The gather the *ledger* leaves windowless whose runs **do** hold the view is
+/// the shape `G1-B` moves, and it has its own test
+/// (`an_index_gather_the_ledger_leaves_windowless_is_gathered_from_its_runs`).
 #[test]
 fn an_affine_stage_buffer_keeps_the_engine_when_the_index_window_cannot_be_read() {
     use reims_vgpu::backend::provider_compute::host_import_alignment;
@@ -22304,19 +22309,30 @@ fn an_affine_stage_buffer_keeps_the_engine_when_the_index_window_cannot_be_read(
         }
     };
 
-    // The ledger derived no window for this run: the gather is not one
-    // registered window, which is the shape this bucket has always answered.
-    let unwindowed = gather(vec![GuestWindowRun {
-        window_offset: 0,
-        guest: guest(),
-        window: None,
-    }]);
-    let (slug, detail) = answer("index run without a window", &unwindowed);
+    // No window *and* runs that stop two indices short of the view: the copy
+    // `G1-B` makes is the only arm such a source could take, and a run list that
+    // cannot cover the bind is one no copy may pad — so the draw keeps the
+    // engine under the bucket's own sentence, byte for byte.
+    let short_runs = engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            base,
+            2 * page as u64,
+            0,
+            8,
+        )
+        .expect("the run is inside the mapping")]),
+        source_offset: 0,
+        total_len: INDEX_BYTES.len() as u64,
+        row_length_texels: 0,
+        pages: None,
+        direct_image: None,
+    };
+    let (slug, detail) = answer("index runs short of the view", &short_runs);
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_index_staging");
     assert!(
         detail.contains("not one registered window"),
-        "the sentence is the index stream's own: {detail}"
+        "the sentence is the index stream's own, unchanged by G1-B: {detail}"
     );
 
     // The window exists, and the registration that names it does not hold the
@@ -22559,20 +22575,26 @@ fn an_unaligned_index_stream_window_is_copied_into_the_owner_staged_arm() {
     );
 }
 
-/// R11's refusal half: an index gather the seam cannot cut one registered
-/// window from stays on the engine, each under the bucket its own fact names.
+/// R11's refusal half, beside `G1-B`'s: what is left of the index gathers the
+/// seam cannot state stays on the engine, each under the bucket its own fact
+/// names.
 ///
-/// The same three shapes R9q's refusal half drives for a vertex stream, on the
-/// arm this increment moved: bytes scattered over more than one run, a run
-/// whose import the registration ledger never registered, and a bind whose
+/// Two facts, two buckets. A gather whose **runs stop short of the view** is the
+/// shape `G1-B` leaves exactly where it was — the copy it makes may not pad
+/// bytes no record wrote, and the sentence is the index stream's own, byte for
+/// byte — and it answers `render_provider_out_of_class_index_staging`, the
+/// bucket every index gather answered with before `R11`. A bind whose
 /// `source_offset` leaves the view's own host pointer off the device's import
-/// granule beside an import the owner rail was never handed. The first two
-/// answer `render_provider_out_of_class_index_staging` — the bucket every index
-/// gather answered with before this increment — and the third answers
+/// granule, beside an import the owner rail was never handed, answers
 /// `render_provider_out_of_class_index_alignment`, the *unreadable* window's
 /// bucket since R18: an off-granule window the rail can read is copied into the
 /// staged arm (`an_unaligned_index_stream_window_is_copied_into_the_owner_staged_arm`),
 /// and only one with no registration to read from keeps the draw on the engine.
+///
+/// The scatter over more than one run and the run the ledger never registered
+/// are the shapes this increment moves: neither derives a window the seam can
+/// state, and both are now read out of the runs they carry
+/// (`an_index_gather_the_ledger_leaves_windowless_is_gathered_from_its_runs`).
 #[test]
 fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     use reims_vgpu::backend::provider_compute::host_import_alignment;
@@ -22653,42 +22675,33 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     };
     let delivered = provider_render::provider_submissions();
 
-    // Scattered: two runs tile the bind, so no single host range is its bytes.
-    let scattered = gather(
-        0,
-        vec![
-            GuestWindowRun {
-                window_offset: 0,
-                guest: guest(),
-                window: Some(registered),
-            },
-            GuestWindowRun {
-                window_offset: 6,
-                guest: guest(),
-                window: Some(registered),
-            },
-        ],
-    );
-    let (slug, detail) = answer("scattered index gather", &scattered);
+    // No window, and a run that stops two indices short of the view: the copy
+    // `G1-B` makes is the only arm such a source could take, and a run list that
+    // cannot cover the bind is one no copy may pad — so the draw keeps the
+    // engine under the bucket's own sentence, byte for byte. (The windowless
+    // source whose run *does* hold the view is the shape the increment moves:
+    // `an_index_gather_the_ledger_leaves_windowless_is_gathered_from_its_runs`.)
+    let short_runs = engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            owner.pointer as usize,
+            2 * page as u64,
+            0,
+            8,
+        )
+        .expect("the run is inside the mapping")]),
+        source_offset: 0,
+        total_len: INDEX_BYTES.len() as u64,
+        row_length_texels: 0,
+        pages: None,
+        direct_image: None,
+    };
+    let (slug, detail) = answer("index runs short of the view", &short_runs);
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_index_staging");
     assert!(
         detail.contains("gathers from guest RAM"),
         "the sentence names the gather: {detail}"
     );
-
-    // Unregistered: the ledger derived no window for this run.
-    let unregistered = gather(
-        0,
-        vec![GuestWindowRun {
-            window_offset: 0,
-            guest: guest(),
-            window: None,
-        }],
-    );
-    let (slug, detail) = answer("unregistered index gather", &unregistered);
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_index_staging");
 
     // Off-granule: the bind starts inside the window, so the view's own host
     // pointer is not a whole number of the device's import granules — and this
@@ -22716,7 +22729,7 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
 
     // Both buckets are counters, not latches, and no refused shape reaches the
     // provider.
-    assert!(route_count("render_provider_out_of_class_index_staging") >= 2);
+    assert!(route_count("render_provider_out_of_class_index_staging") >= 1);
     assert!(route_count("render_provider_out_of_class_index_alignment") >= 1);
     assert_eq!(
         provider_render::provider_submissions(),
@@ -22724,6 +22737,191 @@ fn an_index_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
         "a refused index gather never reaches the provider"
     );
     assert_eq!(registered.import.get(), import_id);
+}
+
+/// G1-B: an index gather the ledger names **no window** for is gathered out of
+/// its own runs, and the frame that comes out is the engine's own frame for the
+/// same view, byte for byte.
+///
+/// This is the production shape, and the census' largest door: with
+/// `host_pointer_import=disabled_by_env` the ledger derives no window for *any*
+/// gather, and one `g1a` boot read **102 588** refusals in
+/// `render_provider_out_of_class_index_staging` — 434.7 a window, and the
+/// population `G1-A`'s arm uncovered when it emptied the stage-buffer bucket
+/// (`evidence/gate3-census-g1a-2026-09-20`).
+///
+/// The bytes read are `source_offset .. source_offset + total_len` across the
+/// runs the source already carries, which is the same walk the engine's own CPU
+/// staging arm performs for the same bind — so the two frames are one frame.
+/// Four facts are checked at once: the frame; its freshness (moving the runs'
+/// bytes moves the next frame, so the copy is made per submission and not
+/// cached); the *absence* of an owner plan (the bytes are stated as the trace's
+/// own, R47's arm, so nothing crosses the owner→provider wire and no lease is
+/// minted); and the census (the new arm's routes count the binds and the bytes
+/// it carried).
+#[test]
+fn an_index_gather_the_ledger_leaves_windowless_is_gathered_from_its_runs() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The mapping holds the reviewed triangle's own indices, `[0, 1, 2]`.
+    owner.as_mut_slice()[..INDEX_BYTES.len()].copy_from_slice(&INDEX_BYTES);
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    // The source the draw path builds for this bind in the production pose: one
+    // live host run over the view's own bytes, and no `pages` — the reading a
+    // host that cannot register an import gives every gather.
+    let production = || {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                mapping,
+                mapping_len,
+                0,
+                INDEX_BYTES.len() as u64,
+            )
+            .expect("the index view's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: INDEX_BYTES.len() as u64,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        })
+    };
+    let request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.indexed = Some(IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    // The moved reading: the third index names the first vertex, so the draw
+    // covers no area at all and the frame is the clear colour. Both engine
+    // frames are taken before the provider's device exists, which is when the
+    // engine rail is reachable from a test.
+    let mut moved = INDEX_BYTES;
+    moved[8..12].copy_from_slice(&0u32.to_ne_bytes());
+    let Some(engine_frame) =
+        engine_pixels("windowless index gather", &stages, request(&production()))
+    else {
+        return;
+    };
+    owner.as_mut_slice()[..moved.len()].copy_from_slice(&moved);
+    let Some(moved_engine_frame) =
+        engine_pixels("moved index gather", &stages, request(&production()))
+    else {
+        return;
+    };
+    owner.as_mut_slice()[..INDEX_BYTES.len()].copy_from_slice(&INDEX_BYTES);
+    let frame = |label: &str, content: &BufferContent| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(content),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: an index gather whose runs hold these bytes is in class since G1-B: \
+                 {other:?}"
+            ),
+        }
+    };
+    let delivered = provider_render::provider_submissions();
+    let staged_before = route_count("render_provider_out_of_class_index_staging_staged");
+    let staged_bytes_before = route_count("render_provider_out_of_class_index_staging_bytes");
+
+    let shaded = frame("no-window index gather", &production());
+    eprintln!(
+        "windowless index gather: device host-import alignment = {alignment}; {} byte(s) of \
+         index view over one run at the owner's own mapping, with no `pages` and no window; \
+         texel (0, 0) {:?}",
+        INDEX_BYTES.len(),
+        texel_at(&shaded, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&shaded, 0, 0),
+        FRAGMENT_TEXEL,
+        "the copy read the runs' own indices"
+    );
+    assert_frames_equal(
+        "windowless index gather, both rails",
+        &shaded,
+        &engine_frame,
+    );
+
+    // The arm's own reading, where it is decidable: these bytes travel as the
+    // *trace's own* (R47's arm for an index view a snapshot admission has to be
+    // able to evaluate), so the pass states no lease at all — and `submit_render`
+    // writes an owner→provider frame only when the plan states leases. The
+    // submission therefore stays the in-process trace it was before R9h, which
+    // is the cheapest shape this class has for these bytes: `G1-A`'s
+    // stage-buffer arm pays a staged lease here, and this arm pays none.
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts();
+    let captured = frame("captured", &production());
+    let wire_frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert_frames_equal(
+        "the captured windowless index gather, both rails",
+        &captured,
+        &engine_frame,
+    );
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before.submit_frames,
+        "a copy stated as the trace's own bytes mints no lease and writes no frame"
+    );
+    assert!(
+        wire_frames.is_empty(),
+        "and the capture holds no frame for it"
+    );
+
+    // The falsifiable half: the copy is made per submission, so moving the
+    // guest's own bytes moves the frame — the freshness the GPU gather arm has,
+    // and not a cached read that would keep drawing the indices it saw first.
+    owner.as_mut_slice()[..moved.len()].copy_from_slice(&moved);
+    let collapsed = frame("index gather after the indices moved", &production());
+    eprintln!(
+        "provider texel after moving the third index: {:?}",
+        texel_at(&collapsed, 0, 0),
+    );
+    assert_frames_equal(
+        "the moved index gather, both rails",
+        &collapsed,
+        &moved_engine_frame,
+    );
+    assert_frames_differ("the copy follows the runs' bytes", &shaded, &collapsed);
+    owner.as_mut_slice()[..INDEX_BYTES.len()].copy_from_slice(&INDEX_BYTES);
+
+    // The census: one route per bind that took the arm, one byte total beside
+    // it. Three submissions took it above, so both counters move by at least
+    // that.
+    let staged = route_count("render_provider_out_of_class_index_staging_staged");
+    let staged_bytes = route_count("render_provider_out_of_class_index_staging_bytes");
+    eprintln!(
+        "index-staging census: binds={} bytes={} (bytes per bind {})",
+        staged - staged_before,
+        staged_bytes - staged_bytes_before,
+        (staged_bytes - staged_bytes_before) / (staged - staged_before).max(1),
+    );
+    assert!(
+        staged - staged_before >= 3,
+        "every submission that took the arm is counted"
+    );
+    assert_eq!(
+        staged_bytes - staged_bytes_before,
+        (staged - staged_before) * INDEX_BYTES.len() as u64,
+        "and each of them charges the copy's own bytes"
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
 }
 
 /// R18: the same staged answer for a **vertex stream** the device cannot import
@@ -22994,19 +23192,27 @@ fn an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm() {
     );
 }
 
-/// R9q's refusal half: a vertex gather the seam cannot cut one registered
-/// window from stays on the engine, each under the bucket its own fact names.
+/// R9q's refusal half, beside `G1-B`'s: what is left of the vertex gathers the
+/// seam cannot state stays on the engine, each under the bucket its own fact
+/// names.
 ///
-/// The same three shapes R9e's refusal half drives for a stage buffer, on the
-/// arm this increment moved: bytes scattered over more than one run, a run
-/// whose import the registration ledger never registered, and a bind whose
-/// `source_offset` leaves the view's own host pointer off the device's import
-/// granule beside an import the owner rail was never handed. The first two
-/// answer `render_provider_out_of_class_vertex_staging` — the bucket every
-/// gather answered with before this increment — and the third answers
-/// `render_provider_out_of_class_vertex_alignment`, the *unreadable* window's
-/// bucket since R18: an off-granule window the rail can read is copied into the
-/// staged arm (`an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm`),
+/// Three shapes, two buckets. A gather whose **runs stop short of the bind** is
+/// the one `G1-B` leaves exactly where it was — the copy may not pad bytes no
+/// record wrote, and the sentence is the stream's own, byte for byte. A gather
+/// the ledger derives no window for *is* read by this increment, so the two
+/// windowless fixtures below are refused for the reason that arm owes: its bytes
+/// are in hand, and a stream the class read may not be the reason the provider
+/// declines the draw it was handed (`render_vertex_buffer_footprint_unsupported`
+/// — the stream here holds two records while the draw's index stream names
+/// vertex two). Both answer `render_provider_out_of_class_vertex_staging`, the
+/// bucket every gather answered with before `R9q`.
+///
+/// The third shape answers `render_provider_out_of_class_vertex_alignment`, the
+/// *unreadable* window's bucket since R18: a bind whose `source_offset` leaves
+/// the view's own host pointer off the device's import granules, beside an
+/// import the owner rail was never handed. An off-granule window the rail *can*
+/// read is copied into the staged arm
+/// (`an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm`),
 /// and only one with no registration to read from keeps the draw on the engine.
 #[test]
 fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
@@ -23093,7 +23299,35 @@ fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     };
     let delivered = provider_render::provider_submissions();
 
-    // Scattered: two runs tile the bind, so no single host range is its bytes.
+    // The runs hold fewer bytes than the bind: 16 byte(s) of stream over one
+    // 8 byte run. `G1-B`'s copy stops where the runs stop, and the remainder is
+    // not a byte any record wrote — so the source is refused rather than padded,
+    // under the sentence this bucket has always carried.
+    let short_runs = engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            owner.pointer as usize,
+            2 * page as u64,
+            0,
+            8,
+        )
+        .expect("the run is inside the mapping")]),
+        source_offset: 0,
+        total_len: 16,
+        row_length_texels: 0,
+        pages: None,
+        direct_image: None,
+    };
+    let (slug, detail) = answer("vertex runs short of the stream", &short_runs);
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_vertex_staging");
+    assert!(
+        detail.contains("gathers from guest RAM"),
+        "the sentence names the gather: {detail}"
+    );
+
+    // Scattered: two page runs tile the bind, so the seam can state no single
+    // window for it — and the stream's own bytes stop short of the span this
+    // draw names, which is `G1-B`'s own coverage rule.
     let scattered = gather(
         0,
         vec![
@@ -23113,11 +23347,12 @@ fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_vertex_staging");
     assert!(
-        detail.contains("gathers from guest RAM"),
-        "the sentence names the gather: {detail}"
+        detail.contains("gathers from guest RAM") && detail.contains("the draw's own span"),
+        "the sentence names the gather and the span it missed: {detail}"
     );
 
-    // Unregistered: the ledger derived no window for this run.
+    // Unregistered: the ledger derived no window for this run — the same
+    // coverage answer on the arm the production pose puts every gather in.
     let unregistered = gather(
         0,
         vec![GuestWindowRun {
@@ -23129,6 +23364,10 @@ fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     let (slug, detail) = answer("unregistered vertex gather", &unregistered);
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_vertex_staging");
+    assert!(
+        detail.contains("the draw's own span"),
+        "the coverage half of the bucket answers here: {detail}"
+    );
 
     // Off-granule: the bind starts inside the window, so the view's own host
     // pointer is not a whole number of the device's import granules — and this
@@ -23164,6 +23403,198 @@ fn a_vertex_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
         "a refused vertex gather never reaches the provider"
     );
     assert_eq!(registered.import.get(), import_id);
+}
+
+/// G1-B: the vertex half of the same arm — a stream the ledger names **no
+/// window** for is gathered out of its own runs, and the frame that comes out
+/// is the engine's own frame for the same bind, byte for byte.
+///
+/// The census read **2 450** refusals in
+/// `render_provider_out_of_class_vertex_staging` in the `g1a` boot — 10.4 a
+/// window — which is the vertex population `G1-A`'s arm uncovered when it
+/// emptied the stage-buffer bucket (`evidence/gate3-census-g1a-2026-09-20`).
+/// The stream here is the reviewed triangle's own three `float2` records, the
+/// shape a draw's position table really is: a `[[buffer(n)]]`-free pipeline
+/// whose one fetch table the guest bound once.
+///
+/// Four facts, the same four the index half checks: the frame, its freshness
+/// (moving the runs' bytes moves the next frame), the *absence* of an owner plan
+/// (the stream is stated as the trace's own bytes, so no lease is minted and
+/// nothing crosses the owner→provider wire), and the census (the new arm's
+/// routes count the binds and the bytes). One fact is the vertex half's
+/// own and is *not* shared with the index stream: `G1-B` proves a stream it
+/// reads against the draw's span before admitting it (a provider decline is a
+/// lost draw, not a fallback), which is why the coverage rule's own fixture is
+/// the refusal test beside this one.
+#[test]
+fn a_vertex_stream_the_ledger_leaves_windowless_is_gathered_from_its_runs() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    /// Three `float2` records: the reviewed full-screen triangle's own stream.
+    const STREAM_BYTES: u64 = 24;
+
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The mapping holds the triangle's three positions, which is what the
+    // vertex stage fetches — and so what both rails must land.
+    owner.as_mut_slice()[..STREAM_BYTES as usize].copy_from_slice(&position_records());
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    // The production source: one live host run over the stream's own bytes, and
+    // no `pages` — the reading a host that cannot register an import gives
+    // every gather.
+    let production = || {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                mapping,
+                mapping_len,
+                0,
+                STREAM_BYTES,
+            )
+            .expect("the stream's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: STREAM_BYTES,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        })
+    };
+    let request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes = vec![VertexAttributeResource {
+            location: 0,
+            binding: 0,
+            format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+                .expect("Float2 is a vertex format"),
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: content.clone(),
+        }];
+        req
+    };
+    // The moved reading: the first vertex *is* the second, so the triangle
+    // collapses and the frame is the clear colour. Both engine frames are taken
+    // before the provider's device exists, which is when the engine rail is
+    // reachable from a test.
+    let mut moved = position_records();
+    let second_record = moved[8..16].to_vec();
+    moved[..8].copy_from_slice(&second_record);
+    let Some(engine_frame) =
+        engine_pixels("windowless vertex stream", &stages, request(&production()))
+    else {
+        return;
+    };
+    owner.as_mut_slice()[..STREAM_BYTES as usize].copy_from_slice(&moved);
+    let Some(moved_engine_frame) =
+        engine_pixels("moved vertex stream", &stages, request(&production()))
+    else {
+        return;
+    };
+    owner.as_mut_slice()[..STREAM_BYTES as usize].copy_from_slice(&position_records());
+    let frame = |label: &str, content: &BufferContent| -> Vec<u8> {
+        match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(content),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a vertex stream whose runs hold these bytes is in class since G1-B: \
+                 {other:?}"
+            ),
+        }
+    };
+    let delivered = provider_render::provider_submissions();
+    let staged_before = route_count("render_provider_out_of_class_vertex_staging_staged");
+    let staged_bytes_before = route_count("render_provider_out_of_class_vertex_staging_bytes");
+
+    let shaded = frame("no-window vertex stream", &production());
+    eprintln!(
+        "windowless vertex stream: device host-import alignment = {alignment}; {STREAM_BYTES} \
+         byte(s) of stream over one run at the owner's own mapping, with no `pages` and no \
+         window; texel (0, 0) {:?}",
+        texel_at(&shaded, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&shaded, 0, 0),
+        FRAGMENT_TEXEL,
+        "the copy read the runs' own positions"
+    );
+    assert_frames_equal(
+        "windowless vertex stream, both rails",
+        &shaded,
+        &engine_frame,
+    );
+
+    // The arm's own reading, where it is decidable: the stream's bytes are the
+    // trace's own (`BufferSource::OwnedBytes` — the arm an in-process trace
+    // states for any copy this rail reads), so the pass states no lease and
+    // `submit_render` writes no owner→provider frame for it. Here too the
+    // submission stays the in-process trace it was before R9h.
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts();
+    let captured = frame("captured", &production());
+    let wire_frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert_frames_equal(
+        "the captured windowless vertex stream, both rails",
+        &captured,
+        &engine_frame,
+    );
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before.submit_frames,
+        "a copy stated as the trace's own bytes mints no lease and writes no frame"
+    );
+    assert!(
+        wire_frames.is_empty(),
+        "and the capture holds no frame for it"
+    );
+
+    // The falsifiable half: the copy is made per submission, so moving the
+    // guest's own bytes moves the frame.
+    owner.as_mut_slice()[..STREAM_BYTES as usize].copy_from_slice(&moved);
+    let collapsed = frame("vertex stream after the positions moved", &production());
+    eprintln!(
+        "provider texel after moving the first position onto the second: {:?}",
+        texel_at(&collapsed, 0, 0),
+    );
+    assert_frames_equal(
+        "the moved vertex stream, both rails",
+        &collapsed,
+        &moved_engine_frame,
+    );
+    assert_frames_differ("the copy follows the runs' bytes", &shaded, &collapsed);
+    owner.as_mut_slice()[..STREAM_BYTES as usize].copy_from_slice(&position_records());
+
+    // The census: one route per bind that took the arm, one byte total beside
+    // it. Three submissions took it above, so both counters move by at least
+    // that.
+    let staged = route_count("render_provider_out_of_class_vertex_staging_staged");
+    let staged_bytes = route_count("render_provider_out_of_class_vertex_staging_bytes");
+    eprintln!(
+        "vertex-staging census: binds={} bytes={} (bytes per bind {})",
+        staged - staged_before,
+        staged_bytes - staged_bytes_before,
+        (staged_bytes - staged_bytes_before) / (staged - staged_before).max(1),
+    );
+    assert!(
+        staged - staged_before >= 3,
+        "every submission that took the arm is counted"
+    );
+    assert_eq!(
+        staged_bytes - staged_bytes_before,
+        (staged - staged_before) * STREAM_BYTES,
+        "and each of them charges the copy's own bytes"
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
 }
 
 /// A host allocation whose first byte is aligned to `alignment`, so the owner
@@ -28582,18 +29013,22 @@ fn a_carried_frames_own_record_is_restatable_as_a_production() {
 ///
 /// The window the contract states for a texture is its tightly packed extent at
 /// the reservation's own start, so every gather outside that shape is an exit —
-/// and each one below is a different fact, not one looser rule: no registration
-/// under the current epoch, a padded stride narrower than the texture's own row
-/// (R36: those rows would overlap rather than carry padding), a padded span the
-/// stated stride and row count cannot tile (R36: no row's own bytes are
-/// locatable), more than one stretch (no single host range is the bind's), a
-/// span that is not the texture's extent, and a window that does not reach the
-/// span from its first byte. A padded gather whose stride, row count and window
-/// *do* agree is no longer one of them: R36 repacks it and the declaration
-/// states the texture's own extent
-/// ([`a_padded_row_gather_leaves_as_the_textures_own_extent`]). The class is
-/// pure here: no provider is asked and no lease is minted for a shape that stays
-/// on the engine.
+/// and each one below is a different fact, not one looser rule: a **windowless**
+/// gather whose span is not the texture's extent (`G1-B`: the ledger names no
+/// window for it, so the runs it carries are the only arm left, and a span that
+/// is not the extent is one no copy may state), a padded stride narrower than
+/// the texture's own row (R36: those rows would overlap rather than carry
+/// padding), a padded span the stated stride and row count cannot tile (R36: no
+/// row's own bytes are locatable), more than one stretch (no single host range
+/// is the bind's), a span that is not the texture's extent beside a window, and
+/// a window that does not reach the span from its first byte. Two shapes that
+/// *were* of this population are no longer: R36 repacks a padded gather whose
+/// stride, row count and window agree
+/// ([`a_padded_row_gather_leaves_as_the_textures_own_extent`]), and `G1-B` reads
+/// a windowless gather whose runs hold the texture's own extent
+/// ([`a_windowless_sampled_gather_leaves_as_the_textures_own_extent`]). The
+/// class is pure here: no provider is asked and no lease is minted for a shape
+/// that stays on the engine.
 #[test]
 fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
     use reims_vgpu::runtime::guest_ram::GuestRamImport;
@@ -28669,20 +29104,65 @@ fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
     };
     let deliveries = provider_render::provider_submissions();
 
-    // No registration under the current epoch: the one run carries no window.
-    let unregistered = answer(
-        "unregistered gathered texture",
-        gather((extent, 0, vec![run(guest.clone(), None)])),
+    // No registration under the current epoch, and a span that is not the
+    // texture's extent: `G1-B` reads the runs of a windowless gather, so what
+    // still refuses here is the span it would have to state — the copy is never
+    // a shorter one, and the sentence is this bucket's own. (The windowless
+    // gather whose runs *do* hold the extent is the arm the increment moves:
+    // `a_windowless_sampled_gather_leaves_as_the_textures_own_extent`.)
+    let short_span_unwindowed = answer(
+        "short-span unwindowed gathered texture",
+        gather((extent - 4, 0, vec![run(guest.clone(), None)])),
     );
-    eprintln!("door: {}\n  {}", unregistered.0, unregistered.1);
+    eprintln!(
+        "door: {}\n  {}",
+        short_span_unwindowed.0, short_span_unwindowed.1
+    );
     assert_eq!(
-        unregistered.0,
+        short_span_unwindowed.0,
         "render_provider_out_of_class_texture_source"
     );
     assert!(
-        unregistered.1.contains("no registered window"),
-        "the sentence names the fact that met it: {}",
-        unregistered.1
+        short_span_unwindowed
+            .1
+            .contains("span is 124 byte(s) for a 128 byte")
+            && short_span_unwindowed
+                .1
+                .contains("the gather is not one registered window"),
+        "the sentence names both the registration fact and the span: {}",
+        short_span_unwindowed.1
+    );
+
+    // No window at all, and runs that stop short of the span the gather states:
+    // `G1-B` reads the runs of a windowless gather, and a copy that padded the
+    // rest would name bytes no record wrote — the arm's own sentence, in the
+    // same bucket.
+    let uncovered = answer(
+        "short-run unwindowed gathered texture",
+        SampledSource::GuestRuns(
+            engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                    base,
+                    2 * page as u64,
+                    0,
+                    extent / 2,
+                )
+                .expect("the run is inside the mapping")]),
+                source_offset: 0,
+                total_len: extent,
+                row_length_texels: 0,
+                pages: None,
+                direct_image: None,
+            },
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        ),
+    );
+    eprintln!("door: {}\n  {}", uncovered.0, uncovered.1);
+    assert_eq!(uncovered.0, "render_provider_out_of_class_texture_source");
+    assert!(
+        uncovered.1.contains("do not cover the 128 byte(s)"),
+        "the sentence names the span the runs miss: {}",
+        uncovered.1
     );
 
     // Padded rows whose stride is *narrower* than one tightly packed row of the
@@ -28791,6 +29271,181 @@ fn the_gathers_outside_one_registered_window_stay_on_the_engine_by_name() {
         provider_render::provider_submissions(),
         deliveries,
         "a gather outside one registered window never reaches the provider"
+    );
+}
+
+/// G1-B: a sampled gather the ledger names **no window** for is read out of its
+/// own runs, and the frame that comes out is the engine's own frame for the same
+/// bind, byte for byte.
+///
+/// This is the production shape of the census' third door: one `g1a` boot read
+/// **3 486** refusals in `render_provider_out_of_class_texture_source` — 14.8 a
+/// window — and every one of the driven ones carried the same fact, an import
+/// with no registration under the current epoch
+/// (`evidence/gate3-census-g1a-2026-09-20`; the sentence is `…_texture_source`'s
+/// `Unregistered` half, which is the exit this arm now answers). The rows are
+/// the texture's own tightly packed extent, the guest's rows dropped when the
+/// source states a stride, and R41's fold taken last — all of them out of the
+/// one derivation the window arms use ([`sampled_rows`]), so a copy and a lease
+/// cannot disagree about which bytes the bind means.
+///
+/// Four readings, because each one alone would pass for a rail that did
+/// something else: the frame (the texel the shader samples, equal to the
+/// engine's own byte for byte); its freshness (moving the sampled texel in the
+/// guest's own pages moves the next frame); the *absence* of an owner plan (no
+/// lease is minted, so no frame crosses the owner→provider wire — this arm is
+/// cheaper than R36's, whose copy still travels as a declaration); and the
+/// census (the new arm's routes count the binds and the bytes).
+#[test]
+fn a_windowless_sampled_gather_leaves_as_the_textures_own_extent() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    let extent = u64::from(width) * u64::from(height) * 4;
+    let read_bytes = |texels: &[Vec<u8>]| {
+        let texel = &texels[read_y * width as usize + read_x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let texel_at_offset = (read_y * width as usize + read_x) * 4;
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The mapping holds the texture's tightly packed extent: the bytes a gather
+    // the guest bound once really carries.
+    let packed: Vec<u8> = texels.iter().flatten().copied().collect();
+    assert!(
+        u64::try_from(packed.len()).expect("the extent fits u64") == extent,
+        "the fixture's texels are the texture's own extent"
+    );
+    owner.as_mut_slice()[..packed.len()].copy_from_slice(&packed);
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    // The source the draw path builds for this bind in the production pose: one
+    // live host run over the texture's own bytes, and **no `pages`** — the
+    // reading a host that cannot register an import gives every gather, and the
+    // one the ledger answers `Unregistered` for.
+    let source = || {
+        SampledSource::GuestRuns(
+            engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                    mapping,
+                    mapping_len,
+                    0,
+                    extent,
+                )
+                .expect("the texture's own bytes are inside the mapping")]),
+                source_offset: 0,
+                total_len: extent,
+                row_length_texels: 0,
+                pages: None,
+                direct_image: None,
+            },
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        )
+    };
+    let request = || {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].source = source();
+        request
+    };
+    // The moved reading: a colour no texel of the fixture's pattern carries, so
+    // a rail that read the bytes somewhere else could not land it.
+    let moved_bytes = [255, 0, 0, 255];
+    // The engine arm first: its device context is created lazily on the first
+    // draw, and it is the rail a test may only reach before the provider's own
+    // device exists.
+    let engine = engine_pixels("G1-B windowless sampled gather", &stages, request())
+        .expect("the engine gathers this shape");
+    assert_uniform_frame(
+        "G1-B windowless sampled gather (engine)",
+        &engine,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    owner.as_mut_slice()[texel_at_offset..texel_at_offset + 4].copy_from_slice(&moved_bytes);
+    let moved_engine = engine_pixels("G1-B moved sampled gather", &stages, request())
+        .expect("the engine gathers the moved shape");
+    assert_uniform_frame(
+        "G1-B moved sampled gather (engine)",
+        &moved_engine,
+        width,
+        height,
+        moved_bytes,
+    );
+    owner.as_mut_slice()[texel_at_offset..texel_at_offset + 4]
+        .copy_from_slice(&read_bytes(&texels));
+    let gathered_before = route_count("render_provider_out_of_class_texture_source_gathered");
+    let gathered_bytes_before = route_count("render_provider_out_of_class_texture_source_bytes");
+    let out_of_class_before = route_count("render_provider_out_of_class_texture_source");
+    let wire_before = provider_wire::wire_counts();
+    let provider = provider_pixels("G1-B windowless sampled gather", &stages, &request());
+    assert_uniform_frame(
+        "G1-B windowless sampled gather (provider)",
+        &provider,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    assert_frames_equal(
+        "G1-B windowless sampled gather, both rails",
+        &provider,
+        &engine,
+    );
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        wire_before.submit_frames,
+        "a copy stated as the trace's own bytes mints no lease and writes no frame"
+    );
+
+    // The falsifiable half: the copy is made per submission, so moving the
+    // guest's own texel moves the frame.
+    owner.as_mut_slice()[texel_at_offset..texel_at_offset + 4].copy_from_slice(&moved_bytes);
+    let moved = provider_pixels("G1-B moved sampled gather", &stages, &request());
+    assert_uniform_frame(
+        "G1-B moved sampled gather (provider)",
+        &moved,
+        width,
+        height,
+        moved_bytes,
+    );
+    assert_frames_equal(
+        "G1-B moved sampled gather, both rails",
+        &moved,
+        &moved_engine,
+    );
+    assert_frames_differ("the copy follows the runs' bytes", &provider, &moved);
+    owner.as_mut_slice()[texel_at_offset..texel_at_offset + 4]
+        .copy_from_slice(&read_bytes(&texels));
+
+    // The census: one route per bind that took the arm, one byte total beside
+    // it — and the bucket this arm lifts is not charged for it.
+    let gathered = route_count("render_provider_out_of_class_texture_source_gathered");
+    let gathered_bytes = route_count("render_provider_out_of_class_texture_source_bytes");
+    eprintln!(
+        "texture-source census: binds={} bytes={} (bytes per bind {})",
+        gathered - gathered_before,
+        gathered_bytes - gathered_bytes_before,
+        (gathered_bytes - gathered_bytes_before) / (gathered - gathered_before).max(1),
+    );
+    assert_eq!(
+        gathered - gathered_before,
+        2,
+        "both submissions that took the arm are counted"
+    );
+    assert_eq!(
+        gathered_bytes - gathered_bytes_before,
+        extent * 2,
+        "and each of them charges the gather's own span"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_texture_source") - out_of_class_before,
+        0,
+        "the bucket this arm lifts is not charged for a bind it read"
     );
 }
 
