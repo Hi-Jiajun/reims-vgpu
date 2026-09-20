@@ -1419,10 +1419,12 @@ fn copy_identities() -> &'static std::sync::Mutex<std::collections::HashMap<Copy
 ///
 /// # The bound
 ///
-/// One entry per identity, capped at [`COPY_IDENTITIES_MAX`] — a sampled
-/// gather's identities are the distinct sampled binds a boot reads, which one
-/// census read as **11 203**, and this is why the census is scoped to this arm
-/// rather than the vertex streams' 420 549. At the cap the table stops
+/// One entry per identity, capped at [`COPY_IDENTITIES_MAX`]. A sampled
+/// gather's identities are the *distinct* binds a boot reads, which is far
+/// below its copy count — one `g1c` boot made 7 277 copies out of **19**
+/// identities — while the vertex arm's population is its binds (420 549 in one
+/// `g1b` boot), which is why this census is scoped to the sampled gather and
+/// not to the streams. At the cap the table stops
 /// admitting new identities instead of evicting: an evicted identity would read
 /// as a *first* copy when it returned, which under-reports the repeat rate and
 /// hides the fact that it did, while a frozen table keeps counting every repeat
