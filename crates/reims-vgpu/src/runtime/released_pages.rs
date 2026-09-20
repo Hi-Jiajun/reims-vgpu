@@ -287,6 +287,35 @@ pub const BIND_ROUTE: &str = "read_after_release_buffer_bind";
 /// say which of the two families a hit came from.
 pub const SAMPLED_BIND_ROUTE: &str = "read_after_release_sampled_bind";
 
+/// The provider rail's sampled-bind entry, counted on its own: every call the
+/// entry made with the probe on.
+///
+/// The shared [`note_read`] counters say how much of a boot the whole probe
+/// judged; they do not say which *entry* the reads came from, and for the
+/// sampled family that is the whole question — 148 borrowed windows and 48
+/// repacked rows across one round's two 240 s arms are the population the entry
+/// exists to watch, and a reader of the log has to be able to size it. Charged
+/// before the armed-set test, so it counts a read this entry saw and could not
+/// judge as well as one it judged.
+pub const SAMPLED_BIND_READS: &str = "read_guard_sampled_bind_reads";
+
+/// The sampled-bind entry's reads that reached its page resolve — the analogue
+/// of [`note_read`]'s `read_guard_checked_reads`, for this entry alone.
+///
+/// Charged where the resolve runs, which is the same condition the shared
+/// counter's `checked` arm is under (the probe is on and the armed set is not
+/// empty), so the two cannot disagree about which reads were checkable.
+pub const SAMPLED_BIND_CHECKED_READS: &str = "read_guard_sampled_bind_checked_reads";
+
+/// The pages the sampled-bind entry's own resolve named, summed the way
+/// `read_guard_checked_pages` is.
+///
+/// A read whose pages this entry could not name (a source with no run list, a
+/// packed alias) contributes nothing here and is counted by the shared
+/// `read_guard_unnamed_reads` instead: the two are different readings and must
+/// not be added into one number.
+pub const SAMPLED_BIND_CHECKED_PAGES: &str = "read_guard_sampled_bind_checked_pages";
+
 /// Check one named read's pages against the released set.
 ///
 /// `pages` is the caller's own resolve of everything it is about to read, and

@@ -6009,7 +6009,20 @@ impl SampledGatherExit {
 ///
 /// Off unless the operator switch is on, and off when nothing is armed: the
 /// page resolve is behind the probe's own gate, and `describe` is paid for only
-/// by a hit. A boot that is not the read-side round pays a null check.
+/// by a hit. A boot that is not the read-side round pays the switch's own read
+/// (`reads_guarded`, a cached load) and nothing else.
+///
+/// # What a census can read off this entry
+///
+/// [`crate::runtime::released_pages::SAMPLED_BIND_READS`] is how many sampled
+/// binds this entry saw while the probe was on;
+/// [`crate::runtime::released_pages::SAMPLED_BIND_CHECKED_READS`] and
+/// `…_CHECKED_PAGES` are how many of them reached the page resolve and over how
+/// many pages; and [`crate::runtime::released_pages::SAMPLED_BIND_ROUTE`] is how
+/// many of *those* pages the guest had taken back. The difference between the
+/// first and the second is the reads the probe saw with nothing armed to judge
+/// them against — the same reading the shared `read_guard_unarmed_reads` gives
+/// for the whole probe, told for this family.
 fn note_sampled_bind_read(
     // The census, or `None` for a caller that handed none over
     // ([`RenderRailInputs::read_guard`]). `None` is dark, not quiet: nothing is
@@ -6032,10 +6045,32 @@ fn note_sampled_bind_read(
     let Some(writes) = census else {
         return;
     };
+    // This entry's own denominator, charged only while the probe is on: the
+    // shared counters say how much of the boot the probe judged, and this says
+    // how much of it was *this* family — which is the number a census of the
+    // sampled gather has to be able to read, since the family's reads and the
+    // draw path's buffer binds are counted by one pair of shared counters
+    // otherwise.
+    if !crate::runtime::released_pages::reads_guarded() {
+        return;
+    }
+    crate::runtime::drain::note_store_route(crate::runtime::released_pages::SAMPLED_BIND_READS);
     crate::runtime::released_pages::note_read(
         writes,
         crate::runtime::released_pages::SAMPLED_BIND_ROUTE,
-        || sampled_bind_pages(source, writes.page_shift()),
+        || {
+            crate::runtime::drain::note_store_route(
+                crate::runtime::released_pages::SAMPLED_BIND_CHECKED_READS,
+            );
+            let pages = sampled_bind_pages(source, writes.page_shift());
+            if let Some(pages) = pages.as_ref() {
+                crate::runtime::drain::note_store_route_n(
+                    crate::runtime::released_pages::SAMPLED_BIND_CHECKED_PAGES,
+                    pages.len() as u64,
+                );
+            }
+            pages
+        },
         || {
             format!(
                 "reader=sampled_bind decl={declaration} arm={} span={:#x} runs={} \
@@ -6160,7 +6195,10 @@ mod sampled_bind_read_tests {
     use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
     use crate::runtime::guest_ram_map::GuestWindowRun;
     use crate::runtime::host_writes::HostWrites;
-    use crate::runtime::released_pages::{ForcedOn, SAMPLED_BIND_ROUTE};
+    use crate::runtime::released_pages::{
+        ForcedOn, SAMPLED_BIND_CHECKED_PAGES, SAMPLED_BIND_CHECKED_READS, SAMPLED_BIND_READS,
+        SAMPLED_BIND_ROUTE,
+    };
 
     /// A plausible RAMBlock and the guest-physical base every reference in these
     /// fixtures lands on. The host address is compared and never dereferenced,
@@ -6325,6 +6363,9 @@ mod sampled_bind_read_tests {
         let reads_before = store_route_count("read_guard_reads");
         let checked_before = store_route_count("read_guard_checked_reads");
         let reader_before = store_route_count(SAMPLED_BIND_ROUTE);
+        let entry_before = store_route_count(SAMPLED_BIND_READS);
+        let entry_checked_before = store_route_count(SAMPLED_BIND_CHECKED_READS);
+        let entry_pages_before = store_route_count(SAMPLED_BIND_CHECKED_PAGES);
 
         note_sampled_bind_read(None, false, 0, (16, 16), &source, &stated);
         note_sampled_bind_read(Some(&writes), true, 0, (16, 16), &source, &stated);
@@ -6335,6 +6376,19 @@ mod sampled_bind_read_tests {
             checked_before
         );
         assert_eq!(store_route_count(SAMPLED_BIND_ROUTE), reader_before);
+        assert_eq!(
+            store_route_count(SAMPLED_BIND_READS),
+            entry_before,
+            "a probe is not a read of this entry's family either"
+        );
+        assert_eq!(
+            store_route_count(SAMPLED_BIND_CHECKED_READS),
+            entry_checked_before
+        );
+        assert_eq!(
+            store_route_count(SAMPLED_BIND_CHECKED_PAGES),
+            entry_pages_before
+        );
         assert!(cap.lines().is_empty(), "{:?}", cap.lines());
     }
 
@@ -6353,6 +6407,9 @@ mod sampled_bind_read_tests {
         let pages_before = store_route_count("read_guard_checked_pages");
         let hits_before = store_route_count("read_after_release");
         let reader_before = store_route_count(SAMPLED_BIND_ROUTE);
+        let entry_before = store_route_count(SAMPLED_BIND_READS);
+        let entry_checked_before = store_route_count(SAMPLED_BIND_CHECKED_READS);
+        let entry_pages_before = store_route_count(SAMPLED_BIND_CHECKED_PAGES);
 
         note_sampled_bind_read(Some(&writes), false, 3, (64, 32), &source, &stated);
 
@@ -6378,6 +6435,17 @@ mod sampled_bind_read_tests {
             store_route_count("read_guard_checked_pages") - pages_before,
             3
         );
+        // The family's own denominator moves with the same read: one call, one
+        // resolve over three pages, one hit.
+        assert_eq!(store_route_count(SAMPLED_BIND_READS) - entry_before, 1);
+        assert_eq!(
+            store_route_count(SAMPLED_BIND_CHECKED_READS) - entry_checked_before,
+            1
+        );
+        assert_eq!(
+            store_route_count(SAMPLED_BIND_CHECKED_PAGES) - entry_pages_before,
+            3
+        );
     }
 
     /// The negative control the family's zero rests on: a bind over pages the
@@ -6394,6 +6462,8 @@ mod sampled_bind_read_tests {
         let reads_before = store_route_count("read_guard_reads");
         let checked_before = store_route_count("read_guard_checked_reads");
         let reader_before = store_route_count(SAMPLED_BIND_ROUTE);
+        let entry_before = store_route_count(SAMPLED_BIND_READS);
+        let entry_pages_before = store_route_count(SAMPLED_BIND_CHECKED_PAGES);
 
         note_sampled_bind_read(Some(&writes), false, 1, (8, 8), &source, &stated);
 
@@ -6404,6 +6474,12 @@ mod sampled_bind_read_tests {
             1
         );
         assert_eq!(store_route_count(SAMPLED_BIND_ROUTE), reader_before);
+        assert_eq!(store_route_count(SAMPLED_BIND_READS) - entry_before, 1);
+        assert_eq!(
+            store_route_count(SAMPLED_BIND_CHECKED_PAGES) - entry_pages_before,
+            3,
+            "a quiet read is still a read this entry named the pages of"
+        );
     }
 
     /// With the operator switch off this entry is dark: the probe's own gate
@@ -6421,6 +6497,7 @@ mod sampled_bind_read_tests {
         let stated = borrowed();
         let reads_before = store_route_count("read_guard_reads");
         let checked_before = store_route_count("read_guard_checked_reads");
+        let entry_before = store_route_count(SAMPLED_BIND_READS);
 
         note_sampled_bind_read(Some(&writes), false, 0, (16, 16), &source, &stated);
 
@@ -6429,6 +6506,11 @@ mod sampled_bind_read_tests {
         assert_eq!(
             store_route_count("read_guard_checked_reads"),
             checked_before
+        );
+        assert_eq!(
+            store_route_count(SAMPLED_BIND_READS),
+            entry_before,
+            "off means this entry's own counters are dark too"
         );
         assert!(cap.lines().is_empty(), "{:?}", cap.lines());
     }
