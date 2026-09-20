@@ -5348,6 +5348,16 @@ fn finish_stream<M: HostMemory + HostOps>(
             promise = probes[di].attachment;
         }
         keep_frame = chain_relay_keep_plan(&probes);
+        // G3-B/B-0: what a batch of these runs would carry, read from the very
+        // plan the assembly reads (`REIMS_VGPU_RENDER_BATCH`). The run lengths
+        // are the divisor the increment buys, and the cross-stream reading is
+        // the only place both ends of a frame-level run exist at once — the keep
+        // plan itself never reaches past this packet.
+        note_render_batch_plan(&keep_frame);
+        note_render_batch_stream_identity(
+            probes.first().and_then(|probe| probe.attachment),
+            probes.last().and_then(|probe| probe.attachment),
+        );
         for (di, pd) in draw_list.iter().enumerate() {
             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
             let Some(req) = requests.get_mut(di) else {
@@ -6428,8 +6438,9 @@ use report::{
     note_depth_stencil_unsupported, note_draw_encode_fail, note_empty_scissor,
     note_empty_viewport_or_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
     note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
-    note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_residency_declaration,
-    note_store_action_no_attachment, note_store_action_options_unsupported, note_stream_draw_drops,
+    note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_render_batch_plan,
+    note_render_batch_stream_identity, note_residency_declaration, note_store_action_no_attachment,
+    note_store_action_options_unsupported, note_stream_draw_drops,
     note_unimplemented_render_opcode, note_unnamed_icb_execute,
 };
 // The unimplemented-opcode latch is test-only on both sides, so its import has
