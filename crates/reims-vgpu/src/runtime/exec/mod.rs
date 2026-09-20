@@ -6526,20 +6526,27 @@ fn render_batch_run(
 /// Whether `REIMS_VGPU_RENDER_BATCH` asked for runs of kept records to travel
 /// as one trace (`REIMS_VGPU_RENDER_BATCH`).
 ///
-/// The one name both rails read (E's `render_batch_enabled` is the other end):
+/// **On by default since 2026-09-20.** The A/B pair (`g3b3`/`g3b3-offb`, same
+/// exe and pose, only the switch differing) read per pass **1 485.6 → 1 143.6
+/// µs (−23.0%)**, host per frame **0.494 → 0.354 s (−28.3%)** and per draw
+/// **3.717 → 2.648 ms (−28.8%)**; census v58 with it on read **100.000%
+/// coverage** (a refused run is given back whole to the per-record path, so the
+/// identity `slots − fallen_back = canonical + engine + skipped` closes).
+/// `REIMS_VGPU_RENDER_BATCH=0/off/false/no` is the control arm a round runs the
+/// pre-batch path with, so the two arms' frames stay comparable byte for byte.
+///
+/// The one name both rails read (E's `render_batch_requested` is the other end):
 /// this side decides whether to *assemble* a run, and the canonical provider
-/// decides whether to *submit* one scope. Off by default, and read once — the
-/// control arm a round runs the pre-batch path with, so the two arms' frames
-/// are comparable byte for byte.
+/// decides whether to *submit* one scope.
 fn render_batch_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("REIMS_VGPU_RENDER_BATCH")
                 .ok()
                 .as_deref()
                 .map(str::trim),
-            Some("1" | "on" | "ON" | "true" | "yes")
+            Some("0" | "off" | "OFF" | "false" | "no" | "NO")
         )
     })
 }
