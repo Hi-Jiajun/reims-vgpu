@@ -1161,6 +1161,7 @@ pub fn captured_submission_frames() -> Vec<Vec<u8>> {
 }
 
 fn note_frame(frame: &[u8]) {
+    crate::runtime::drain::note_frame_wire_bytes(frame.len() as u64);
     if CAPTURE_ARMED.load(Ordering::Relaxed) {
         if let Ok(mut frames) = CAPTURED_FRAMES.lock() {
             frames.push(frame.to_vec());

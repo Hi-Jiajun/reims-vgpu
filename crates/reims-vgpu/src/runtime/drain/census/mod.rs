@@ -880,11 +880,18 @@ pub(crate) struct FrameProfileCensus {
     // per-trace or were charged twice by the walk's probe.
     wire_frames: std::sync::atomic::AtomicU64,
     wire_sum: std::sync::atomic::AtomicU64,
+    // The bytes those frames carried, on the same terms. `wire_frames` says how
+    // many statements crossed the wire and this says how big they were, which
+    // is the pair a reader needs to price the frame's own encoder: a bar in
+    // microseconds per frame is not the same reading as microseconds per byte.
+    wire_bytes: std::sync::atomic::AtomicU64,
+    wire_bytes_sum: std::sync::atomic::AtomicU64,
     // The previous frame's close; 0 before the first present.
     last_present_us: std::sync::atomic::AtomicU64,
     last_present_draws: std::sync::atomic::AtomicU64,
     last_present_draw_us: std::sync::atomic::AtomicU64,
     last_present_wire: std::sync::atomic::AtomicU64,
+    last_present_wire_bytes: std::sync::atomic::AtomicU64,
     // The window clock; 0 before the first present arms it.
     last_report_ms: std::sync::atomic::AtomicU64,
     /// The window length; production uses `FRAME_PROFILE_REPORT_MS`.
@@ -914,10 +921,13 @@ impl FrameProfileCensus {
             span_sum_us: [const { AtomicU64::new(0) }; FRAME_SPANS],
             wire_frames: AtomicU64::new(0),
             wire_sum: AtomicU64::new(0),
+            wire_bytes: AtomicU64::new(0),
+            wire_bytes_sum: AtomicU64::new(0),
             last_present_us: AtomicU64::new(0),
             last_present_draws: AtomicU64::new(0),
             last_present_draw_us: AtomicU64::new(0),
             last_present_wire: AtomicU64::new(0),
+            last_present_wire_bytes: AtomicU64::new(0),
             last_report_ms: AtomicU64::new(0),
             report_ms: FRAME_PROFILE_REPORT_MS,
         }
@@ -965,6 +975,12 @@ impl FrameProfileCensus {
         self.wire_frames.fetch_add(1, Relaxed);
     }
 
+    /// Add one owner→provider frame's payload length to the open frame.
+    pub(crate) fn note_wire_bytes(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.wire_bytes.fetch_add(bytes, Relaxed);
+    }
+
     /// Close the frame a present ends, and report when the window fills.
     ///
     /// `not_enabled` names the arm
@@ -1007,6 +1023,7 @@ impl FrameProfileCensus {
         let draws = self.draws.load(Relaxed);
         let draw_us = self.draw_us.load(Relaxed);
         let wire = self.wire_frames.load(Relaxed);
+        let wire_bytes = self.wire_bytes.load(Relaxed);
         // The sub-phase table is differenced the same way and on the same
         // terms, so a frame that straddles a report boundary stays whole.
         let mut frame_spans = [0u64; FRAME_SPANS];
@@ -1024,6 +1041,7 @@ impl FrameProfileCensus {
             self.last_present_draws.store(draws, Relaxed);
             self.last_present_draw_us.store(draw_us, Relaxed);
             self.last_present_wire.store(wire, Relaxed);
+            self.last_present_wire_bytes.store(wire_bytes, Relaxed);
             return;
         }
         let interval = now_us.saturating_sub(prev_us);
@@ -1036,12 +1054,15 @@ impl FrameProfileCensus {
         let prev_draws = self.last_present_draws.swap(draws, Relaxed);
         let prev_draw_us = self.last_present_draw_us.swap(draw_us, Relaxed);
         let prev_wire = self.last_present_wire.swap(wire, Relaxed);
+        let prev_wire_bytes = self.last_present_wire_bytes.swap(wire_bytes, Relaxed);
         let frame_draws = draws.saturating_sub(prev_draws);
         let frame_host_us = draw_us.saturating_sub(prev_draw_us);
         self.draws_sum.fetch_add(frame_draws, Relaxed);
         self.draws_max.fetch_max(frame_draws, Relaxed);
         self.wire_sum
             .fetch_add(wire.saturating_sub(prev_wire), Relaxed);
+        self.wire_bytes_sum
+            .fetch_add(wire_bytes.saturating_sub(prev_wire_bytes), Relaxed);
         self.host_sum_us.fetch_add(frame_host_us, Relaxed);
         self.host_max_us.fetch_max(frame_host_us, Relaxed);
         for (acc, us) in self.span_sum_us.iter().zip(frame_spans.iter()) {
@@ -1062,6 +1083,7 @@ impl FrameProfileCensus {
         let draws_sum = self.draws_sum.swap(0, Relaxed);
         let draws_max = self.draws_max.swap(0, Relaxed);
         let wire_sum = self.wire_sum.swap(0, Relaxed);
+        let wire_bytes_sum = self.wire_bytes_sum.swap(0, Relaxed);
         let host_sum = self.host_sum_us.swap(0, Relaxed);
         let host_max = self.host_max_us.swap(0, Relaxed);
         let p50 = self.take_interval_p50();
@@ -1085,9 +1107,10 @@ impl FrameProfileCensus {
         let span = (frames > 0).then(|| {
             let mut line = format!(
                 "frame_span win_ms={win_ms} frames={frames} draws={} \
-                 wire_frames={}",
+                 wire_frames={} wire_bytes={}",
                 mean(draws_sum),
                 mean(wire_sum),
+                mean(wire_bytes_sum),
             );
             for (name, acc) in SPAN_NAMES.iter().zip(self.span_sum_us.iter()) {
                 let sum = acc.swap(0, Relaxed);
@@ -1196,6 +1219,17 @@ pub(crate) fn note_frame_wire_frame() {
         return;
     }
     FRAME_PROFILE.note_wire_frame();
+}
+
+/// Add one owner→provider frame's payload length to the open frame.
+///
+/// Charged where the frame is counted, so the two readings are of the same
+/// frames rather than of two populations that happen to be adjacent.
+pub(crate) fn note_frame_wire_bytes(bytes: u64) {
+    if !frame_profile_on() {
+        return;
+    }
+    FRAME_PROFILE.note_wire_bytes(bytes);
 }
 
 /// Bank one of [`crate::runtime::chain_phase`]'s bars, named by its ordinal.
