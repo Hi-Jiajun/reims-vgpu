@@ -216,6 +216,33 @@ pub fn reads_guarded() -> bool {
 #[cfg(test)]
 static FORCED_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The probe on, for the duration of one test.
+///
+/// The read of the switch is cached per process, so a fixture that set the
+/// environment and put it back could not turn the probe on for its own window.
+/// The override is `cfg(test)`, so no arm can reach it — and it is published
+/// `pub(crate)` rather than kept to this module's own tests, because the
+/// entries *outside* this module ([`crate::backend::provider_render`]'s
+/// sampled bind is one) have to prove their own call reaches the probe, and a
+/// test that could only ask the switch would prove nothing about the wiring.
+#[cfg(test)]
+pub(crate) struct ForcedOn;
+
+#[cfg(test)]
+impl ForcedOn {
+    pub(crate) fn arm() -> Self {
+        FORCED_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedOn {
+    fn drop(&mut self) {
+        FORCED_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Census route naming one reader's hits, derived from the reader's own settle
 /// slug so the probe cannot grow a second vocabulary for the same sites.
 ///
@@ -247,6 +274,18 @@ pub fn site_route(site: crate::runtime::render_writeback::SettleSite) -> &'stati
 /// about to serve, whose pages are resolved from the window rather than from a
 /// settle site.
 pub const BIND_ROUTE: &str = "read_after_release_buffer_bind";
+
+/// Route naming the provider rail's own bind-time check: a sampled texture
+/// whose texels are the guest's pages, resolved by
+/// [`crate::backend::provider_render`] rather than by the draw path's buffer
+/// resolution.
+///
+/// A second constant and not a second spelling of [`BIND_ROUTE`]: the two
+/// entries name two different reads of the same boot — a buffer this device
+/// binds at draw time, and a texture the canonical rail gathers out of the
+/// guest's own pages — and a census that could not tell them apart could not
+/// say which of the two families a hit came from.
+pub const SAMPLED_BIND_ROUTE: &str = "read_after_release_sampled_bind";
 
 /// Check one named read's pages against the released set.
 ///
@@ -402,26 +441,6 @@ mod tests {
 
     const P: u64 = 4096;
 
-    /// The probe on, for the duration of one test.
-    ///
-    /// The read of the switch is cached per process, so a fixture that set the
-    /// environment and put it back could not turn the probe on for its own
-    /// window. The override is `cfg(test)`, so no arm can reach it.
-    struct ForcedOn;
-
-    impl ForcedOn {
-        fn arm() -> Self {
-            FORCED_ON.store(true, std::sync::atomic::Ordering::Relaxed);
-            Self
-        }
-    }
-
-    impl Drop for ForcedOn {
-        fn drop(&mut self) {
-            FORCED_ON.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
     fn route_count(route: &str) -> u64 {
         crate::runtime::drain::store_route_count(route)
     }
@@ -567,6 +586,21 @@ mod tests {
         assert_eq!(unique.len(), routes.len(), "two readers share one route");
         for route in routes {
             assert!(route.starts_with("read_after_release_"), "{route}");
+        }
+        // The two bind-time entries name two different reads — a draw's buffer
+        // window and the provider rail's sampled gather — so a census line can
+        // say which family a hit came from. One name for both would make the
+        // finding unassignable, which is the whole reason each entry carries
+        // its own route.
+        assert_eq!(BIND_ROUTE, "read_after_release_buffer_bind");
+        assert_eq!(SAMPLED_BIND_ROUTE, "read_after_release_sampled_bind");
+        assert_ne!(BIND_ROUTE, SAMPLED_BIND_ROUTE);
+        for route in [BIND_ROUTE, SAMPLED_BIND_ROUTE] {
+            assert!(route.starts_with("read_after_release_"), "{route}");
+            assert!(
+                !unique.contains(route),
+                "a bind route collides with a settle-derived route: {route}"
+            );
         }
         assert!(
             crate::config::ALL.contains(&crate::config::READ_GUARD),

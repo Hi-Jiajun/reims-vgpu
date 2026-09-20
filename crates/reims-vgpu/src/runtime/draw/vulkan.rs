@@ -12213,6 +12213,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 sampler_family: &sampler_family,
                 texture_interface_refusals: resolved.texture_interface_refusals.as_ref(),
                 stage_buffer_binds: &stage_buffer_binds,
+                // The read-side probe's census, for the one entry on the
+                // provider rail — a sampled bind whose texels are the guest's
+                // own pages. Handed over rather than reached for: the rail is a
+                // function of its inputs, and this is an input. `Some` on every
+                // boot; whether the probe looks at it is the operator switch's
+                // answer, not this field's.
+                read_guard: Some(&state.host_writes),
                 // R4b, probe-gated: the present tail a record states when it is
                 // the one whose frame the guest displays and that frame lands in
                 // a named mapping. `None` is the pre-R4b device.

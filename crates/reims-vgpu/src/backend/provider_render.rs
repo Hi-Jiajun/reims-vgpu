@@ -3007,6 +3007,13 @@ fn texture_count_candidate(inputs: &RenderRailInputs<'_>) -> Option<()> {
     (!inputs.fragment_texture_declarations.is_empty()).then_some(())
 }
 
+// The parameter list is this walk's whole surface — the inputs, the request, who
+// is asking (so the read-side probe can tell a submission from the walk's class
+// probe), and one answer per rule the class lifts from the device — exactly as
+// [`narrow_class`]'s is. Each answer is read by the caller under its own
+// candidate test; bundling them into a struct would move the same values behind
+// one more name without shrinking what the walk has to be handed.
+#[allow(clippy::too_many_arguments)]
 fn sampled_textures<'a>(
     // The inputs' *inner* lifetime, not only the borrow of them: R24's arm hands
     // the caller's frame to the trace the same way the request's own bytes
@@ -3014,6 +3021,16 @@ fn sampled_textures<'a>(
     // consuming pass the caller builds from this answer.
     inputs: &RenderRailInputs<'a>,
     req: &'a DrawRequest,
+    // Whether this call is the walk's class *probe* rather than a submission
+    // (R42's arm). The gate answers the same either way — that is what makes one
+    // function serve both callers — but the read-side probe below is a reading
+    // about records this rail executes, and a probe executes nothing: a record
+    // the walk only asked about would be one more `read_guard_reads` against
+    // pages nothing read yet. Every probe-side reading this gate charges
+    // (`provider_chain_middle_probe_refused`, the class's own buckets) is
+    // deliberately *not* gated on this, because those are the class's answer
+    // and the probe is asking for it; only the I/O observation is.
+    class_only: bool,
     // The device's own answer to the extent rule's one question (R37), read by
     // [`submit_render`] out of the provider's capability frame exactly when the
     // request names a sampled bind of another extent
@@ -4033,7 +4050,7 @@ fn sampled_textures<'a>(
                     Err(SampledGatherExit::Unregistered) => None,
                     Err(exit) => return Err(texture_gather_refusal(declaration.index, &exit)),
                 };
-                match gather {
+                let stated = match gather {
                     Some(gather) => match gather.rows {
                         // The guest's own rows are padded (R36): the class gate
                         // repacks them into the texture's tightly packed extent
@@ -4077,7 +4094,16 @@ fn sampled_textures<'a>(
                     // The windowless arm `G1-B` adds: the gather's own bytes, the
                     // rows it states, and the fold the bind's lane asked for.
                     None => gathered_texture_source(declaration.index, source, extent, fold)?,
-                }
+                };
+                note_sampled_bind_read(
+                    inputs.read_guard,
+                    class_only,
+                    declaration.index,
+                    (req.width, req.height),
+                    source,
+                    &stated,
+                );
+                stated
             }
         };
         // The canonical render sampler of *this* class executes one texture
@@ -5934,6 +5960,545 @@ impl SampledGatherExit {
                  states, and a copy that padded the rest would name bytes no record wrote"
             ),
         }
+    }
+}
+
+/// The read-side probe's one entry on this rail (2026-09-20): a sampled bind
+/// whose texels are the guest's own pages.
+///
+/// # Why this family needed its own entry
+///
+/// [`crate::runtime::released_pages`] watches this device reading a page the
+/// guest has taken back. Three entries covered the reads that name their bytes
+/// before this one — the draw path's buffer window (fresh and held, packed and
+/// imported) and the two settle sites — and a driven round of them read
+/// **570 checked reads over 102 890 pages against 0 findings**. What none of
+/// them covered is the read this function names: a sampled texture whose bytes
+/// *are* the guest's pages, resolved here rather than by the draw path's buffer
+/// resolution. The census sizes it at 278 borrowed windows plus 280 repacked or
+/// staged copies in one 430 s boot
+/// (`render_provider_sampled_window_borrowed`, `…_rows_depadded`), so it is not
+/// a corner: it is the last GPU read family of any size that the probe could not
+/// see at all.
+///
+/// # One entry, not one per arm
+///
+/// Every arm the class states for such a bind reads those pages — the borrowed
+/// window inside the draw's command buffer, and the four copying arms (R28's
+/// staged window, R36's repacked rows, R41's folded lane, `G1-B`'s own runs) on
+/// this side of the device. The probe asks one question about one bind, so this
+/// is one call whose finding line names the arm
+/// ([`sampled_bind_arm`]) rather than five routes whose sum a reader would have
+/// to add up. The arm is read off the value the class *stated*, so the label and
+/// the census route the same boot charged cannot disagree.
+///
+/// # Where it is taken in the gate
+///
+/// After the class has resolved the bind into a source (a refusal is a read the
+/// *engine* makes, under its own name, and is not this entry's), and before the
+/// extent and lane rules that follow — the read this names is fixed at the bind,
+/// whatever the pass then decides about the extent it is declared at.
+///
+/// `class_only` keeps the walk's class probes [R42] out of the reading: a probe
+/// submits nothing, so counting one would put traffic in `read_guard_reads`
+/// that no command buffer touched. The gate's *answers* do not move with it —
+/// that is the whole point of one function serving both callers — and neither
+/// does any other reading beside this one.
+///
+/// # Cost
+///
+/// Off unless the operator switch is on, and off when nothing is armed: the
+/// page resolve is behind the probe's own gate, and `describe` is paid for only
+/// by a hit. A boot that is not the read-side round pays a null check.
+fn note_sampled_bind_read(
+    // The census, or `None` for a caller that handed none over
+    // ([`RenderRailInputs::read_guard`]). `None` is dark, not quiet: nothing is
+    // counted, which is why the input's own doc says a boot can tell the two
+    // apart from its log.
+    census: Option<&crate::runtime::host_writes::HostWrites>,
+    // Whether this call is the walk's class probe rather than a submission.
+    class_only: bool,
+    // The declaration's Metal index, and the attachment extent the finding line
+    // names beside it.
+    declaration: u32,
+    attachment: (u32, u32),
+    // The bind's own source, and the arm the class stated it under.
+    source: &crate::backend::vulkan::engine::GuestRunSource,
+    stated: &NarrowTextureSource<'_>,
+) {
+    if class_only {
+        return;
+    }
+    let Some(writes) = census else {
+        return;
+    };
+    crate::runtime::released_pages::note_read(
+        writes,
+        crate::runtime::released_pages::SAMPLED_BIND_ROUTE,
+        || sampled_bind_pages(source, writes.page_shift()),
+        || {
+            format!(
+                "reader=sampled_bind decl={declaration} arm={} span={:#x} runs={} \
+                 attachment={}x{}",
+                sampled_bind_arm(stated),
+                source.total_len,
+                source.pages.as_ref().map_or(0, |runs| runs.len()),
+                attachment.0,
+                attachment.1,
+            )
+        },
+    );
+}
+
+/// The guest pages one sampled bind's own bytes sit in, as the read-side probe
+/// states them ([`crate::runtime::released_pages::note_read`]).
+///
+/// This is the pages half of the provider rail's one entry into that probe
+/// (2026-09-20): the bind it is asked about is a `SampledSource::GuestRuns`, and
+/// those bytes are the guest's own pages — read inside the draw's command buffer
+/// when the window arm borrows them, and by this side of the device when one of
+/// the four copying arms repacks them.
+///
+/// The list comes from the source's own `pages`, which is the run list the
+/// gather's provider-shaped window was cut from — one [`GuestRef`] per maximal
+/// GPA-contiguous stretch, ascending, tiling the window exactly. Nothing here
+/// re-walks a task page table: a bind that reached this rail has already been
+/// resolved, and the reference it was resolved to is the authority for which
+/// bytes it names. That is a different question from the draw path's buffer
+/// entry, which resolves a *task GVA window* to pages and pays a walk for the
+/// answer; here the walk is behind us and the answer is a subtraction.
+///
+/// `None` — the probe's `unnamed` arm, never its quiet one — is every bind whose
+/// pages this coordinate system cannot state:
+///
+/// * a source that carries no `pages` at all, which is what
+///   `host_pointer_import=disabled_by_env` produces for every gather;
+/// * an import with no GPA base: the packed alias, a host allocation this
+///   process arranged over scattered guest pages, for which there is no one
+///   guest range to name — and stating the one range it does not cover would
+///   license the pages it omitted.
+///
+/// Each stretch is stated at its **bound** range rather than at the window the
+/// caller asked for: `GuestRef::bound` is the import-granule-aligned range the
+/// backend imports and binds, so it is the range a read of that reference can
+/// touch. Addresses are aligned at the armed set's own geometry
+/// ([`crate::runtime::host_writes::HostWrites::page_shift`]) and deduplicated,
+/// so one guest page is one address however many runs' granules meet in it —
+/// the alternative states one armed page four times on a 16 KiB guest and reads
+/// as four findings.
+fn sampled_bind_pages(
+    source: &crate::backend::vulkan::engine::GuestRunSource,
+    page_shift: u32,
+) -> Option<Vec<u64>> {
+    let runs = source.pages.as_ref()?;
+    let page_size = 1u64 << page_shift;
+    let mask = page_size - 1;
+    let mut pages = Vec::new();
+    for run in runs.iter() {
+        let guest = &run.guest;
+        let gpa_base = guest.import().gpa_base()?;
+        let bound = guest.bound().ok()?;
+        let start = gpa_base.checked_add(bound.offset)?;
+        let end = start.checked_add(bound.len)?;
+        let mut page = start & !mask;
+        while page < end {
+            pages.push(page);
+            page = page.checked_add(page_size)?;
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    (!pages.is_empty()).then_some(pages)
+}
+
+/// The arm one resolved sampled gather's bytes travel by, as the read-side
+/// probe's finding line names it.
+///
+/// The names are the census's own where an arm has one beside its route in the
+/// device-answer walk (`render_provider_sampled_window_borrowed`,
+/// `…_window_staged`, `…_rows_depadded`), so a hit's line and the route the same
+/// boot counted name one arm rather than two vocabularies for it. The arms the
+/// copy side of the walk takes (`depadded`, `folded_rows`, the windowless
+/// `gathered`) read the same guest pages as the borrowed window does, which is
+/// why the entry is one entry and not one per arm: what the probe asks is
+/// whether a page the guest took back was read, and every one of these is a read
+/// of it. The labelling is for the reader of a hit, not for the counting.
+fn sampled_bind_arm(stated: &NarrowTextureSource<'_>) -> &'static str {
+    match stated {
+        NarrowTextureSource::Window { .. } => "borrowed",
+        NarrowTextureSource::Depadded { .. } => "depadded",
+        NarrowTextureSource::Folded {
+            texels: FoldedTexels::Window { .. },
+            ..
+        } => "folded_window",
+        NarrowTextureSource::Folded {
+            texels: FoldedTexels::Rows { .. },
+            ..
+        } => "folded_rows",
+        NarrowTextureSource::Folded {
+            texels: FoldedTexels::Bytes(_),
+            ..
+        } => "folded_bytes",
+        NarrowTextureSource::Gathered(_) => "gathered",
+        // The arms a guest gather cannot reach. Spelled rather than left to a
+        // catch-all, so a variant added to the enum has to answer here.
+        NarrowTextureSource::Bytes(_) => "bytes",
+        NarrowTextureSource::Produced { .. } => "produced",
+        NarrowTextureSource::Frame(_) => "frame",
+        NarrowTextureSource::EntrySnapshot => "entry_snapshot",
+    }
+}
+
+#[cfg(test)]
+mod sampled_bind_read_tests {
+    use super::{
+        note_sampled_bind_read, sampled_bind_arm, sampled_bind_pages, FoldedTexels,
+        NarrowTextureSource, PaddedRows, StageBufferWindow,
+    };
+    use crate::backend::vulkan::engine::GuestRunSource;
+    use crate::runtime::drain::store_route_count;
+    use crate::runtime::guest_ram::{GuestRamImport, GuestRamRegion, GuestRef};
+    use crate::runtime::guest_ram_map::GuestWindowRun;
+    use crate::runtime::host_writes::HostWrites;
+    use crate::runtime::released_pages::{ForcedOn, SAMPLED_BIND_ROUTE};
+
+    /// A plausible RAMBlock and the guest-physical base every reference in these
+    /// fixtures lands on. The host address is compared and never dereferenced,
+    /// which is what lets a unit test hold a region it did not map.
+    const GPA_BASE: u64 = 0x1_0000_0000;
+    const RAMBLOCK: u64 = 0x7f00_0000_0000;
+
+    /// The run list the seam hands this rail for a zero-copy sampled gather: one
+    /// bounded reference per stretch of one RAMBlock, ascending and tiling the
+    /// window. `align` is the import's own granularity, which is what `bound`
+    /// widens each reference to.
+    fn window_runs(stretches: &[(u64, u64, u64)], align: u64) -> Vec<GuestWindowRun> {
+        let import = std::sync::Arc::new(
+            GuestRamImport::new(
+                GuestRamRegion {
+                    gpa_base: GPA_BASE,
+                    host_va: RAMBLOCK,
+                    len: 0x10_0000,
+                },
+                align,
+            )
+            .expect("region is aligned and non-empty"),
+        );
+        stretches
+            .iter()
+            .map(|&(window_offset, offset, len)| {
+                let guest = GuestRef::new(
+                    std::sync::Arc::clone(&import),
+                    import.slice(offset, len).expect("inside the import"),
+                )
+                .expect("the slice came from this import");
+                GuestWindowRun {
+                    window_offset,
+                    guest,
+                    window: None,
+                }
+            })
+            .collect()
+    }
+
+    fn source_over(runs: Vec<GuestWindowRun>, total_len: u64) -> GuestRunSource {
+        GuestRunSource {
+            // The CPU gather's own view of the same bytes, which the probe never
+            // reads: a probe that is on names pages from `pages`, and these
+            // fixtures have no mapping to point a host run at.
+            runs: std::sync::Arc::new(Vec::new()),
+            source_offset: 0,
+            total_len,
+            row_length_texels: 0,
+            pages: Some(std::sync::Arc::new(runs)),
+            direct_image: None,
+        }
+    }
+
+    /// The one window a sampled gather's registration names, as the finding
+    /// line's own arm value.
+    fn owned_window() -> StageBufferWindow {
+        StageBufferWindow {
+            import: 7,
+            host_va: RAMBLOCK + 0x1000,
+            length: 0x4000,
+            head: 0,
+            bytes_len: 0x1000,
+        }
+    }
+
+    fn borrowed() -> NarrowTextureSource<'static> {
+        NarrowTextureSource::Window {
+            binding: 0,
+            window: owned_window(),
+        }
+    }
+
+    /// The pages of one sampled bind, stated in guest coordinates and aligned at
+    /// the armed set's own geometry.
+    #[test]
+    fn the_bind_pages_are_guest_coordinates_aligned_at_the_armed_geometry() {
+        // A page-aligned stretch is named page for page.
+        let runs = window_runs(&[(0, 0x1000, 0x3000)], 1);
+        assert_eq!(
+            sampled_bind_pages(&source_over(runs, 0x3000), 12),
+            Some(vec![
+                GPA_BASE + 0x1000,
+                GPA_BASE + 0x2000,
+                GPA_BASE + 0x3000
+            ])
+        );
+
+        // A reference that starts inside a page is stated from that page's own
+        // first byte: the armed set is keyed by page, so the address has to be
+        // the page's and not the reference's.
+        let runs = window_runs(&[(0, 0x1800, 0x2800)], 1);
+        assert_eq!(
+            sampled_bind_pages(&source_over(runs, 0x2800), 12),
+            Some(vec![
+                GPA_BASE + 0x1000,
+                GPA_BASE + 0x2000,
+                GPA_BASE + 0x3000
+            ])
+        );
+
+        // Two stretches that meet inside one page are one page and not two: the
+        // host's contiguity is not the guest's, and a page stated twice would
+        // read one finding as two.
+        let runs = window_runs(&[(0, 0x1000, 0x800), (0x800, 0x1800, 0x800)], 1);
+        assert_eq!(
+            sampled_bind_pages(&source_over(runs, 0x1000), 12),
+            Some(vec![GPA_BASE + 0x1000])
+        );
+
+        // The geometry is the armed set's and not a constant: at 16 KiB the same
+        // bytes are one page.
+        let runs = window_runs(&[(0, 0x1000, 0x3000)], 1);
+        assert_eq!(
+            sampled_bind_pages(&source_over(runs, 0x3000), 14),
+            Some(vec![GPA_BASE])
+        );
+    }
+
+    /// A bind whose pages this coordinate system cannot state answers `None` —
+    /// the probe's undecided arm, never its quiet one.
+    #[test]
+    fn a_bind_that_cannot_name_its_pages_is_undecided_rather_than_quiet() {
+        // No run list at all, which is what a host that cannot import host
+        // pointers produces for every gather.
+        let mut windowless = source_over(window_runs(&[(0, 0x1000, 0x1000)], 1), 0x1000);
+        windowless.pages = None;
+        assert_eq!(sampled_bind_pages(&windowless, 12), None);
+
+        // The packed alias: a host allocation over scattered guest pages, which
+        // has no guest-physical base to state them from, and whose one
+        // contiguous host range is not the set of pages a read touches.
+        let backing = vec![0u8; 0x1000];
+        let alias = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(backing.as_ptr() as usize, 0x800, 1)
+                .expect("an aligned host allocation"),
+        );
+        let run = GuestWindowRun {
+            window_offset: 0,
+            guest: GuestRef::new(
+                std::sync::Arc::clone(&alias),
+                alias.slice(0, 0x800).expect("inside the allocation"),
+            )
+            .expect("the slice came from this import"),
+            window: None,
+        };
+        assert_eq!(sampled_bind_pages(&source_over(vec![run], 0x800), 12), None);
+    }
+
+    /// The entry is dark — nothing counted — for a caller that handed no census
+    /// over and for the walk's class probe. Both are asked with the probe **on**,
+    /// so "dark" cannot be read as "off": an off probe would leave the same
+    /// counters alone, and the difference is the finding line beside them.
+    #[test]
+    fn the_entry_counts_nothing_for_a_probe_or_a_caller_with_no_census() {
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        let mut writes = HostWrites::new(12);
+        writes.release_page(GPA_BASE + 0x1000);
+        let source = source_over(window_runs(&[(0, 0x1000, 0x1000)], 1), 0x1000);
+        let stated = borrowed();
+        let reads_before = store_route_count("read_guard_reads");
+        let checked_before = store_route_count("read_guard_checked_reads");
+        let reader_before = store_route_count(SAMPLED_BIND_ROUTE);
+
+        note_sampled_bind_read(None, false, 0, (16, 16), &source, &stated);
+        note_sampled_bind_read(Some(&writes), true, 0, (16, 16), &source, &stated);
+
+        assert_eq!(store_route_count("read_guard_reads"), reads_before);
+        assert_eq!(
+            store_route_count("read_guard_checked_reads"),
+            checked_before
+        );
+        assert_eq!(store_route_count(SAMPLED_BIND_ROUTE), reader_before);
+        assert!(cap.lines().is_empty(), "{:?}", cap.lines());
+    }
+
+    /// A bind over a page the guest has taken back is the finding: it is counted
+    /// under the sampled bind's own route — not the draw path's buffer route —
+    /// and its line names the arm and the declaration they belong to.
+    #[test]
+    fn a_read_of_a_released_page_is_reported_against_the_sampled_bind() {
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        let mut writes = HostWrites::new(12);
+        writes.release_page(GPA_BASE + 0x2000);
+        let source = source_over(window_runs(&[(0, 0x1000, 0x3000)], 1), 0x3000);
+        let stated = borrowed();
+        let checked_before = store_route_count("read_guard_checked_reads");
+        let pages_before = store_route_count("read_guard_checked_pages");
+        let hits_before = store_route_count("read_after_release");
+        let reader_before = store_route_count(SAMPLED_BIND_ROUTE);
+
+        note_sampled_bind_read(Some(&writes), false, 3, (64, 32), &source, &stated);
+
+        let line = cap.one(SAMPLED_BIND_ROUTE);
+        assert!(line.contains("reason=read_after_release"), "{line}");
+        assert!(
+            line.contains(&format!("gpa={:#x}", GPA_BASE + 0x2000)),
+            "{line}"
+        );
+        assert!(line.contains("arm=borrowed"), "{line}");
+        assert!(line.contains("decl=3"), "{line}");
+        assert!(
+            line.contains("attachment=64x32"),
+            "the line has to say which bind it is about: {line}"
+        );
+        assert_eq!(store_route_count(SAMPLED_BIND_ROUTE) - reader_before, 1);
+        assert_eq!(store_route_count("read_after_release") - hits_before, 1);
+        assert_eq!(
+            store_route_count("read_guard_checked_reads") - checked_before,
+            1
+        );
+        assert_eq!(
+            store_route_count("read_guard_checked_pages") - pages_before,
+            3
+        );
+    }
+
+    /// The negative control the family's zero rests on: a bind over pages the
+    /// guest still holds is checked and quiet and counted, so "nothing read a
+    /// released page" and "nothing was read" stay different readings.
+    #[test]
+    fn a_bind_over_pages_the_guest_still_holds_is_checked_and_quiet() {
+        let _on = ForcedOn::arm();
+        let cap = crate::observe::FailCapture::start();
+        let mut writes = HostWrites::new(12);
+        writes.release_page(GPA_BASE + 0x9000);
+        let source = source_over(window_runs(&[(0, 0x1000, 0x3000)], 1), 0x3000);
+        let stated = borrowed();
+        let reads_before = store_route_count("read_guard_reads");
+        let checked_before = store_route_count("read_guard_checked_reads");
+        let reader_before = store_route_count(SAMPLED_BIND_ROUTE);
+
+        note_sampled_bind_read(Some(&writes), false, 1, (8, 8), &source, &stated);
+
+        assert!(cap.lines().is_empty(), "{:?}", cap.lines());
+        assert_eq!(store_route_count("read_guard_reads") - reads_before, 1);
+        assert_eq!(
+            store_route_count("read_guard_checked_reads") - checked_before,
+            1
+        );
+        assert_eq!(store_route_count(SAMPLED_BIND_ROUTE), reader_before);
+    }
+
+    /// With the operator switch off this entry is dark: the probe's own gate
+    /// returns before the resolve and before any count, so a boot that is not
+    /// the read-side round pays neither the walk nor the lookup. (The property
+    /// that the resolve itself does not run is [`note_read`]'s, pinned in its
+    /// own module by a closure that counts its own calls; this entry's resolve
+    /// is passed to that same call and nothing runs it earlier.)
+    #[test]
+    fn the_entry_is_dark_while_the_probe_is_off() {
+        let cap = crate::observe::FailCapture::start();
+        let mut writes = HostWrites::new(12);
+        writes.release_page(GPA_BASE + 0x1000);
+        let source = source_over(window_runs(&[(0, 0x1000, 0x1000)], 1), 0x1000);
+        let stated = borrowed();
+        let reads_before = store_route_count("read_guard_reads");
+        let checked_before = store_route_count("read_guard_checked_reads");
+
+        note_sampled_bind_read(Some(&writes), false, 0, (16, 16), &source, &stated);
+
+        assert!(!crate::runtime::released_pages::reads_guarded());
+        assert_eq!(store_route_count("read_guard_reads"), reads_before);
+        assert_eq!(
+            store_route_count("read_guard_checked_reads"),
+            checked_before
+        );
+        assert!(cap.lines().is_empty(), "{:?}", cap.lines());
+    }
+
+    /// Every arm a gathered bind can be stated under has its own name, and the
+    /// arms a gather cannot reach answer too rather than falling into one label.
+    #[test]
+    fn every_arm_of_a_gathered_bind_is_named() {
+        let rows = PaddedRows {
+            row_length_texels: 4,
+            stride: 16,
+            tight_row: 8,
+            rows: 2,
+        };
+        let plan = crate::protocol::pixel_format::swizzle_identity();
+        assert_eq!(sampled_bind_arm(&borrowed()), "borrowed");
+        assert_eq!(
+            sampled_bind_arm(&NarrowTextureSource::Depadded {
+                window: owned_window(),
+                rows,
+            }),
+            "depadded"
+        );
+        for (texels, expected) in [
+            (
+                FoldedTexels::Window {
+                    window: owned_window(),
+                },
+                "folded_window",
+            ),
+            (
+                FoldedTexels::Rows {
+                    window: owned_window(),
+                    rows,
+                },
+                "folded_rows",
+            ),
+            (FoldedTexels::Bytes(&[]), "folded_bytes"),
+        ] {
+            assert_eq!(
+                sampled_bind_arm(&NarrowTextureSource::Folded { plan, texels }),
+                expected
+            );
+        }
+        assert_eq!(
+            sampled_bind_arm(&NarrowTextureSource::Gathered(Vec::new())),
+            "gathered"
+        );
+        assert_eq!(sampled_bind_arm(&NarrowTextureSource::Bytes(&[])), "bytes");
+        assert_eq!(sampled_bind_arm(&NarrowTextureSource::Frame(&[])), "frame");
+        assert_eq!(
+            sampled_bind_arm(&NarrowTextureSource::EntrySnapshot),
+            "entry_snapshot"
+        );
+    }
+
+    /// The pages a bind names are stated at the geometry the guest's own unmaps
+    /// were armed at, which is the census's and not a constant of the rail.
+    #[test]
+    fn the_pages_are_stated_at_the_censuss_own_geometry() {
+        let writes = HostWrites::new(12);
+        assert_eq!(writes.page_shift(), 12);
+        let writes = HostWrites::new(14);
+        assert_eq!(writes.page_shift(), 14);
+        let runs = window_runs(&[(0, 0x1000, 0x800)], 1);
+        let source = source_over(runs, 0x800);
+        assert_eq!(
+            sampled_bind_pages(&source, writes.page_shift()),
+            Some(vec![GPA_BASE])
+        );
     }
 }
 
@@ -11584,6 +12149,32 @@ pub struct RenderRailInputs<'a> {
     /// single-namespace relocation, and each entry's bytes are the ones this
     /// draw already resolved.
     pub stage_buffer_binds: &'a [StageBufferBind<'a>],
+    /// The device's own record of the guest pages the guest has taken back, for
+    /// the read-side probe ([`crate::runtime::released_pages`]) — the second
+    /// reader of it on this side of the seam, beside the draw path's buffer
+    /// window.
+    ///
+    /// The provider rail holds no device state: every answer it gives is a
+    /// function of these inputs, which is what lets the walk ask it a class
+    /// question without a submission and what keeps the pure gate pure. The
+    /// probe is the one **observation** this rail makes that is about the
+    /// *device* rather than about the request — does this bind read a page the
+    /// guest has taken back? — so the census travels in as an input rather than
+    /// being reached for through a global or threaded down as a fourth
+    /// argument to every call above it.
+    ///
+    /// `None` is a caller that hands no census over, and the probe then stays
+    /// dark on this rail whatever the operator switch says. That is the honest
+    /// shape for a caller that has not been wired yet: the boot's own log says
+    /// which of the two happened — a probe that never ran leaves
+    /// `read_guard_reads` at zero and no `read_guard_selftest` line, while a
+    /// probe that ran with this input absent counts nothing on the sampled
+    /// family and everything on the entries the draw path owns.
+    ///
+    /// The census itself is read-only to this rail: the probe asks it one
+    /// question per page ([`crate::runtime::host_writes::HostWrites::released_at`])
+    /// and never arms, disarms or reports through it.
+    pub read_guard: Option<&'a crate::runtime::host_writes::HostWrites>,
 }
 
 /// The statement one request's two stages make, and the declarations it leaves
@@ -12842,6 +13433,7 @@ fn submit_render_inner(
     let pass = match narrow_class(
         inputs,
         req,
+        class_only,
         stage_buffer_namespace_split,
         stage_buffer_per_stage_ceiling,
         stage_buffer_binding_range,
@@ -15193,6 +15785,16 @@ fn nonindexed_vertex_span(
 fn narrow_class<'a>(
     inputs: &'a RenderRailInputs<'a>,
     req: &'a DrawRequest,
+    // Who is asking: `true` for the walk's class probe ([`render_class_probe`]),
+    // `false` for a call that may submit. It is deliberately **not** a class
+    // answer: every rule below reads the same fields for both callers and the
+    // walk's own tests pin that (`the class cannot answer the two callers
+    // differently`). What it decides is narrower than that and belongs to the
+    // caller — whether this call is a *submission* in the making, and therefore
+    // whether the read-side probe beside the sampled gather has a read to
+    // observe at all. A probe submits nothing, so counting one as a read would
+    // put traffic in `read_guard_reads` that no command buffer ever touched.
+    class_only: bool,
     stage_buffer_namespace_split: bool,
     stage_buffer_per_stage_ceiling: Option<usize>,
     // Whether this draw's provider executes a `[[buffer(N)]]` declaration whose
@@ -16346,6 +16948,7 @@ fn narrow_class<'a>(
     let sampling = sampled_textures(
         inputs,
         req,
+        class_only,
         render_texture_gathered_extent,
         render_texture_gathered_extent_no_copy,
         render_texture_sampled_lanes,

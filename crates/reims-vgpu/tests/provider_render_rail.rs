@@ -1242,6 +1242,11 @@ fn inputs<'a>(stages: &'a Stages, role: RenderChainRole) -> RenderRailInputs<'a>
         // shape every pre-R9d test in this file is about — a request whose
         // stages declare nothing answers exactly as it did before.
         stage_buffer_binds: &[],
+        // No read-side census: every test in this file is about the class's own
+        // answer, and the probe observes rather than decides — the tests that
+        // check the entry itself are the rail's own module tests, where the
+        // probe's per-process switch can be forced on.
+        read_guard: None,
         present: None,
     }
 }

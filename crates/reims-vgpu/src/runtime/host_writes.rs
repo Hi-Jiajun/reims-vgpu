@@ -578,6 +578,20 @@ impl HostWrites {
         self.pages.disarm(gpa >> self.page_shift);
     }
 
+    /// The geometry every address in this record is normalized at.
+    ///
+    /// A reader that has to *state* a byte range as this record's pages — the
+    /// read-side probe asks one address per page — has to align at the same
+    /// granularity the arming side shifted by, or the same guest page would be
+    /// reported as several: on a 16 KiB guest, four 4 KiB addresses of one
+    /// armed page are four `released_at` hits and four lines, one finding read
+    /// as four. The shift is therefore read here rather than assumed, so a
+    /// caller cannot state its pages at another geometry than the one the
+    /// guest's own unmaps were armed at.
+    pub fn page_shift(&self) -> u32 {
+        self.page_shift
+    }
+
     /// The epoch at which the guest released `gpa`, or `None` while the page is
     /// not armed.
     ///
