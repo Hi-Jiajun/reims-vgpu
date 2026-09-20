@@ -860,6 +860,17 @@ pub enum EncodeStatus {
     /// pass clear — but the class is not, and a reader triaging a black frame on
     /// a Metal host needs to know the difference between a stub and a gap.
     Unsupported(&'static str),
+    /// G3-B/B-1: the record was assembled into the run under construction
+    /// (`REIMS_VGPU_RENDER_BATCH`) and answered nothing on its own — the run's
+    /// one completion carries its answer, and every member of a run shares it.
+    ///
+    /// This is *not* a refusal, and the walk must not treat it as one: the draw
+    /// has neither run nor been lost, it is one entry of a submission scope the
+    /// walk is still building. The one arm that answers a record on this rail
+    /// without submitting anything of its own, exactly as the resident-chain
+    /// arm answers one that keeps a frame — which is why it is a status and not
+    /// a decline.
+    Parked,
 }
 
 impl crate::observe::Refusal for EncodeStatus {
@@ -868,6 +879,9 @@ impl crate::observe::Refusal for EncodeStatus {
             // The only non-refusal, and the reason this is a `Refusal` rather
             // than a `Decline`: `Emit::refusal` cannot render a line for it.
             Self::Ok => None,
+            // A record in a run has neither drawn nor been refused yet; the
+            // run's own answer is what will say which it was.
+            Self::Parked => None,
             Self::RailRefused(refusal) => refusal.refusal(),
             Self::MissingPipeline(slug)
             | Self::MissingMtlb(slug)
@@ -898,6 +912,10 @@ impl EncodeStatus {
     pub fn class(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            // Named for the census: a `draws_skipped_after_engine_refusal`
+            // reading that swept this variant into a refusal class would report
+            // a run's members as draws this device lost.
+            Self::Parked => "parked",
             // The two names the boot logs have carried since this was
             // `MetalBackend`; see `ComputeStatus::class`.
             Self::RailRefused(refusal) => {

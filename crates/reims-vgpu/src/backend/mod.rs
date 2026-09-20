@@ -319,6 +319,46 @@ pub(crate) trait Backend: Copy {
         writeback_guest: bool,
     ) -> crate::runtime::draw::ChainHandoffProbe;
 
+    /// G3-B/B-1 (`REIMS_VGPU_RENDER_BATCH`): assemble one record of a run the
+    /// walk has already probed into the batch under construction, instead of
+    /// submitting anything of its own.
+    ///
+    /// The walk decides *which* records form a run, because it is the only
+    /// thing that has the keep plan; this method decides only whether the rail
+    /// can carry a record the plan elected. The two are one call on purpose: a
+    /// rail that cannot park must say so before the walk has parked anything
+    /// else, or the batch it abandoned would be half a trace.
+    ///
+    /// `parked` is the status; `Some` names a provider answer that the record
+    /// does not own. The two arms a caller has to keep apart are:
+    ///
+    /// * a **member** of a run parks and answers nothing
+    ///   ([`crate::runtime::draw::EncodeStatus::Parked`], `None` on both of the
+    ///   other slots) — the run's own completion will answer it;
+    /// * the run's **publishing tail** parks *and* finishes the run, so the
+    ///   pair it returns is what a lone record's `encode_draw_chain` would have
+    ///   returned, and the third slot names the outcome that produced it when
+    ///   the rail has one to name.
+    ///
+    /// The default has no canonical rail to assemble into, so it answers the
+    /// status the walk reads as "this record did not join" — which no caller
+    /// reaches on a rail whose probe answers
+    /// [`crate::runtime::draw::ChainProbe::Unavailable`], because a run is
+    /// never elected there.
+    fn park_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _req: &mut DrawEncodeRequest,
+        _writeback_guest: bool,
+        _batch: &mut crate::backend::provider_render::RenderBatch,
+    ) -> (EncodeStatus, Option<Vec<u8>>) {
+        (
+            EncodeStatus::BadArgs("draw_park_without_a_canonical_provider"),
+            None,
+        )
+    }
+
     /// Execute a range of an indirect command buffer the guest has filled.
     ///
     /// A backend may not have one: `executeCommandsInBuffer:` is a Metal
@@ -1329,6 +1369,22 @@ impl Backend for SelectedBackend {
             Self::Metal(b) => b.probe_draw_chain(state, host, req, writeback_guest),
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => b.probe_draw_chain(state, host, req, writeback_guest),
+        }
+    }
+
+    fn park_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+        batch: &mut crate::backend::provider_render::RenderBatch,
+    ) -> (EncodeStatus, Option<Vec<u8>>) {
+        match self {
+            #[cfg(feature = "backend-metal")]
+            Self::Metal(b) => b.park_draw_chain(state, host, req, writeback_guest, batch),
+            #[cfg(feature = "backend-vulkan")]
+            Self::Vulkan(b) => b.park_draw_chain(state, host, req, writeback_guest, batch),
         }
     }
 

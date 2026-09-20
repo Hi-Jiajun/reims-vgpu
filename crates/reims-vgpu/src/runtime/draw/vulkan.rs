@@ -435,10 +435,19 @@ pub fn probe_draw_chain<M: HostMemory + HostOps>(
     req.resident_frame_published_by_provider = false;
     req.chain_resident_held_by_provider = false;
     req.chain_resident_kept_attachment = None;
-    match try_metal2vulkan_draw(state, host, req, writeback_guest, Some(&mut probe)) {
+    match try_metal2vulkan_draw(
+        state,
+        host,
+        req,
+        writeback_guest,
+        &mut ChainHandoff::Probe(&mut probe),
+        &mut None,
+    ) {
         // The seam returns `Probed` on this path and never any other span; a
         // different arm would mean the probe asked for a real encode, which is
-        // the one thing its sink exists to prevent.
+        // the one thing its sink exists to prevent. `Parked` is the same
+        // statement about the batch arm: a class-only call is handed
+        // `ChainHandoff::Probe`, which cannot reach it.
         Ok(M2vDrawSpan::Probed) => probe,
         // A record the seam cannot even prepare (a bind past its table, a chain
         // identity it cannot resolve) is not one the walk may keep a frame for.
@@ -460,6 +469,33 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // ever reaches the pipeline scissor rect, never the Store extent.
     _force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
+    encode_draw_chain_handoff(state, host, req, writeback_guest, ChainHandoff::Encode)
+}
+
+/// [`encode_draw_chain`] with the canonical rail's own question named
+/// (G3-B/B-1).
+///
+/// `handoff` is `Park` for a run's member and `ParkAndFinish` for its
+/// publishing tail; `Encode` is every call that predates the batch, byte for
+/// byte. The writeback arm is not a parameter here because the run's own shape
+/// states it: a member withholds its Store and a tail performs it, which is
+/// exactly what the walk's fixup hands this call.
+pub fn encode_draw_chain_handoff<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &mut DrawEncodeRequest,
+    writeback_guest: bool,
+    handoff: ChainHandoff<'_>,
+) -> (EncodeStatus, Option<Vec<u8>>) {
+    // The run's tail is the one record of a run that publishes, and the walk
+    // reaches this call for it with `multi_draw_store_plan`'s own answer. A
+    // tail without the Store would build the run's whole trace and then answer
+    // `Ok` with no frame — a run the guest never sees and no counter names.
+    debug_assert!(
+        !matches!(handoff, ChainHandoff::ParkAndFinish(_)) || writeback_guest,
+        "a run's tail parks with the Store the walk's own plan gave it"
+    );
+    let mut handoff = handoff;
     // Charges this chain to one phase at a time all the way down, including the
     // parts of it that live inside `try_metal2vulkan_draw`. Held here rather
     // than there because the Store routing below the engine is on the same
@@ -552,13 +588,48 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // resource-scoped debt records the future transfer. The twin of
     // `surface_store_armed`, and it returns through the same door.
     let mut gva_store_armed = false;
+    // G3-B/B-1: the run's own answer, on the one arm where this record parked
+    // *and* finished the run. `None` is every other arm — including a run's
+    // member, which has no answer because the run it belongs to is still open,
+    // and every record that predates the batch.
+    let mut engine_answer: Option<crate::backend::provider_render::RenderRailOutcome> = None;
+    // G3-B/B-1: a run's *member* answers nothing — the run it belongs to is
+    // still open, so there is no completion to read and no span to route. The
+    // walk hands a member `ChainHandoff::Park`, and a tail
+    // `ChainHandoff::ParkAndFinish`, so this arm is exactly "the run's middle":
+    // return the same pair a resident-chain intermediate returns, and let the
+    // run's one completion answer it.
+    //
+    // Taken *before* the seam and not after it, for two reasons: the seam is
+    // where the record's assembly happens (and it already has, by the time this
+    // is reached), and the flags the seam's own guard below resets are the ones
+    // a parked record has to carry out of here.
+    if matches!(handoff, ChainHandoff::Park(_)) {
+        debug_assert!(
+            req.vertex_count > 0 || req.indexed.is_some(),
+            "a run's member declares color-0 geometry"
+        );
+        // The same flag the resident-chain intermediate sets, for the same
+        // reason: the frame this record's pass will produce is the run's own
+        // image, and a caller that asked whether the record produced pixels
+        // would be asking the wrong question.
+        req.chain_resident_established = true;
+        return (EncodeStatus::Parked, None);
+    }
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
         req.chain_resident_established = false;
         req.resident_frame_published_by_provider = false;
         req.chain_resident_held_by_provider = false;
         req.chain_resident_kept_attachment = None;
-        let engine = try_metal2vulkan_draw(state, host, req, writeback_guest, None);
+        let engine = try_metal2vulkan_draw(
+            state,
+            host,
+            req,
+            writeback_guest,
+            &mut handoff,
+            &mut engine_answer,
+        );
         // Set from the result itself rather than inside the arms, because the
         // arms are where this went wrong: the refusal slug was assigned only in
         // `Err`, every `Ok` arm left it `None`, and the tail spelled `None`
@@ -701,6 +772,18 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     EncodeStatus::BadArgs("draw_vk_probe_reached_the_encoder"),
                     None,
                 );
+            }
+            // G3-B/B-1: a record of a run was assembled and nothing of it ran,
+            // so there is no span to route and no frame to store. The run's own
+            // completion answers it, and the answer is read one block down —
+            // after this match, because it belongs to the *submission* handling
+            // rather than to span routing, and the two are otherwise the same
+            // five hundred lines written twice.
+            Ok(M2vDrawSpan::Parked) => {
+                crate::observe::line(format!(
+                    "linux_m2v_draw parked pipe={} {}x{}",
+                    req.pipeline_ref, pass_w, pass_h
+                ));
             }
             Ok(M2vDrawSpan::BorrowedLanding {
                 bytes,
@@ -7057,6 +7140,11 @@ impl EngineDrawOutcome {
     fn of(result: &Result<M2vDrawSpan, DrawError>) -> Self {
         match result {
             Ok(M2vDrawSpan::None) => Self::NoColorGeometry,
+            // G3-B/B-1: a record in a run reaches the tail that reads this
+            // enum without either rail running, so the honest class is the same
+            // one a record whose shape the packet never offered gets — the
+            // engine's own answer, if it ever has one, is the batch's.
+            Ok(M2vDrawSpan::Parked) => Self::NotAttempted,
             Ok(_) => Self::Drew,
             Err(e) => Self::Refused(crate::observe::Decline::slug(e)),
         }
@@ -7612,6 +7700,46 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
 }
 
 /// Result of a Linux metal2vulkan draw.
+/// Which of the canonical rail's three questions one seam call asks (G3-B/B-1).
+///
+/// Every arm below the class gate — the probe's sink, the run's assembly and
+/// the run's own completion — is the *same* code reached with a different
+/// answer wanted, so they are one value rather than three entry points into the
+/// seam. That is what keeps "a probe and the encode it stands for ask one
+/// question" true by construction: none of the three can be reached with
+/// another's request.
+pub enum ChainHandoff<'a> {
+    /// The real encode: the class's answer, then a submission of this record's
+    /// own. Every call outside `REIMS_VGPU_RENDER_BATCH`'s run members is this
+    /// arm.
+    Encode,
+    /// R42: the class-only probe. Fills `sink` and returns before either rail
+    /// runs.
+    Probe(&'a mut super::ChainHandoffProbe),
+    /// G3-B/B-1: assemble the record into the run under construction and
+    /// submit nothing — the run's one completion will answer it.
+    Park(&'a mut crate::backend::provider_render::RenderBatch),
+    /// G3-B/B-1: assemble the record into the run and *finish* it, so this
+    /// record is the trace's publishing tail and the run's own answer for it
+    /// travels out on [`M2vDrawSpan::Parked`]'s `answer`.
+    ParkAndFinish(&'a mut crate::backend::provider_render::RenderBatch),
+}
+
+impl ChainHandoff<'_> {
+    /// Whether this call is the class-only probe rather than a record's real
+    /// encode.
+    ///
+    /// The one question the seam's own body asks about its own arm: several
+    /// steps below the class gate exist because a record about to be *submitted*
+    /// must state something a probe must not (a load this rail's predecessor
+    /// already answered for, a frame this record's predecessor kept). A run's
+    /// member is a real encode on that axis, so it answers `false` here exactly
+    /// as [`Self::Encode`] does.
+    fn is_probe(&self) -> bool {
+        matches!(self, Self::Probe(_))
+    }
+}
+
 /// The class-only answer, defined on the always-compiled draw module so the
 /// backend trait can name it on a host with no Vulkan rail at all (R42).
 pub use super::ChainProbe;
@@ -7704,6 +7832,18 @@ enum M2vDrawSpan {
     /// `encode_draw_chain` treats an answer here as a wiring fault rather than
     /// as "the record produced nothing".
     Probed,
+    /// G3-B/B-1: the record was assembled into the run under construction
+    /// (`REIMS_VGPU_RENDER_BATCH`) instead of being submitted on its own, and
+    /// nothing of this record ran yet.
+    ///
+    /// The run's own answer — on the one arm where this record parked *and*
+    /// finished the run — travels out through `try_metal2vulkan_draw`'s own
+    /// sink rather than through this span, because that answer is what the
+    /// run's one completion said and not a rail's geometry: the arm that reads
+    /// it is the *same* match the single-record path reads (the tail is
+    /// answered exactly as it would have been alone), and an `Option` on this
+    /// span would be five hundred lines of routing re-stated to get there.
+    Parked,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -8336,12 +8476,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
-    // R42: the class-only probe's sink. `Some` asks the canonical class the
-    // question this record's predecessor needs answered before it keeps a
-    // frame — "would you answer this record?" — and returns before either rail
-    // runs. `None` is every real encode, and the two paths share every line of
-    // the class above the submission by construction.
-    probe: Option<&mut super::ChainHandoffProbe>,
+    // Borrowed rather than moved: this function asks its own body one question
+    // about which arm it was handed (`is_probe`) after the answer has been
+    // taken, so the arm has to outlive the call that consumes it.
+    handoff: &mut ChainHandoff<'_>,
+    // G3-B/B-1: the run's own answer, on the one arm where this record parked
+    // *and* finished the run (`ChainHandoff::ParkAndFinish`). A sink rather
+    // than a seventh `M2vDrawSpan` variant, because the answer is not a span:
+    // it is *what the run's one completion answered*, and the caller it belongs
+    // to is the same code that handles a lone record's answer.
+    engine_answer: &mut Option<crate::backend::provider_render::RenderRailOutcome>,
 ) -> Result<M2vDrawSpan, DrawError> {
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
@@ -10700,7 +10844,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // committed. Skipped while probing: a probe has no predecessor
             // answer yet, and its verdict is the class's own.
             #[cfg(feature = "provider-render")]
-            if probe.is_none() && req.chain_loads_resident {
+            if !handoff.is_probe() && req.chain_loads_resident {
                 let current = resources.target_identity.as_ref().map(|identity| {
                     let attachment = crate::backend::provider_render::resident_attachment(identity);
                     (attachment.allocation.get(), attachment.view.get())
@@ -11452,9 +11596,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // smaller than its parent is a bracket bug, not a finding: the
             // first eg1 round read exactly that (rails plus seam at 165 % of
             // `engine_us`), and the probe's own cost is read where it is paid.
+            // The probe question, read once into a flag rather than captured:
+            // the closure outlives the `handoff` match below (it closes the
+            // bands after the answer), and a closure that borrowed the arm
+            // would hold the seam's own handoff across its own dispatch.
+            let seam_charges = !handoff.is_probe();
             let seam_span = |bar| {
-                probe
-                    .is_none()
+                seam_charges
                     .then(|| crate::runtime::drain::frame_span(bar))
                     .flatten()
             };
@@ -12112,29 +12260,96 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // (`provider_render::submit_render` with its class-only mode), so
             // the verdict the walk admits a record on is the verdict that
             // record will meet.
-            // Moved, not borrowed through a deref: `probe` is used once and the
-            // seam returns on this arm.
-            if let Some(sink) = probe {
-                sink.verdict = match provider_render::render_class_probe(&inputs, &resources) {
-                    provider_render::RenderClassProbe::InClass => ChainProbe::Admitted,
-                    provider_render::RenderClassProbe::OutOfClass => ChainProbe::Refused,
-                    provider_render::RenderClassProbe::Unavailable => ChainProbe::Unavailable,
-                };
-                // R42: the pair this record's own identity names, which is the
-                // half the walk compares across a packet's records. Read from
-                // the same mint the submission would use, so a probe and the
-                // encode it stands for cannot name two different images.
-                sink.attachment = resources.target_identity.as_ref().map(|identity| {
-                    let attachment = provider_render::resident_attachment(identity);
-                    (attachment.allocation.get(), attachment.view.get())
-                });
-                return Ok(M2vDrawSpan::Probed);
+            //
+            // The three ways the canonical answer can be *asked for* are the
+            // three arms below, and they are one `match` rather than three
+            // hooks so a record cannot reach the submission with two of them
+            // set: the probe wants the class's verdict and no work, a run's
+            // member wants the assembly and no submission, and a run's tail
+            // wants both the assembly and the run's own completion.
+            //
+            // G3-B/B-1: the two park arms are reached only for a shape that
+            // declares color-0 geometry, because this seam never calls the
+            // canonical rail for one that does not (`encode_draw_chain`'s own
+            // guard, which the walk's fixup reads as well). A member the run's
+            // trace could not carry would be one the run's single completion
+            // answers for a pass that does not exist, so it is a wiring fault
+            // and not a case to route.
+            debug_assert!(
+                matches!(handoff, ChainHandoff::Encode | ChainHandoff::Probe(_))
+                    || req.vertex_count > 0
+                    || req.indexed.is_some(),
+                "a run's member or tail declares color-0 geometry"
+            );
+            match &mut *handoff {
+                ChainHandoff::Encode => {}
+                ChainHandoff::Probe(sink) => {
+                    sink.verdict = match provider_render::render_class_probe(&inputs, &resources) {
+                        provider_render::RenderClassProbe::InClass => ChainProbe::Admitted,
+                        provider_render::RenderClassProbe::OutOfClass => ChainProbe::Refused,
+                        provider_render::RenderClassProbe::Unavailable => ChainProbe::Unavailable,
+                    };
+                    // R42: the pair this record's own identity names, which is
+                    // the half the walk compares across a packet's records.
+                    // Read from the same mint the submission would use, so a
+                    // probe and the encode it stands for cannot name two
+                    // different images.
+                    sink.attachment = resources.target_identity.as_ref().map(|identity| {
+                        let attachment = provider_render::resident_attachment(identity);
+                        (attachment.allocation.get(), attachment.view.get())
+                    });
+                    return Ok(M2vDrawSpan::Probed);
+                }
+                ChainHandoff::Park(batch) => {
+                    let answer = provider_render::park_render(&inputs, &resources, batch);
+                    match answer {
+                        provider_render::RenderParkOutcome::Parked => {
+                            return Ok(M2vDrawSpan::Parked);
+                        }
+                        provider_render::RenderParkOutcome::OutOfClass(reason) => {
+                            *engine_answer = Some(RenderRailOutcome::NotInNarrowClass(reason));
+                            return Ok(M2vDrawSpan::Parked);
+                        }
+                        provider_render::RenderParkOutcome::Declined(decline) => {
+                            *engine_answer = Some(RenderRailOutcome::ProviderDeclined(decline));
+                            return Ok(M2vDrawSpan::Parked);
+                        }
+                    }
+                }
+                ChainHandoff::ParkAndFinish(batch) => {
+                    return match provider_render::park_and_finish_render(&inputs, &resources, batch)
+                    {
+                        // Nothing of this record ran and nothing was routed:
+                        // the run's one completion answered it, and that answer
+                        // travels out through the sink rather than through a
+                        // span a reader would have to interpret.
+                        Ok(outcome) => {
+                            *engine_answer = Some(outcome);
+                            Ok(M2vDrawSpan::Parked)
+                        }
+                        Err(decline) => {
+                            *engine_answer = Some(RenderRailOutcome::ProviderDeclined(decline));
+                            Ok(M2vDrawSpan::Parked)
+                        }
+                    };
+                }
             }
-            let outcome = {
-                let _provider_rail = crate::runtime::drain::frame_span(
-                    crate::runtime::drain::FrameSpan::RailProvider,
-                );
-                provider_render::submit_render(&inputs, &resources)
+            // G3-B/B-1: the run's tail already has its answer — the run's one
+            // completion is the submission, and it happened when the batch was
+            // finished. Every other call reaches the provider rail here exactly
+            // as it always did.
+            let outcome = match engine_answer.take() {
+                // The run's tail: its answer came out of the run's one
+                // completion, and every arm below reads it exactly as it reads
+                // a lone record's — which is the whole point of the tail
+                // parking instead of returning early.
+                Some(answer) => answer,
+                None => {
+                    let _provider_rail = crate::runtime::drain::frame_span(
+                        crate::runtime::drain::FrameSpan::RailProvider,
+                    );
+                    provider_render::submit_render(&inputs, &resources)
+                }
             };
             // The answer's own handling: on the engine rail this is where the
             // class's refusal is priced, because the out-of-class line and the
@@ -16765,7 +16980,14 @@ mod vulkan_split_tests {
             ..DrawEncodeRequest::default()
         };
 
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true, None) {
+        let err = match try_metal2vulkan_draw(
+            &mut state,
+            &mut host,
+            &mut req,
+            true,
+            &mut ChainHandoff::Encode,
+            &mut None,
+        ) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
         };
@@ -16806,7 +17028,14 @@ mod vulkan_split_tests {
             ..DrawEncodeRequest::default()
         };
 
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true, None) {
+        let err = match try_metal2vulkan_draw(
+            &mut state,
+            &mut host,
+            &mut req,
+            true,
+            &mut ChainHandoff::Encode,
+            &mut None,
+        ) {
             Err(err) => err,
             Ok(_) => panic!("a texture bind past the table cannot encode"),
         };
@@ -16827,7 +17056,14 @@ mod vulkan_split_tests {
         // which is what says the refusal is about live guest work and not about
         // the index alone.
         std::sync::Arc::make_mut(&mut req.fragment_textures)[0].texture_ref = 0;
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true, None) {
+        let err = match try_metal2vulkan_draw(
+            &mut state,
+            &mut host,
+            &mut req,
+            true,
+            &mut ChainHandoff::Encode,
+            &mut None,
+        ) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
         };

@@ -180,6 +180,26 @@ impl Backend for VulkanBackend {
         draw::vulkan::probe_draw_chain(state, host, req, writeback_guest)
     }
 
+    fn park_draw_chain<M: HostMemory + HostOps>(
+        &self,
+        state: &mut DeviceState,
+        host: &mut M,
+        req: &mut DrawEncodeRequest,
+        writeback_guest: bool,
+        batch: &mut crate::backend::provider_render::RenderBatch,
+    ) -> (EncodeStatus, Option<Vec<u8>>) {
+        // The run's tail is the record that publishes, and the walk reaches
+        // this call for it with `multi_draw_store_plan`'s own answer. The
+        // handoff arm is read off that rather than passed, so the two cannot
+        // disagree about which record finishes the run.
+        let handoff = if writeback_guest {
+            draw::vulkan::ChainHandoff::ParkAndFinish(batch)
+        } else {
+            draw::vulkan::ChainHandoff::Park(batch)
+        };
+        draw::vulkan::encode_draw_chain_handoff(state, host, req, writeback_guest, handoff)
+    }
+
     fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
         &self,
         state: &mut DeviceState,
