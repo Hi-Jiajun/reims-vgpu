@@ -825,6 +825,113 @@ impl LeaseVecMeter {
     }
 }
 
+/// One section of the statement this rail put on the wire, with its own slot in
+/// the count/byte tables beside the frame the section was read from.
+///
+/// [`wire_bytes`](crate::runtime::drain::FrameProfileCensus) says how big the
+/// owner→provider frames were. It cannot say *what* they were made of, and a
+/// cut that shrinks a statement has to know which section the bytes are in
+/// before it may take them out — which is the question
+/// `openspec/changes/render-statement-economy` §2 (W1) is decided on. The
+/// sections are read inside the codec
+/// (`metal_api_ipc::statement`) and handed to this table by the rail that
+/// encodes the frames, so every field here is a reading of the same bytes
+/// [`wire_bytes`](crate::runtime::drain::FrameProfileCensus) counts rather than
+/// a second estimate of them.
+///
+/// The six positional sections tile a payload, so a reader can check the line
+/// against the frame it came from:
+///
+/// ```text
+/// stmt_total_bytes == stmt_tag_bytes + stmt_trace_bytes + stmt_pipeline_bytes
+///                   + stmt_pass_bytes + stmt_resources_bytes + stmt_tail_bytes
+/// wire_bytes       == stmt_total_bytes + 9 * stmt_total_n
+/// ```
+///
+/// The view fields are the exception, and deliberately so: a view sits inside
+/// whichever pass carries it, so `stmt_views` and `stmt_view_payload` are
+/// roll-ups *within* `stmt_pass` rather than tiles beside it. The payload arm is
+/// the one the statement-economy change is read against — it is the batch of
+/// bytes the provider then has to copy, upload and release.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub(crate) enum StatementMeter {
+    /// The whole payload, frame header excluded (`_n` is statements).
+    Total = 0,
+    /// The request tag that selected the submission's shape.
+    Tag = 1,
+    /// The trace's schema, epoch, operation id and pipeline count.
+    TraceHeader = 2,
+    /// The pipeline table behind that count.
+    PipelineTable = 3,
+    /// The dispatch type, the pass count and every pass.
+    PassTable = 4,
+    /// The allocations and lease reservations.
+    ResourceTable = 5,
+    /// The completion policy and any heap/ICB tail.
+    Tail = 6,
+    /// Every `BufferView` in the payload (`_n` is views).
+    Views = 7,
+    /// The `OwnedBytes` payload inside those views.
+    ViewPayload = 8,
+    /// The sum of those views' declared lengths.
+    ViewDeclared = 9,
+    /// Every `TextureView` in the payload (`_n` is textures).
+    Textures = 10,
+    /// The `OwnedBytes` payload inside those textures.
+    TexturePayload = 11,
+}
+
+/// Number of [`StatementMeter`] slots, derived from the enum the same way
+/// [`LEASE_VEC_METERS`] is.
+const STATEMENT_METERS: usize = StatementMeter::TexturePayload as usize + 1;
+
+/// The emitted field-name stem of each statement meter, in slot order.
+const STATEMENT_NAMES: [&str; STATEMENT_METERS] = [
+    "stmt_total",
+    "stmt_tag",
+    "stmt_trace",
+    "stmt_pipeline",
+    "stmt_pass",
+    "stmt_resources",
+    "stmt_tail",
+    "stmt_views",
+    "stmt_view_payload",
+    "stmt_view_declared",
+    "stmt_textures",
+    "stmt_texture_payload",
+];
+
+impl StatementMeter {
+    /// This meter's slot in the count/byte tables, which is its discriminant.
+    #[inline]
+    pub(crate) fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// Every [`StatementMeter`] in slot order, so the rail that hands the codec's
+/// account over walks one table rather than naming twelve variants at each end
+/// of the hand-over.
+pub(crate) const STATEMENT_METER_SLOTS: [StatementMeter; STATEMENT_METERS] = [
+    StatementMeter::Total,
+    StatementMeter::Tag,
+    StatementMeter::TraceHeader,
+    StatementMeter::PipelineTable,
+    StatementMeter::PassTable,
+    StatementMeter::ResourceTable,
+    StatementMeter::Tail,
+    StatementMeter::Views,
+    StatementMeter::ViewPayload,
+    StatementMeter::ViewDeclared,
+    StatementMeter::Textures,
+    StatementMeter::TexturePayload,
+];
+
+/// How many [`StatementMeter`] slots there are, for a caller sizing its own
+/// table of the same shape.
+pub(crate) const STATEMENT_METER_COUNT: usize = STATEMENT_METERS;
+
 impl FrameSpan {
     /// The bar a [`crate::runtime::chain_phase::Phase`] ordinal names.
     ///
@@ -1017,6 +1124,16 @@ pub(crate) struct FrameProfileCensus {
     lease_vec_bytes_sum: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
     last_present_lease_vec_n: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
     last_present_lease_vec_bytes: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
+    // The statement's own sections ([`StatementMeter`]), charged by the rail
+    // where the frame is built and differenced on the same edge as the wire
+    // counters beside them, so the sections and the frame they were read from
+    // are the same frame's.
+    stmt_n: [std::sync::atomic::AtomicU64; STATEMENT_METERS],
+    stmt_bytes: [std::sync::atomic::AtomicU64; STATEMENT_METERS],
+    stmt_n_sum: [std::sync::atomic::AtomicU64; STATEMENT_METERS],
+    stmt_bytes_sum: [std::sync::atomic::AtomicU64; STATEMENT_METERS],
+    last_present_stmt_n: [std::sync::atomic::AtomicU64; STATEMENT_METERS],
+    last_present_stmt_bytes: [std::sync::atomic::AtomicU64; STATEMENT_METERS],
     // The previous frame's close; 0 before the first present.
     last_present_us: std::sync::atomic::AtomicU64,
     last_present_draws: std::sync::atomic::AtomicU64,
@@ -1060,6 +1177,12 @@ impl FrameProfileCensus {
             lease_vec_bytes_sum: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
             last_present_lease_vec_n: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
             last_present_lease_vec_bytes: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
+            stmt_n: [const { AtomicU64::new(0) }; STATEMENT_METERS],
+            stmt_bytes: [const { AtomicU64::new(0) }; STATEMENT_METERS],
+            stmt_n_sum: [const { AtomicU64::new(0) }; STATEMENT_METERS],
+            stmt_bytes_sum: [const { AtomicU64::new(0) }; STATEMENT_METERS],
+            last_present_stmt_n: [const { AtomicU64::new(0) }; STATEMENT_METERS],
+            last_present_stmt_bytes: [const { AtomicU64::new(0) }; STATEMENT_METERS],
             last_present_us: AtomicU64::new(0),
             last_present_draws: AtomicU64::new(0),
             last_present_draw_us: AtomicU64::new(0),
@@ -1130,6 +1253,18 @@ impl FrameProfileCensus {
         self.lease_vec_bytes[meter.slot()].fetch_add(bytes, Relaxed);
     }
 
+    /// Bank one statement section read out of the codec against the open frame.
+    ///
+    /// `n` is how many of the meter's own subject the read covered — one
+    /// statement for the six tiles, one view or texture for the roll-ups — and
+    /// `bytes` is the bytes that subject took. Charged by the rail where the
+    /// frame is built, so the section and the frame are the same event's.
+    pub(crate) fn note_statement(&self, meter: StatementMeter, n: u64, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stmt_n[meter.slot()].fetch_add(n, Relaxed);
+        self.stmt_bytes[meter.slot()].fetch_add(bytes, Relaxed);
+    }
+
     /// Close the frame a present ends, and report when the window fills.
     ///
     /// `not_enabled` names the arm
@@ -1190,6 +1325,20 @@ impl FrameProfileCensus {
             let prev = self.last_present_lease_vec_bytes[slot].swap(cur, Relaxed);
             *bytes = cur.saturating_sub(prev);
         }
+        // The statement sections are differenced the same way and on the same
+        // edge as the wire counters, so a statement that straddles a report
+        // boundary stays whole: the sections and the frame they came out of are
+        // never split across two windows.
+        let mut stmt_n = [0u64; STATEMENT_METERS];
+        let mut stmt_bytes = [0u64; STATEMENT_METERS];
+        for (slot, (n, bytes)) in stmt_n.iter_mut().zip(stmt_bytes.iter_mut()).enumerate() {
+            let cur = self.stmt_n[slot].load(Relaxed);
+            let prev = self.last_present_stmt_n[slot].swap(cur, Relaxed);
+            *n = cur.saturating_sub(prev);
+            let cur = self.stmt_bytes[slot].load(Relaxed);
+            let prev = self.last_present_stmt_bytes[slot].swap(cur, Relaxed);
+            *bytes = cur.saturating_sub(prev);
+        }
         // The sub-phase table is differenced the same way and on the same
         // terms, so a frame that straddles a report boundary stays whole.
         let mut frame_spans = [0u64; FRAME_SPANS];
@@ -1232,6 +1381,10 @@ impl FrameProfileCensus {
         for (slot, (n, bytes)) in lease_vec_n.iter().zip(lease_vec_bytes.iter()).enumerate() {
             self.lease_vec_n_sum[slot].fetch_add(*n, Relaxed);
             self.lease_vec_bytes_sum[slot].fetch_add(*bytes, Relaxed);
+        }
+        for (slot, (n, bytes)) in stmt_n.iter().zip(stmt_bytes.iter()).enumerate() {
+            self.stmt_n_sum[slot].fetch_add(*n, Relaxed);
+            self.stmt_bytes_sum[slot].fetch_add(*bytes, Relaxed);
         }
         self.host_sum_us.fetch_add(frame_host_us, Relaxed);
         self.host_max_us.fetch_max(frame_host_us, Relaxed);
@@ -1287,6 +1440,18 @@ impl FrameProfileCensus {
                     " {name}_n={} {name}_bytes={}",
                     mean(self.lease_vec_n_sum[slot].swap(0, Relaxed)),
                     mean(self.lease_vec_bytes_sum[slot].swap(0, Relaxed)),
+                ));
+            }
+            // The statement's own sections, closed on the same presents and
+            // divided by the same `frames`: `stmt_total_n` beside `wire_frames`
+            // is the count of statements the bytes were read from, and the two
+            // roll-ups are shares of `stmt_pass_bytes` rather than tiles beside
+            // it.
+            for (slot, name) in STATEMENT_NAMES.iter().enumerate() {
+                line.push_str(&format!(
+                    " {name}_n={} {name}_bytes={}",
+                    mean(self.stmt_n_sum[slot].swap(0, Relaxed)),
+                    mean(self.stmt_bytes_sum[slot].swap(0, Relaxed)),
                 ));
             }
             for (name, acc) in SPAN_NAMES.iter().zip(self.span_sum_us.iter()) {
@@ -1349,7 +1514,7 @@ pub(crate) struct FrameProfileLines {
 /// (`chain_phase`'s bars) beside the spans it added. The answer cannot change
 /// after the first read, so `INIT` is read before it is written rather than by
 /// the write.
-fn frame_profile_on() -> bool {
+pub(crate) fn frame_profile_on() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     static INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1422,6 +1587,25 @@ pub(crate) fn note_lease_vec(meter: LeaseVecMeter, n: u64, bytes: u64) {
         return;
     }
     FRAME_PROFILE.note_lease_vec(meter, n, bytes);
+}
+
+/// Bank one statement section against the open frame.
+///
+/// Called only by the rail that encodes the submission, out of the account
+/// `metal_api_ipc::statement` took for the frame it just built — so the section
+/// is charged on the same event `note_frame_wire_bytes` charges the frame on,
+/// and the two readings are of the same bytes rather than of two populations
+/// that happen to be adjacent.
+///
+/// A window whose arm did not price its statements prints the fields at zero,
+/// which is a reading a reader can tell from "no statement crossed" by the
+/// `_n` beside it only where that is possible: the switch is the arm's, and the
+/// `wire_bytes` field on the same line says frames did cross.
+pub(crate) fn note_statement(meter: StatementMeter, n: u64, bytes: u64) {
+    if !frame_profile_on() {
+        return;
+    }
+    FRAME_PROFILE.note_statement(meter, n, bytes);
 }
 
 /// Bank one of [`crate::runtime::chain_phase`]'s bars, named by its ordinal.

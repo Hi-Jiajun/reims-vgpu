@@ -1070,6 +1070,7 @@ pub fn submit_frame(
     resources: &ResourceTableSnapshot,
 ) -> Result<Vec<u8>, WireDecline> {
     use crate::runtime::drain::{frame_span, FrameSpan};
+    arm_statement_accounting();
     let trace = {
         let _span = frame_span(FrameSpan::ProvFrameCloneTrace);
         trace.clone()
@@ -1108,6 +1109,7 @@ pub fn submit_frame_owned(
     resources: ResourceTableSnapshot,
 ) -> Result<Vec<u8>, WireDecline> {
     use crate::runtime::drain::{frame_span, FrameSpan};
+    arm_statement_accounting();
     let request = CommandRequest::Submit { trace, resources };
     let _encode = frame_span(FrameSpan::ProvFrameEncode);
     CommandCodec::encode_request(&request)
@@ -1196,12 +1198,93 @@ pub fn captured_submission_frames() -> Vec<Vec<u8>> {
 
 fn note_frame(frame: &[u8]) {
     crate::runtime::drain::note_frame_wire_bytes(frame.len() as u64);
+    note_statement_sections();
     if CAPTURE_ARMED.load(Ordering::Relaxed) {
         if let Ok(mut frames) = CAPTURED_FRAMES.lock() {
             frames.push(frame.to_vec());
         }
     }
 }
+
+/// Ask the codec to price the statements this rail is about to build, when this
+/// process has a frame profile for the sections to be reported into.
+///
+/// The sections are read inside `metal_api_ipc::statement`, which prices a
+/// submission only when it is asked to, so the rail that wants them does the
+/// asking — once per process, at the first frame it builds rather than at the
+/// first frame it has already built, so no frame goes unpriced. A round
+/// therefore needs the one switch it already sets (`REIMS_VGPU_FRAME_PROFILE`)
+/// rather than a second one per crate, and a profile that is off leaves this a
+/// pair of relaxed loads and the codec's own switch off.
+fn arm_statement_accounting() {
+    arm_statement_accounting_when(crate::runtime::drain::frame_profile_on());
+}
+
+/// [`arm_statement_accounting`] with the profile's answer handed in, so the arm
+/// itself is a seam a test can drive without an environment it cannot put back.
+fn arm_statement_accounting_when(profiling: bool) {
+    if !profiling {
+        return;
+    }
+    let _ = STATEMENT_ACCOUNTING_ARMED.get_or_init(|| {
+        metal_api_ipc::statement::set_enabled(true);
+        true
+    });
+}
+
+/// Hand the statement sections the codec just priced to the frame profile.
+///
+/// The account is taken rather than read so that the sections charged here are
+/// exactly the ones the frame just encoded carried, and so that a frame built
+/// on another thread is charged by whichever call takes it and never by both.
+fn note_statement_sections() {
+    use crate::runtime::drain::{note_statement, STATEMENT_METER_SLOTS};
+
+    if !crate::runtime::drain::frame_profile_on() {
+        return;
+    }
+    let account = metal_api_ipc::statement::take();
+    if account.frames == 0 {
+        return;
+    }
+    for (meter, (n, bytes)) in STATEMENT_METER_SLOTS
+        .iter()
+        .zip(statement_meter_values(&account))
+    {
+        note_statement(*meter, n, bytes);
+    }
+}
+
+/// The `(n, bytes)` every [`crate::runtime::drain::StatementMeter`] is charged
+/// with for one codec account, in slot order.
+///
+/// Split out from the charge so the mapping is a function a test can read: the
+/// section tiles are charged against the account's own frame count — they are
+/// all readings of the same statements — while the three roll-ups are charged
+/// against how many views and textures those statements carried, which is the
+/// count their bytes divide by.
+fn statement_meter_values(
+    account: &metal_api_ipc::statement::StatementAccount,
+) -> [(u64, u64); crate::runtime::drain::STATEMENT_METER_COUNT] {
+    let statements = account.frames;
+    [
+        (statements, account.total_bytes),
+        (statements, account.tag_bytes),
+        (statements, account.trace_header_bytes),
+        (statements, account.pipeline_table_bytes),
+        (statements, account.pass_table_bytes),
+        (statements, account.resource_table_bytes),
+        (statements, account.tail_bytes),
+        (account.views_n, account.view_bytes),
+        (account.views_n, account.view_payload_bytes),
+        (account.views_n, account.view_declared_bytes),
+        (account.textures_n, account.texture_bytes),
+        (account.textures_n, account.texture_payload_bytes),
+    ]
+}
+
+/// Whether this process has already armed the codec's statement account.
+static STATEMENT_ACCOUNTING_ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// How many frames this rail has produced for the canonical provider's
 /// capability answer, and how many submissions it has carried across the wire.
@@ -1279,5 +1362,91 @@ mod tests {
             refusal.detail.contains("capabilities"),
             "the refusal names what the frame was instead: {refusal:?}"
         );
+    }
+
+    /// The bridge charges every section to the meter that names it, the six
+    /// tiles add up to the payload the codec priced, and the roll-ups are
+    /// charged against the views they are shares of.
+    ///
+    /// The account is the codec's own (`metal_api_ipc::statement`), so this is
+    /// the one seam a unit test can pin without a boot: what the frame line
+    /// would print is the frame that was encoded, section for section.
+    #[test]
+    fn the_statement_bridge_charges_every_section_to_its_own_meter() {
+        use crate::runtime::drain::StatementMeter;
+        let account = metal_api_ipc::statement::StatementAccount {
+            frames: 1,
+            tag_bytes: 1,
+            trace_header_bytes: 26,
+            pipeline_table_bytes: 200,
+            pass_table_bytes: 700,
+            resource_table_bytes: 40,
+            tail_bytes: 33,
+            total_bytes: 1_000,
+            views_n: 2,
+            view_bytes: 96,
+            view_payload_bytes: 64,
+            view_declared_bytes: 64,
+            textures_n: 1,
+            texture_bytes: 64,
+            texture_payload_bytes: 0,
+        };
+        let values = statement_meter_values(&account);
+        assert_eq!(values.len(), 12, "one slot per section meter");
+        assert_eq!(values[StatementMeter::Total.slot()], (1, 1_000));
+        assert_eq!(values[StatementMeter::Tag.slot()], (1, 1));
+        assert_eq!(values[StatementMeter::TraceHeader.slot()], (1, 26));
+        assert_eq!(values[StatementMeter::PipelineTable.slot()], (1, 200));
+        assert_eq!(values[StatementMeter::PassTable.slot()], (1, 700));
+        assert_eq!(values[StatementMeter::ResourceTable.slot()], (1, 40));
+        assert_eq!(values[StatementMeter::Tail.slot()], (1, 33));
+        assert_eq!(values[StatementMeter::Views.slot()], (2, 96));
+        assert_eq!(values[StatementMeter::ViewPayload.slot()], (2, 64));
+        assert_eq!(values[StatementMeter::ViewDeclared.slot()], (2, 64));
+        assert_eq!(values[StatementMeter::Textures.slot()], (1, 64));
+        assert_eq!(values[StatementMeter::TexturePayload.slot()], (1, 0));
+        // The six tiles are the payload the codec measured, and the frame the
+        // rail built around it is that payload plus the nine-byte header.
+        let tiles: u64 = [
+            StatementMeter::Tag,
+            StatementMeter::TraceHeader,
+            StatementMeter::PipelineTable,
+            StatementMeter::PassTable,
+            StatementMeter::ResourceTable,
+            StatementMeter::Tail,
+        ]
+        .iter()
+        .map(|meter| values[meter.slot()].1)
+        .sum();
+        assert_eq!(tiles, values[StatementMeter::Total.slot()].1);
+        assert_eq!(account.residual_bytes(), 0, "{account:?}");
+        // The roll-ups are inside the pass table rather than beside it.
+        assert!(values[StatementMeter::ViewPayload.slot()].1 <= account.pass_table_bytes);
+    }
+
+    /// The profile's switch is what turns the codec's account on, and a profile
+    /// that is off leaves it alone.
+    ///
+    /// The rail arms the codec rather than reading a second switch, so a round
+    /// that sets `REIMS_VGPU_FRAME_PROFILE` gets the sections without setting
+    /// one per crate. Both directions are read back through the codec's own
+    /// question rather than through a copy of the answer.
+    #[test]
+    fn the_profile_switch_is_what_arms_the_codecs_account() {
+        let was_on = metal_api_ipc::statement::enabled();
+        metal_api_ipc::statement::set_enabled(false);
+        arm_statement_accounting_when(false);
+        assert!(
+            !metal_api_ipc::statement::enabled(),
+            "a profile that is off must not arm the account"
+        );
+        arm_statement_accounting_when(true);
+        assert!(
+            metal_api_ipc::statement::enabled(),
+            "a profile that is on is what arms it"
+        );
+        // Leave the process as it was found: this switch is global and the
+        // other tests in this binary encode frames through the same codec.
+        metal_api_ipc::statement::set_enabled(was_on);
     }
 }
