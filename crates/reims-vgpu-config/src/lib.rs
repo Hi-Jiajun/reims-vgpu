@@ -289,6 +289,24 @@ pub const GPU_STAMP: &str = "REIMS_VGPU_GPU_STAMP";
 /// the drain thread is exactly the kind that could perturb its own subject.
 pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
 
+/// Setting this on makes the device check every **named guest-page read** it
+/// takes against the released-page set [`PAGE_GUARDS`] arms.
+///
+/// The write side of that set is judged at the write. It read zero on the three
+/// panicking boots of the 2026-09-20 import round while every panic-named page
+/// that could be converted sat outside everything this device had written, so
+/// the other half of the defect is the read: a reader served from a page the
+/// guest had already taken back derives whatever it derives from bytes that now
+/// belong to somebody else. Nothing observed that before this switch.
+///
+/// **Off unless spelled affirmatively**, unlike [`PAGE_GUARDS`]. It is a probe
+/// on the read path — one page-walk per checked read while it is on — and a boot
+/// that is not the read-side round must not pay for it or perturb the race it
+/// exists to watch. `unset`, `off` and a typo therefore all mean "do not
+/// observe", and the census line that says a boot was watched is the one this
+/// probe writes when it is on.
+pub const READ_GUARD: &str = "REIMS_VGPU_READ_GUARD";
+
 /// Setting this **on** makes `crate::runtime::range_coverage` walk the guest's
 /// page table across every page of every map and unmap range. Default off, and
 /// it is the only variable here whose default is the quiet one.

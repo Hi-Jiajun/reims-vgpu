@@ -5001,8 +5001,46 @@ pub(super) fn window_binds_zero_copy(needs_gather: bool, gather_eligible: bool) 
 
 /// Answer a retained zero-copy resolution without touching the object table or
 /// walking the task page table.
+/// The read-side probe's check for one buffer bind, whether the window came
+/// from the held-resolution registry or from a walk taken just now.
+///
+/// Both routes are the same reading — this draw is about to be served from
+/// these guest pages, on the CPU or on the GPU — so both report under one
+/// route and the emitted line says which window it was. The resolve is a
+/// page-table walk and runs only when the probe is on and something is armed;
+/// `None` from it means the window could not be named completely, which the
+/// probe counts rather than assuming quiet.
+fn note_bind_read<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    buffer_ref: u32,
+    gva: u64,
+    span: u64,
+) {
+    crate::runtime::released_pages::note_read(
+        &state.host_writes,
+        crate::runtime::released_pages::BIND_ROUTE,
+        || {
+            let (tasks, page_shift, page_size) =
+                (&state.tasks, state.page_shift, state.page_size());
+            let spanned = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+                host, tasks, task_id, gva, span, page_shift,
+            );
+            (gpas.len() as u64 == spanned).then_some(gpas)
+        },
+        || {
+            format!(
+                "reader=buffer_bind task={task_id} ref={buffer_ref} gva={gva:#x} span={span:#x}"
+            )
+        },
+    );
+}
+
 fn held_buffer_content(
     state: &mut DeviceState,
+    host: &(impl HostMemory + HostOps),
     task_id: u32,
     buffer_ref: u32,
     offset: u64,
@@ -5028,6 +5066,7 @@ fn held_buffer_content(
             // right here the whole time.
             let span = extent_cap.map_or(full, |cap| full.min(cap));
             if let Some(bound) = slice_packed_buffer(packed, offset, span) {
+                note_bind_read(state, host, task_id, buffer_ref, bound.gva, bound.span);
                 crate::runtime::drain::note_store_route("zc_buffer_held");
                 return Some(bound_buffer_content(&bound));
             }
@@ -5043,6 +5082,7 @@ fn held_buffer_content(
         .bound_buffers
         .get(task_id, buffer_ref, offset, extent_cap)
     {
+        note_bind_read(state, host, task_id, buffer_ref, bound.gva, bound.span);
         let content = bound_buffer_content(bound);
         crate::runtime::drain::note_store_route("zc_buffer_held");
         return Some(content);
@@ -5066,6 +5106,23 @@ fn load_buffer_content_resolved<M: HostMemory + HostOps>(
     extent_cap: Option<u64>,
     backing: &BufferBacking,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
+    // The read-side probe, at the bind rather than at either rail below it:
+    // this window is what the draw is about to be served from, whether the
+    // engine reads it on the CPU or gathers it on the GPU, and the guest
+    // releasing these pages has to be visible on both. The check is over the
+    // whole window the bind may read, before any shader reach narrows it — a
+    // released page inside the window is a finding even where this draw's
+    // reflection would not have reached it. Free when the probe is off.
+    if let Some(full) = host_alloc_len(backing.size.saturating_sub(offset)).filter(|&n| n > 0) {
+        note_bind_read(
+            state,
+            host,
+            task_id,
+            buffer_ref,
+            backing.gva + offset,
+            full as u64,
+        );
+    }
     // Resolve the backing (object-list entry + descriptor) ONCE and share it
     // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
     // to walk the task PT twice — once in the failed ZC attempt, once in the
@@ -5110,7 +5167,9 @@ pub(super) fn load_buffer_content<M: HostMemory + HostOps>(
     extent_cap: Option<u64>,
 ) -> Option<crate::backend::vulkan::engine::BufferContent> {
     if allow_zero_copy {
-        if let Some(content) = held_buffer_content(state, task_id, buffer_ref, offset, extent_cap) {
+        if let Some(content) =
+            held_buffer_content(state, host, task_id, buffer_ref, offset, extent_cap)
+        {
             return Some(content);
         }
     }
@@ -5145,6 +5204,7 @@ fn load_index_content_reason<M: HostMemory + HostOps>(
     let extent = Some(need as u64);
     if let Some(content) = held_buffer_content(
         state,
+        host,
         task_id,
         info.index_buffer_ref,
         info.index_buffer_offset,

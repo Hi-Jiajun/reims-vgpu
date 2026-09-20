@@ -1529,6 +1529,16 @@ pub fn settle_for_mapping<M: HostMemory + HostOps>(
     mapping_id: u32,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
+    // The read-side probe, ahead of the payment: a mapping this caller is about
+    // to read whose pages the guest has already taken back is the finding, and
+    // the payment below does not change that set. Free on every boot that is not
+    // watching for one — the resolve is behind the probe's own gate.
+    crate::runtime::released_pages::note_read(
+        &state.host_writes,
+        crate::runtime::released_pages::site_route(site),
+        || state.mapping_reach_pages(mapping_id),
+        || format!("reader=mapping mid={mapping_id}"),
+    );
     // Charged apart because subtracting the wait cannot tell them apart, and
     // after the wait went away the remainder was still 4.9 s on a driven leg:
     // that is either the payment doing work the quiesce used to have already
@@ -1593,6 +1603,23 @@ pub fn settle_for_texture<M: HostMemory + HostOps>(
     span: u64,
     site: crate::runtime::render_writeback::SettleSite,
 ) {
+    // The read-side probe, ahead of the payment for the same reason
+    // [`settle_for_mapping`] takes it there: what this caller is about to read
+    // is fixed at entry, and the settle below is about writes, not about it.
+    crate::runtime::released_pages::note_read(
+        &state.host_writes,
+        crate::runtime::released_pages::site_route(site),
+        || {
+            let (tasks, page_shift, page_size) =
+                (&state.tasks, state.page_shift, state.page_size());
+            let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
+            let gpas = crate::runtime::gva_mem::task_gva_page_gpas(
+                host, tasks, task_id, gva, span, page_shift,
+            );
+            (gpas.len() as u64 == want).then_some(gpas)
+        },
+        || format!("reader=resource task={task_id} ref={texture_ref} gva={gva:#x} span={span:#x}"),
+    );
     // The reference names a resource and a surface debt is keyed by mapping id,
     // so the payment reaches only what this reference resolves to. The census is
     // the standing alarm for the one thing that naming cannot see — raw page
