@@ -392,6 +392,52 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     out
 }
 
+/// The whole set, once, for a caller that is about to lose the process.
+///
+/// # Why this is not `census_lines`
+///
+/// The census dump is a **delta** on a 30 s cadence, which is the right shape
+/// for a boot that keeps running: it is cheap, and the union of the deltas is
+/// the set. It is the wrong shape for the last line a device ever writes. Two
+/// things go missing between the last census and the process going away — every
+/// frame marked inside that interval, and every frame marked between a dump and
+/// a quit. A scorer comparing a panic's page against the delta dumps reads
+/// those as a **miss**, and a miss is this module's exonerating answer, so the
+/// gap does not reduce the reading: it inverts it.
+///
+/// So the closing dump restates the set rather than diffing it, and carries
+/// `pages` as well: a reader who unions the census deltas can check the union
+/// against this line's level, and a reader who takes this dump alone has the
+/// whole footprint without having to trust the cadence at all.
+///
+/// Emit it once, from the teardown path, and emit it **synchronously** — the
+/// caller is by definition at the point where a queued line may never be
+/// written. See [`crate::sink::off_sync`].
+pub fn closing_lines() -> Vec<String> {
+    let fp = &*FOOTPRINT;
+    let (pages, dropped) = counts();
+    let kib = (pages << FRAME_SHIFT) / 1024;
+    let runs = fp.runs();
+    let parts = runs.len().div_ceil(RUNS_PER_LINE).max(1);
+    let mut out = vec![format!(
+        "guest_write_footprint_closing pages={pages} kib={kib} dropped={dropped} \
+         frame_shift={FRAME_SHIFT} runs={} parts={parts} (whole set, not a delta)",
+        runs.len()
+    )];
+    for (i, chunk) in runs.chunks(RUNS_PER_LINE).enumerate() {
+        let spans: Vec<String> = chunk
+            .iter()
+            .map(|(a, b)| format!("{a:#x}-{b:#x}"))
+            .collect();
+        out.push(format!(
+            "guest_write_footprint_closing_runs part={}/{parts} {}",
+            i + 1,
+            spans.join(" ")
+        ));
+    }
+    out
+}
+
 /// One test at a time over the process-global set, cleared on entry.
 ///
 /// The set is deliberately global — it is a property of the boot, not of any
@@ -677,5 +723,73 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// The closing dump is the whole set, not a delta — including the frames an
+    /// earlier census already reported.
+    ///
+    /// This is the difference that decides a panic's reading: a scorer
+    /// comparing the frame a panic names against a *delta* that predates the
+    /// write scores it a miss, and a miss is the answer that exonerates the
+    /// device. So the closing dump has to restate everything and say its level.
+    #[test]
+    fn the_closing_dump_restates_the_whole_set_with_its_level() {
+        let _g = fresh();
+        note_written_range(0x1000, 0x1000);
+        note_written_range(0x9000, 0x1000);
+        // The first census reports these as additions; the closing dump must
+        // report them again rather than diffing against that dump.
+        let _ = census_lines(0);
+
+        let closing = closing_lines();
+        assert!(
+            closing[0].starts_with("guest_write_footprint_closing pages=2"),
+            "the header carries the level a union can be checked against: {}",
+            closing[0]
+        );
+        let spans: Vec<(u64, u64)> = closing
+            .iter()
+            .filter(|l| l.starts_with("guest_write_footprint_closing_runs"))
+            .flat_map(|l| {
+                l.split_whitespace()
+                    .filter(|t| t.starts_with("0x") && t.contains('-'))
+                    .map(|t| {
+                        let (a, b) = t.split_once('-').expect("span");
+                        (
+                            u64::from_str_radix(a.trim_start_matches("0x"), 16).expect("start"),
+                            u64::from_str_radix(b.trim_start_matches("0x"), 16).expect("end"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            vec![(1, 1), (9, 9)],
+            "every frame of the set, not only those added since the last census"
+        );
+    }
+
+    /// The closing dump's level is the level the census reports, so a reader
+    /// can tell a complete export from one the quit truncated.
+    #[test]
+    fn the_closing_dump_covers_frames_no_census_ever_saw() {
+        let _g = fresh();
+        note_written_range(0x1000, 0x1000);
+        let _ = census_lines(0);
+        // Marked inside the dump interval, so no census will ever report it.
+        note_written_range(0x50 << FRAME_SHIFT, 0x1000);
+
+        let closing = closing_lines();
+        assert!(
+            closing[0].contains("pages=2") && closing[0].contains("runs=2"),
+            "{}",
+            closing[0]
+        );
+        assert!(
+            closing.iter().any(|l| l.contains("0x50-0x50")),
+            "a frame written after the last census is exactly what the closing dump \
+             exists to keep: {closing:?}"
+        );
     }
 }

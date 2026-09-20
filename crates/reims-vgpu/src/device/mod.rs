@@ -345,7 +345,19 @@ pub fn device_reset(id: u64) -> bool {
 }
 
 pub fn device_destroy(id: u64) -> bool {
-    DEVICES.lock().remove(&id).is_some()
+    let removed = DEVICES.lock().remove(&id).is_some();
+    if removed {
+        // The boot's guest-write footprint is process state and dies with the
+        // process. QEMU reaches here on unrealize, which is the last moment
+        // this library can still write — so the whole set is dumped here,
+        // through the synchronous sink, rather than left to a census delta
+        // that a quit can arrive before. Read-only: it appends log lines and
+        // selects nothing.
+        for line in crate::observe::footprint::closing_lines() {
+            crate::observe::off_sync(&line);
+        }
+    }
+    removed
 }
 
 pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
