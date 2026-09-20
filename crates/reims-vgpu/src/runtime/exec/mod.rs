@@ -5507,6 +5507,16 @@ fn finish_stream<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route(
                             "render_provider_batch_member_refused",
                         );
+                        // G3-B/B-1c: the refusal kinds behind the one name the
+                        // census ranks. The fail line that names a refusal
+                        // dedupes on `(pipeline, slug)`, so the *population*
+                        // each cause refuses was unreadable; these counters are
+                        // one per refusal.
+                        if batch_giveback_census_enabled() {
+                            crate::runtime::drain::note_store_route(
+                                "render_batch_giveback_refused_member_park_status",
+                            );
+                        }
                         Some(format!("park_status: {parked:?}"))
                     };
                     // A member that parks but does not *keep* its frame is a
@@ -5526,6 +5536,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                         crate::runtime::drain::note_store_route(
                             "render_provider_batch_member_refused",
                         );
+                        if batch_giveback_census_enabled() {
+                            crate::runtime::drain::note_store_route(
+                                "render_batch_giveback_refused_member_publishes",
+                            );
+                        }
                         refusal = Some(format!(
                             "member_publishes: the record's own store arm leaves the frame \
                              outside the run's image (di={di} pipe={} mid={} gva={:#x})",
@@ -5559,6 +5574,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                         open_run = None;
                         batch_refused = true;
+                        note_giveback_opened(&mut requests, origin, di);
                         rewind_batch_records(&mut requests, origin, tail);
                         di = origin;
                         continue;
@@ -5709,6 +5725,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                         open_run = None;
                         batch_refused = true;
+                        note_giveback_opened(&mut requests, origin, tail);
                         rewind_batch_records(&mut requests, origin, tail);
                         di = origin;
                         continue;
@@ -5773,6 +5790,19 @@ fn finish_stream<M: HostMemory + HostOps>(
                 );
                 match encode {
                     (EncodeStatus::Ok, Some(rgba)) => {
+                        // G3-B/B-1c: where the record's own answer is read is
+                        // where the give-back census reads it too, so the two
+                        // cannot drift. A frame that carries the canonical
+                        // rail's own provenance is the provider's answer; every
+                        // other frame is the engine's readback.
+                        note_giveback_rerun(
+                            req,
+                            if req.resident_frame_published_by_provider {
+                                "render_batch_giveback_rerun_provider"
+                            } else {
+                                "render_batch_giveback_rerun_engine"
+                            },
+                        );
                         out.metal_draws_ok += 1;
                         // R23: a frame that comes back while the chain is
                         // resident is the chain moving back into bytes. The
@@ -5796,6 +5826,17 @@ fn finish_stream<M: HostMemory + HostOps>(
                         chain_rgba = Some(rgba);
                     }
                     (EncodeStatus::Ok, None) if req.chain_resident_established => {
+                        // The same reading for a frame that stayed on a device
+                        // image: which registry holds it is the answer's own
+                        // out-flag (R42), not a second guess.
+                        note_giveback_rerun(
+                            req,
+                            if req.chain_resident_held_by_provider {
+                                "render_batch_giveback_rerun_provider"
+                            } else {
+                                "render_batch_giveback_rerun_engine"
+                            },
+                        );
                         // Resident render-pass chain intermediate: content stays
                         // on the engine target; the next record loads it there.
                         out.metal_draws_ok += 1;
@@ -5811,6 +5852,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                     (EncodeStatus::Ok, None) => {
+                        // An `Ok` with no frame anywhere: the draw ran and its
+                        // content has no reader, which is neither of the two
+                        // "a rail answered" arms and must not be folded into
+                        // either of them.
+                        note_giveback_rerun(req, "render_batch_giveback_rerun_no_frame");
                         // Intermediate must return color0 for chaining; treat as
                         // break so we do not composite later draws on a missing seed.
                         out.metal_draws_ok += 1;
@@ -5851,6 +5897,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                     (st @ EncodeStatus::NoMetal(_), _) => {
+                        // No rail answered this record on the walk the give-back
+                        // gave it: the draw is lost, and the census says so
+                        // under the arm that is a loss.
+                        note_giveback_rerun(req, "render_batch_giveback_rerun_skipped");
                         saw_nometal = true;
                         out.metal_draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
@@ -5874,6 +5924,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                     // terminal refusal, including the Metal-only carrier when
                     // that feature exists.
                     (st, _) => {
+                        note_giveback_rerun(req, "render_batch_giveback_rerun_skipped");
                         out.metal_draws_fail += 1;
                         note_draw_encode_fail(task_id, pd.pipeline_ref, st, di, draw_list.len());
                         // If earlier GVA draws produced a chain image, land it
@@ -5906,6 +5957,21 @@ fn finish_stream<M: HostMemory + HostOps>(
         // on the per-record path this packet did not reach.
         if let Some(run) = open_run.as_mut() {
             run.batch.abandon();
+        }
+        // G3-B/B-1c: a record a give-back handed back whose re-walk this packet
+        // never reached — the walk above breaks the packet on the arms that
+        // abandon a chain, and a give-back record after that break has no
+        // answer. Charged rather than left out, so the give-back census is an
+        // identity (`records = provider + engine + no_frame + skipped +
+        // not_reached`) instead of a remainder a reader has to compute.
+        if batch_giveback_census_enabled() {
+            for req in requests.iter_mut() {
+                if std::mem::take(&mut req.gave_back_rerun) {
+                    crate::runtime::drain::note_store_route(
+                        "render_batch_giveback_rerun_not_reached",
+                    );
+                }
+            }
         }
         // fp3 probe: a frame the canonical provider published that this packet
         // never consumed — the literal "readback superseded with no reader"
@@ -6544,6 +6610,61 @@ fn render_batch_enabled() -> bool {
     })
 }
 
+/// Whether `REIMS_VGPU_BATCH_GIVEBACK_CENSUS` asked for the outcome of every
+/// record a refused run handed back to the per-record path.
+///
+/// G3-B/B-1c. `render_provider_batch_member_fell_back_draws` says how many
+/// records a give-back returned and nothing about where they went. The walk
+/// re-walks every one of them, and each re-walk reaches exactly one of its own
+/// answers — the canonical provider drew the record, the engine drew it, it
+/// produced a frame with no reader, or its draw was skipped — so the readings
+/// that matter are those four populations against the records given back. Read
+/// alone, the fall-back count cannot tell "the re-run answered every record"
+/// from "the re-run answered none of them": the two answers differ by every
+/// frame in the run, and only the second is the defect this increment is
+/// looking for.
+///
+/// Off by default, and read once. With it off the walk never sets the marker on
+/// a request, so every charge below is one not-taken branch per record and the
+/// census map gains no key at all.
+pub(crate) fn batch_giveback_census_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = *BATCH_GIVEBACK_CENSUS_FOR_TEST
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("REIMS_VGPU_BATCH_GIVEBACK_CENSUS")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "on" | "ON" | "true" | "yes")
+        )
+    })
+}
+
+/// The suite's own door onto [`batch_giveback_census_enabled`], so a unit test
+/// can pin the answer without an environment variable a parallel test could
+/// race on.
+#[cfg(test)]
+static BATCH_GIVEBACK_CENSUS_FOR_TEST: std::sync::OnceLock<std::sync::Mutex<Option<bool>>> =
+    std::sync::OnceLock::new();
+
+/// Pin [`batch_giveback_census_enabled`]'s answer for one suite; `None`
+/// restores the environment read.
+#[cfg(test)]
+pub(crate) fn set_batch_giveback_census_for_test(enabled: Option<bool>) {
+    let forced = BATCH_GIVEBACK_CENSUS_FOR_TEST.get_or_init(|| std::sync::Mutex::new(None));
+    *forced
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
+}
+
 /// Count one run the walk assembled and the records it carried
 /// (`REIMS_VGPU_RENDER_BATCH`).
 ///
@@ -6597,6 +6718,71 @@ fn rewind_batch_records(requests: &mut [draw::DrawEncodeRequest], origin: usize,
         if let Some(req) = requests.get_mut(k) {
             req.chain_from_resident = false;
         }
+    }
+}
+
+/// Open the give-back census over the records a refused run is handing back
+/// (`REIMS_VGPU_BATCH_GIVEBACK_CENSUS`).
+///
+/// `refused` is the index of the record whose park step answered with the
+/// refusal, so `origin..=refused` is exactly the set of records the park had
+/// walked when the run was given back — the set
+/// `note_render_batch_given_back` counts. Each of them is marked, so the walk
+/// below reads its answer back and charges one of the four outcome arms.
+///
+/// The records after `refused` are deliberately left unmarked: their walk below
+/// is their *first*, not a re-run, and a census that counted them would be
+/// reading the per-record path's ordinary traffic as a give-back outcome.
+fn note_giveback_opened(requests: &mut [draw::DrawEncodeRequest], origin: usize, refused: usize) {
+    if !batch_giveback_census_enabled() {
+        return;
+    }
+    for k in origin..=refused {
+        if let Some(req) = requests.get_mut(k) {
+            req.gave_back_rerun = true;
+            crate::runtime::drain::note_store_route("render_batch_giveback_records");
+        }
+    }
+}
+
+/// Read back one record's answer on the walk a give-back gave it
+/// (`REIMS_VGPU_BATCH_GIVEBACK_CENSUS`).
+///
+/// `arm` is the walk's own classification of that answer, taken at the same
+/// `match` the answer itself is routed through — the place
+/// `render_provider_canonical` and `draws_skipped_after_engine_refusal` are
+/// already read from — so the two readings cannot disagree about which rail
+/// answered. The marker is cleared here, which is what makes a second charge
+/// for one record unrepresentable; whatever is still marked when the packet
+/// ends is charged under `render_batch_giveback_rerun_not_reached` by the
+/// packet's own tail.
+fn note_giveback_rerun(req: &mut draw::DrawEncodeRequest, arm: &'static str) {
+    if !req.gave_back_rerun {
+        return;
+    }
+    req.gave_back_rerun = false;
+    crate::runtime::drain::note_store_route(arm);
+}
+
+/// Charge one park refusal that gave a run back
+/// (`render_batch_giveback_refused_*`).
+///
+/// `kind` names where the refusal came from, and `owner` is the cause beside it
+/// when the refusal is the owner rail's own decline — so the two populations a
+/// widening order has to choose between (a member the *class* would not keep,
+/// and a member the *owner plan* would not import) are separate counts. The
+/// fail line that carries the detail dedupes on `(pipeline, slug)`, so the
+/// population behind one cause is exactly what a reader of the log cannot get.
+///
+/// Charged on every refusal rather than behind the give-back census's switch:
+/// the path is cold (one per run the park refuses, not one per draw), and
+/// "which cause refuses the runs this posture does not carry" is a reading a
+/// batch-on round wants whether or not it also asked for the outcome census. A
+/// round with the batch switch off parks nothing, so these keys stay absent.
+pub(crate) fn note_giveback_refusal(kind: &'static str, owner: Option<&'static str>) {
+    crate::runtime::drain::note_store_route(kind);
+    if let Some(owner) = owner {
+        crate::runtime::drain::note_store_route(owner);
     }
 }
 

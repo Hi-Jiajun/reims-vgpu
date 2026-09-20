@@ -735,6 +735,18 @@ pub struct DrawEncodeRequest {
     /// *before* the promise is committed, which is the only place it can be
     /// asked without costing the packet.
     pub chain_resident_successor: Option<(u64, u64)>,
+    /// G3-B/B-1c: this record is being walked **again**, because the run a park
+    /// step had assembled it into was given back to the per-record path
+    /// (`REIMS_VGPU_BATCH_GIVEBACK_CENSUS`).
+    ///
+    /// Set by the walk on the records a refusal handed back — the ones its own
+    /// `render_provider_batch_member_fell_back_draws` counts — and cleared by
+    /// the walk at the point it reads that record's answer back, so the marker
+    /// is true for exactly one walk of exactly one record and a record can
+    /// never be charged twice. A packet with no give-back leaves it `false` on
+    /// every record, which is what makes the instrument a not-taken branch
+    /// rather than a per-record cost when the census is not asked for.
+    pub gave_back_rerun: bool,
     /// This draw continues the Metal render encoder of the preceding draw in
     /// the same decoded stream. Vulkan may keep an identical render pass open
     /// when no command that is illegal inside it intervenes.

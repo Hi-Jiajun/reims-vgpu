@@ -31978,3 +31978,98 @@ fn a_run_refuses_a_record_that_names_another_image() {
     );
     batch.abandon();
 }
+
+/// G3-B/B-1c: both park entry points count a refusal under the cause that
+/// refused it, and the owner rail's own causes are counted apart.
+///
+/// This is the reading that was missing. A refused record is named by
+/// `render_provider_batch_member_refused`, and that fail line dedupes on
+/// `(pipeline, slug)` — so a round could say a cause exists and could not say
+/// how many records it refused. Two causes matter and they are different work:
+/// a member the *class* will not keep (the run's image is not the one the
+/// record names) and a member the *owner plan* will not import (the record's
+/// bindings read a registration the plan has already given to another member).
+/// The run is given back either way, so a reading that cannot size the two
+/// cannot say which one a widening order should take first.
+///
+/// The pair of entry points the seam has is driven here directly: `park_render`
+/// for a member, `park_and_finish_render` for the publishing tail — the same
+/// two calls the seam's `Park` and `ParkAndFinish` arms make.
+#[test]
+fn a_park_refusal_is_counted_under_its_cause_at_the_rail() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let first = gva_identity(0x42_00_04, ash::vk::Format::R8G8B8A8_UNORM);
+    let second = gva_identity(0x42_00_05, ash::vk::Format::R8G8B8A8_UNORM);
+
+    const MEMBER: &str = "render_batch_giveback_refused_member_declined";
+    const MEMBER_OWNER: &str = "render_batch_giveback_refused_member_owner";
+    const TAIL: &str = "render_batch_giveback_refused_tail";
+    const TAIL_OWNER: &str = "render_batch_giveback_refused_tail_owner";
+    let member_before = route_count(MEMBER);
+    let member_owner_before = route_count(MEMBER_OWNER);
+    let tail_before = route_count(TAIL);
+    let tail_owner_before = route_count(TAIL_OWNER);
+
+    // The member arm: a record that names an image the run already states is
+    // refused by the run's own rule, which is not the owner rail's.
+    let mut batch = provider_render::RenderBatch::new();
+    match provider_render::park_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &resident_seed_request(&first),
+        &mut batch,
+    ) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the run's first record joins it: {other:?}"),
+    }
+    match provider_render::park_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &resident_seed_request(&second),
+        &mut batch,
+    ) {
+        provider_render::RenderParkOutcome::Declined(_) => {}
+        other => panic!("a second image is refused by name: {other:?}"),
+    }
+    assert_eq!(
+        route_count(MEMBER) - member_before,
+        1,
+        "one member refusal is one count under its own cause"
+    );
+    assert_eq!(
+        route_count(MEMBER_OWNER) - member_owner_before,
+        0,
+        "an image the run already states is the run's own rule, not the owner \
+         plan's, and the owner arm has to read zero for it"
+    );
+    batch.abandon();
+
+    // The tail arm: the record that would have closed the run, refused by the
+    // same rule through the other entry point.
+    let mut batch = provider_render::RenderBatch::new();
+    match provider_render::park_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &resident_seed_request(&first),
+        &mut batch,
+    ) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the run's first record joins it: {other:?}"),
+    }
+    match provider_render::park_and_finish_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &resident_seed_request(&second),
+        &mut batch,
+    ) {
+        Err(_) => {}
+        Ok(_) => panic!("a tail the run cannot carry is refused, not submitted"),
+    }
+    assert_eq!(
+        route_count(TAIL) - tail_before,
+        1,
+        "a tail refusal is counted under the tail's own cause"
+    );
+    assert_eq!(
+        route_count(TAIL_OWNER) - tail_owner_before,
+        0,
+        "and not under the owner rail's arm"
+    );
+}

@@ -8331,3 +8331,131 @@ fn a_submission_frames_each_stream_once_and_preflight_frames_none() {
         Some(3)
     );
 }
+
+/// G3-B/B-1c: the give-back census reads back the records a refused run hands
+/// to the per-record path — and only those.
+///
+/// The marker is what makes the outcome reading possible: without it the walk
+/// cannot tell a record it is walking for the second time from one it is
+/// walking for the first, and
+/// `render_provider_batch_member_fell_back_draws` alone cannot answer whether
+/// the re-run answered every record or none of them. Three things are asserted,
+/// and they are the instrument's whole claim:
+///
+/// * only `origin..=refused` is marked — the records the park had walked when
+///   the run was given back, which is exactly what the fall-back count counts.
+///   A record after the refusal is walked for the first time, and counting it
+///   would read the per-record path's ordinary traffic as a give-back outcome;
+/// * a marked record is charged under exactly one arm, and the marker is
+///   cleared, so one record cannot be counted twice;
+/// * with the switch off nothing is marked at all — the zero-cost half.
+#[test]
+fn the_giveback_census_marks_only_the_records_the_park_had_walked_and_reads_back_one_arm_each() {
+    use crate::runtime::drain::store_route_count_for_test as count;
+
+    const RECORDS: &str = "render_batch_giveback_records";
+    const PROVIDER: &str = "render_batch_giveback_rerun_provider";
+    const ENGINE: &str = "render_batch_giveback_rerun_engine";
+
+    // The switch off: nothing is marked and nothing is charged, which is the
+    // arm a round that did not ask for the census pays for.
+    set_batch_giveback_census_for_test(Some(false));
+    let mut requests: Vec<draw::DrawEncodeRequest> =
+        (0..4).map(|_| draw::DrawEncodeRequest::default()).collect();
+    let records_before = count(RECORDS);
+    note_giveback_opened(&mut requests, 1, 2);
+    assert_eq!(
+        requests.iter().filter(|req| req.gave_back_rerun).count(),
+        0,
+        "the switch off marks no record at all"
+    );
+    assert_eq!(
+        count(RECORDS),
+        records_before,
+        "and charges nothing for the records it did not mark"
+    );
+
+    // The switch on: the refusal at record 2 gives back records 1 and 2.
+    set_batch_giveback_census_for_test(Some(true));
+    note_giveback_opened(&mut requests, 1, 2);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|req| req.gave_back_rerun)
+            .collect::<Vec<_>>(),
+        vec![false, true, true, false],
+        "the records a park had walked are marked, and the ones after the \
+         refusal — whose walk below is their first — are not"
+    );
+    assert_eq!(
+        count(RECORDS) - records_before,
+        2,
+        "the denominator is one count per record given back, the same \
+         population `render_provider_batch_member_fell_back_draws` names"
+    );
+
+    // Each marked record reaches exactly one arm, and the second charge for one
+    // record is unrepresentable because the marker is taken.
+    let provider_before = count(PROVIDER);
+    let engine_before = count(ENGINE);
+    note_giveback_rerun(&mut requests[1], PROVIDER);
+    note_giveback_rerun(&mut requests[2], ENGINE);
+    assert_eq!(count(PROVIDER) - provider_before, 1);
+    assert_eq!(count(ENGINE) - engine_before, 1);
+    assert!(
+        !requests[1].gave_back_rerun,
+        "the answer's own charge takes the marker"
+    );
+    note_giveback_rerun(&mut requests[1], ENGINE);
+    assert_eq!(
+        count(ENGINE) - engine_before,
+        1,
+        "a record already answered is not charged a second time"
+    );
+
+    set_batch_giveback_census_for_test(None);
+}
+
+/// G3-B/B-1c: a park refusal is counted under the cause that refused it, and
+/// the owner rail's own declines are counted apart from the class's.
+///
+/// The fail line beside a refusal dedupes on `(pipeline, slug)`, so a round can
+/// name a cause and cannot size it — and "a member the class would not keep"
+/// against "a member the owner plan would not import" is exactly the choice a
+/// widening order has to make. The two names below are charged from the rail
+/// that decided the refusal, so a census reads them without reading a log.
+///
+/// The switch is irrelevant to these counters on purpose: the path is cold (one
+/// per run, not one per draw), so they are charged on every park refusal a
+/// batch-on round makes.
+#[test]
+fn a_park_refusal_is_counted_under_the_cause_that_refused_it() {
+    use crate::runtime::drain::store_route_count_for_test as count;
+
+    const MEMBER: &str = "render_batch_giveback_refused_member_declined";
+    const MEMBER_OWNER: &str = "render_batch_giveback_refused_member_owner";
+    const TAIL: &str = "render_batch_giveback_refused_tail";
+    const TAIL_OWNER: &str = "render_batch_giveback_refused_tail_owner";
+
+    let owner_before = count(MEMBER_OWNER) + count(TAIL_OWNER);
+    let member_before = count(MEMBER);
+    let tail_before = count(TAIL);
+
+    // The rail's own charge, driven the way the two park entry points drive it:
+    // one count per refusal, and the owner arm untouched for a refusal that is
+    // not the owner rail's.
+    crate::runtime::exec::note_giveback_refusal(MEMBER, None);
+    crate::runtime::exec::note_giveback_refusal(TAIL, None);
+    assert_eq!(count(MEMBER) - member_before, 1);
+    assert_eq!(count(TAIL) - tail_before, 1);
+    assert_eq!(
+        count(MEMBER_OWNER) + count(TAIL_OWNER),
+        owner_before,
+        "a refusal that is not the owner rail's does not touch the owner arm"
+    );
+
+    // And the owner arm is reachable: the same call with a cause beside it.
+    crate::runtime::exec::note_giveback_refusal(MEMBER, Some(MEMBER_OWNER));
+    assert_eq!(count(MEMBER) - member_before, 2);
+    assert_eq!(count(MEMBER_OWNER) - owner_before, 1);
+}
