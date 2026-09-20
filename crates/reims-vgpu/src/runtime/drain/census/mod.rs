@@ -756,11 +756,97 @@ pub(crate) enum FrameSpan {
     /// is the run-list twin of the staged copy above: the declaration wants an
     /// owned list and the plan is holding the only one.
     LeaseRunCopy = 47,
+    /// `record.pass_descriptor.clone()` inside `narrow_trace`: the render pass
+    /// this record states, copied into the trace because the record is only
+    /// borrowed from the walk.
+    ///
+    /// # Why the trace's own copies are priced at all
+    ///
+    /// `prov_trace_us_mean` reads 39–42 ms/frame (16–17 s/round on the seventh
+    /// cut's pose) and nothing had ever said which part of it is the walk's
+    /// three deep copies. Each of them reproduces a value the walk is holding
+    /// a borrow of, and each has one lever: hand the walk the record itself.
+    /// The bars below say what each copy is worth before any of them moves; the
+    /// meters beside them say how many and how many bytes.
+    ProvTracePassClone = 48,
+    /// `many_draws_pass`'s `head.pass_descriptor.clone()`: the head record's
+    /// pass, copied into [`metal_api_core::provider::RenderDrawsDescriptor`].
+    ///
+    /// The fourth site of the same family — not one of the three the task names
+    /// (`narrow_trace`'s own three), but a full pass descriptor copied once per
+    /// **elected list** rather than once per record, so a round that prices the
+    /// three has to price this one beside them or the table would attribute a
+    /// list's copy to nothing.
+    ProvTraceDrawsHeadClone = 49,
+    /// `production.descriptor.clone()` inside `narrow_trace`: one copy per
+    /// in-flight production of every record.
+    ProvTraceProdClone = 50,
+    /// `declare_pipeline`'s `pipeline.clone()`: one copy per **distinct**
+    /// pipeline id the trace states (the function de-duplicates by id, so a
+    /// batch's records share their declaring kernel's entry).
+    ProvTracePipelineClone = 51,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::LeaseRunCopy as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::ProvTracePipelineClone as usize + 1;
+
+/// One deep copy the trace walk makes of a value it only borrowed, with its own
+/// slot in the count/byte tables beside the span bar of the same name.
+///
+/// # Why counts and bytes rather than microseconds alone
+///
+/// [`FrameSpan`] answers "how long did this take"; for a copy that happens
+/// *either* once per record *or* once per elected list, that is not the whole
+/// reading. The interesting numbers are **how many copies ran** (`_n`) and
+/// **how many bytes each one reproduced** (`_bytes`), because the three sites
+/// differ by an order of magnitude in both: a pipeline contract is a few
+/// hundred bytes of metadata, while a pass descriptor owns its byte sources.
+/// The byte reading is the clone's own weight — the payloads a deep copy
+/// allocates and fills (see `provider_render`'s `trace_clone_*` helpers), not
+/// the `size_of` of the struct alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub(crate) enum TraceCloneMeter {
+    /// [`FrameSpan::ProvTracePassClone`]'s copy.
+    PassDescriptor = 0,
+    /// [`FrameSpan::ProvTraceDrawsHeadClone`]'s copy.
+    DrawsHead = 1,
+    /// [`FrameSpan::ProvTraceProdClone`]'s copy.
+    ProductionDescriptor = 2,
+    /// [`FrameSpan::ProvTracePipelineClone`]'s copy.
+    Pipeline = 3,
+    /// The bytes the walk **moved** instead of copying, on the increment arm:
+    /// the pair to the three above, the way [`LeaseVecMeter::StagedMoved`] is
+    /// the pair to [`LeaseVecMeter::StagedCopy`].
+    ///
+    /// No bar of its own — a move reads no clock — and the controls read it at
+    /// zero, so a round says "the same descriptors travelled as values" rather
+    /// than assuming it from the clone bars falling.
+    Moved = 4,
+}
+
+/// Number of [`TraceCloneMeter`] slots, derived from the enum the same way
+/// [`FRAME_SPANS`] is.
+const TRACE_CLONE_METERS: usize = TraceCloneMeter::Moved as usize + 1;
+
+/// The emitted field-name stem of each meter, in slot order. The span bar of
+/// the same copy is the `prov_trace_*_us_mean` field beside it.
+const TRACE_CLONE_NAMES: [&str; TRACE_CLONE_METERS] = [
+    "trace_clone_pass_desc",
+    "trace_clone_draws_head",
+    "trace_clone_prod_desc",
+    "trace_clone_pipeline",
+    "trace_clone_moved",
+];
+
+impl TraceCloneMeter {
+    /// This meter's slot in the count/byte tables, which is its discriminant.
+    #[inline]
+    pub(crate) fn slot(self) -> usize {
+        self as usize
+    }
+}
 
 /// One `Vec`-shaped construction the lease/run cut prices, with its own slot in
 /// the count/byte tables beside the span bar of the same name.
@@ -924,6 +1010,11 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "lease_window_gather_us_mean",
     "lease_run_gather_us_mean",
     "lease_run_copy_us_mean",
+    // The trace walk's four copies (TR1), then the arm the cut moves them on.
+    "prov_trace_pass_clone_us_mean",
+    "prov_trace_draws_head_clone_us_mean",
+    "prov_trace_prod_clone_us_mean",
+    "prov_trace_pipeline_clone_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.
@@ -1017,6 +1108,16 @@ pub(crate) struct FrameProfileCensus {
     lease_vec_bytes_sum: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
     last_present_lease_vec_n: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
     last_present_lease_vec_bytes: [std::sync::atomic::AtomicU64; LEASE_VEC_METERS],
+    // The trace walk's own copies ([`TraceCloneMeter`]), counted and sized on
+    // the same terms as the lease meters above: cumulative, differenced at
+    // every present close so a frame that straddles a report boundary is still
+    // counted once.
+    trace_clone_n: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
+    trace_clone_bytes: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
+    trace_clone_n_sum: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
+    trace_clone_bytes_sum: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
+    last_present_trace_clone_n: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
+    last_present_trace_clone_bytes: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
     // The previous frame's close; 0 before the first present.
     last_present_us: std::sync::atomic::AtomicU64,
     last_present_draws: std::sync::atomic::AtomicU64,
@@ -1060,6 +1161,12 @@ impl FrameProfileCensus {
             lease_vec_bytes_sum: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
             last_present_lease_vec_n: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
             last_present_lease_vec_bytes: [const { AtomicU64::new(0) }; LEASE_VEC_METERS],
+            trace_clone_n: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
+            trace_clone_bytes: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
+            trace_clone_n_sum: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
+            trace_clone_bytes_sum: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
+            last_present_trace_clone_n: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
+            last_present_trace_clone_bytes: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
             last_present_us: AtomicU64::new(0),
             last_present_draws: AtomicU64::new(0),
             last_present_draw_us: AtomicU64::new(0),
@@ -1130,6 +1237,18 @@ impl FrameProfileCensus {
         self.lease_vec_bytes[meter.slot()].fetch_add(bytes, Relaxed);
     }
 
+    /// Bank one [`TraceCloneMeter`]'s copy: how many ran and how many bytes
+    /// each one reproduced.
+    ///
+    /// Called only through the module-level [`note_trace_clone`], which is
+    /// where the switch is read, so a profile that is off costs the call site
+    /// one relaxed load and no counter write.
+    pub(crate) fn note_trace_clone(&self, meter: TraceCloneMeter, n: u64, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.trace_clone_n[meter.slot()].fetch_add(n, Relaxed);
+        self.trace_clone_bytes[meter.slot()].fetch_add(bytes, Relaxed);
+    }
+
     /// Close the frame a present ends, and report when the window fills.
     ///
     /// `not_enabled` names the arm
@@ -1190,6 +1309,20 @@ impl FrameProfileCensus {
             let prev = self.last_present_lease_vec_bytes[slot].swap(cur, Relaxed);
             *bytes = cur.saturating_sub(prev);
         }
+        let mut trace_clone_n = [0u64; TRACE_CLONE_METERS];
+        let mut trace_clone_bytes = [0u64; TRACE_CLONE_METERS];
+        for (slot, (n, bytes)) in trace_clone_n
+            .iter_mut()
+            .zip(trace_clone_bytes.iter_mut())
+            .enumerate()
+        {
+            let cur = self.trace_clone_n[slot].load(Relaxed);
+            let prev = self.last_present_trace_clone_n[slot].swap(cur, Relaxed);
+            *n = cur.saturating_sub(prev);
+            let cur = self.trace_clone_bytes[slot].load(Relaxed);
+            let prev = self.last_present_trace_clone_bytes[slot].swap(cur, Relaxed);
+            *bytes = cur.saturating_sub(prev);
+        }
         // The sub-phase table is differenced the same way and on the same
         // terms, so a frame that straddles a report boundary stays whole.
         let mut frame_spans = [0u64; FRAME_SPANS];
@@ -1232,6 +1365,14 @@ impl FrameProfileCensus {
         for (slot, (n, bytes)) in lease_vec_n.iter().zip(lease_vec_bytes.iter()).enumerate() {
             self.lease_vec_n_sum[slot].fetch_add(*n, Relaxed);
             self.lease_vec_bytes_sum[slot].fetch_add(*bytes, Relaxed);
+        }
+        for (slot, (n, bytes)) in trace_clone_n
+            .iter()
+            .zip(trace_clone_bytes.iter())
+            .enumerate()
+        {
+            self.trace_clone_n_sum[slot].fetch_add(*n, Relaxed);
+            self.trace_clone_bytes_sum[slot].fetch_add(*bytes, Relaxed);
         }
         self.host_sum_us.fetch_add(frame_host_us, Relaxed);
         self.host_max_us.fetch_max(frame_host_us, Relaxed);
@@ -1287,6 +1428,13 @@ impl FrameProfileCensus {
                     " {name}_n={} {name}_bytes={}",
                     mean(self.lease_vec_n_sum[slot].swap(0, Relaxed)),
                     mean(self.lease_vec_bytes_sum[slot].swap(0, Relaxed)),
+                ));
+            }
+            for (slot, name) in TRACE_CLONE_NAMES.iter().enumerate() {
+                line.push_str(&format!(
+                    " {name}_n={} {name}_bytes={}",
+                    mean(self.trace_clone_n_sum[slot].swap(0, Relaxed)),
+                    mean(self.trace_clone_bytes_sum[slot].swap(0, Relaxed)),
                 ));
             }
             for (name, acc) in SPAN_NAMES.iter().zip(self.span_sum_us.iter()) {
@@ -1422,6 +1570,22 @@ pub(crate) fn note_lease_vec(meter: LeaseVecMeter, n: u64, bytes: u64) {
         return;
     }
     FRAME_PROFILE.note_lease_vec(meter, n, bytes);
+}
+
+/// Bank one [`TraceCloneMeter`]'s copy against the open frame.
+///
+/// `n` is how many copies the call site made (1 everywhere: each site is one
+/// `clone()`), and `bytes` is the payload the copy reproduced — the same
+/// reading [`note_lease_vec`] takes, one level deeper: a cloned descriptor's
+/// weight is every list it allocates plus every byte source it owns.
+///
+/// Charged at the copy's own site, so the count, the bytes and the
+/// [`FrameSpan`] bar beside them are all of the same events.
+pub(crate) fn note_trace_clone(meter: TraceCloneMeter, n: u64, bytes: u64) {
+    if !frame_profile_on() {
+        return;
+    }
+    FRAME_PROFILE.note_trace_clone(meter, n, bytes);
 }
 
 /// Bank one of [`crate::runtime::chain_phase`]'s bars, named by its ordinal.

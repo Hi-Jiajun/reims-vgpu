@@ -19747,11 +19747,105 @@ fn many_draws_pass(
         9..=16 => "render_batch_draws_per_pass_9_16",
         _ => "render_batch_draws_per_pass_over_16",
     });
+    // TR1: the list states the head's pass state once for the whole run, and
+    // the value it states is a copy of a descriptor the walk is holding a
+    // borrow of for exactly as long as this call. Its own bar and meter, so a
+    // round that prices `narrow_trace`'s three copies reads this one beside
+    // them instead of finding an unattributed descriptor copy in the total.
+    let head_descriptor = {
+        let _span = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvTraceDrawsHeadClone,
+        );
+        crate::runtime::drain::note_trace_clone(
+            crate::runtime::drain::TraceCloneMeter::DrawsHead,
+            1,
+            trace_clone_pass_descriptor_bytes(&head.pass_descriptor),
+        );
+        head.pass_descriptor.clone()
+    };
     Some(RenderDrawsDescriptor {
-        head: head.pass_descriptor.clone(),
+        head: head_descriptor,
         tail: draws,
     })
     .map(|list| (carried, list))
+}
+
+/// The payload one deep copy of a list copies: `len * size_of::<T>()`.
+///
+/// The reading the trace walk's own meters are written in, and the same one
+/// [`crate::runtime::drain::LeaseVecMeter`] takes for a `Vec` — a copy's weight
+/// is what it allocates and fills, not the handle it produces.
+fn trace_clone_list_bytes<T>(items: &[T]) -> u64 {
+    u64::try_from(std::mem::size_of_val(items)).unwrap_or(u64::MAX)
+}
+
+/// The bytes one deep copy of a buffer view reproduces (TR1).
+///
+/// The struct's own size plus whichever byte source it owns: an `OwnedBytes`
+/// view carries its payload by value, a guest-run list carries
+/// `len * size_of::<GuestRun>()`, and the two lease arms carry an id. This is
+/// the number the trace's own copies are priced by — the walk copies the value,
+/// so the value's payload is what the copy costs.
+fn trace_clone_view_bytes(view: &BufferView) -> u64 {
+    let mut bytes = u64::try_from(std::mem::size_of::<BufferView>()).unwrap_or(u64::MAX);
+    bytes += match &view.source {
+        BufferSource::OwnedBytes(owned) => u64::try_from(owned.len()).unwrap_or(u64::MAX),
+        BufferSource::GuestRuns(runs) => trace_clone_list_bytes(runs.as_slice()),
+        BufferSource::StagedLease(_) | BufferSource::BorrowedNoCopy(_) => 0,
+    };
+    bytes
+}
+
+/// The bytes one deep copy of a render pass descriptor reproduces (TR1).
+///
+/// Every list the descriptor owns plus every byte source its views own, with
+/// the flat fields folded in as the struct's own size. A descriptor is the
+/// largest of the four values the walk copies — it is the one that carries the
+/// staged vertex bytes, the attachment's own source and the stage-buffer views
+/// at once — which is why the meter beside it is read as bytes and not as a
+/// count.
+fn trace_clone_pass_descriptor_bytes(descriptor: &RenderPassDescriptor) -> u64 {
+    let mut bytes = u64::try_from(std::mem::size_of::<RenderPassDescriptor>()).unwrap_or(u64::MAX);
+    bytes += trace_clone_list_bytes(descriptor.color_attachments.as_slice());
+    bytes += trace_clone_list_bytes(descriptor.samplers.as_slice());
+    bytes += trace_clone_list_bytes(descriptor.stage_buffers.as_slice());
+    for view in &descriptor.vertex_buffers {
+        bytes += trace_clone_view_bytes(view);
+    }
+    for stage in &descriptor.stage_buffers {
+        bytes += trace_clone_view_bytes(&stage.view);
+    }
+    for texture in &descriptor.textures {
+        bytes += u64::try_from(std::mem::size_of::<TextureView>()).unwrap_or(u64::MAX);
+        if let TextureSource::OwnedBytes(owned) = &texture.source {
+            bytes += u64::try_from(owned.len()).unwrap_or(u64::MAX);
+        }
+    }
+    if let Some(indices) = &descriptor.indices {
+        bytes += u64::try_from(std::mem::size_of::<IndexBufferBinding>()).unwrap_or(u64::MAX);
+        bytes += trace_clone_view_bytes(&indices.view);
+    }
+    bytes
+}
+
+/// The bytes one deep copy of a registered pipeline reproduces (TR1).
+///
+/// The entry carries the provider's own metadata rather than its artifact, so
+/// the copy is the contract's binding lists and the capability strings — two
+/// orders of magnitude below a pass descriptor, which is the reading that says
+/// whether the walk's de-duplicating copy is worth moving at all.
+fn trace_clone_pipeline_bytes(pipeline: &CompiledComputePipeline) -> u64 {
+    let mut bytes =
+        u64::try_from(std::mem::size_of::<CompiledComputePipeline>()).unwrap_or(u64::MAX);
+    bytes += trace_clone_list_bytes(pipeline.contract.buffer_bindings.as_slice());
+    bytes += trace_clone_list_bytes(pipeline.contract.texture_bindings.as_slice());
+    for capability in &pipeline.contract.shader_capabilities {
+        bytes += u64::try_from(capability.len()).unwrap_or(u64::MAX);
+    }
+    if pipeline.render.is_some() {
+        bytes += u64::try_from(std::mem::size_of::<RenderPipelineContract>()).unwrap_or(u64::MAX);
+    }
+    bytes
 }
 
 /// Whether two records of a run state the same **pass state** (G3-B/B-2).
@@ -19839,6 +19933,17 @@ fn narrow_trace(
             ));
         }
         for production in &record.in_flight {
+            // TR1: one production restated in this trace's own coordinates, its
+            // pass descriptor copied because the record it came from is only
+            // borrowed here.
+            let _span = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvTraceProdClone,
+            );
+            crate::runtime::drain::note_trace_clone(
+                crate::runtime::drain::TraceCloneMeter::ProductionDescriptor,
+                1,
+                trace_clone_pass_descriptor_bytes(&production.descriptor),
+            );
             trace_passes.push(TracePass::Render(production.descriptor.clone()));
         }
         // The run's own draws: the ones the list carries are stated by it, once,
@@ -19851,6 +19956,18 @@ fn narrow_trace(
                 .expect("the list is stated at the position of its own last draw");
             trace_passes.push(TracePass::RenderDraws(list));
         } else if index >= listed {
+            // TR1: the record's own render pass, stated by the trace. Every
+            // record the many-draws list carries states its pass through the
+            // list's head instead, which is why this copy is per *tail* record
+            // rather than per record.
+            let _span = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvTracePassClone,
+            );
+            crate::runtime::drain::note_trace_clone(
+                crate::runtime::drain::TraceCloneMeter::PassDescriptor,
+                1,
+                trace_clone_pass_descriptor_bytes(&record.pass_descriptor),
+            );
             trace_passes.push(TracePass::Render(record.pass_descriptor.clone()));
         }
     }
@@ -19914,6 +20031,20 @@ fn declare_pipeline(
         .iter()
         .any(|known| known.pipeline_id == pipeline.pipeline_id)
     {
+        // TR1: the trace states one entry per pipeline id, so the copy below
+        // runs once per *distinct* id — a batch's records share their declaring
+        // kernel's entry and pay for it once. Priced apart from the two
+        // descriptor copies because it is the smallest value of the three and
+        // the de-duplicated one: a round has to be able to say the walk's
+        // copies are descriptors rather than metadata before anything moves.
+        let _span = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvTracePipelineClone,
+        );
+        crate::runtime::drain::note_trace_clone(
+            crate::runtime::drain::TraceCloneMeter::Pipeline,
+            1,
+            trace_clone_pipeline_bytes(pipeline),
+        );
         pipelines.push(pipeline.clone());
     }
 }
