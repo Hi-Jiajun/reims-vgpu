@@ -3299,6 +3299,74 @@ fn the_frame_span_line_divides_the_same_frames_the_profile_closes() {
     assert!(c.note_present(1_030_000, 1_020, false).is_none());
 }
 
+/// The seven seam bars divide the part of `Phase::Engine` neither rail claims.
+///
+/// The reading this round exists for is `engine_us` minus `rail_provider` minus
+/// `rail_engine` — 94 % of an engine bar on the 2026-09-20 interactive session,
+/// and named by nothing. Two properties make the seven bars usable as that
+/// reading, and both are wiring rather than behaviour, so neither is visible in
+/// a boot that only fails: each bar lands in its **own** field (a crossed pair
+/// reports one region's cost under another's name, which still reads as an
+/// answer), and all seven are slices of the engine bar rather than siblings
+/// beside it.
+///
+/// Seven different lengths, so a crossed pair cannot pass on a bound that
+/// happens to hold for its neighbour.
+#[test]
+fn each_seam_bar_is_charged_only_its_own_region() {
+    use crate::runtime::drain::{FrameProfileCensus, FrameSpan};
+    let named = [
+        (FrameSpan::SeamTargets, "seam_targets_us_mean", 1_000u64),
+        (FrameSpan::SeamBinds, "seam_binds_us_mean", 2_000),
+        (FrameSpan::SeamDecls, "seam_decls_us_mean", 3_000),
+        (FrameSpan::SeamFrames, "seam_frames_us_mean", 4_000),
+        (FrameSpan::SeamWindows, "seam_windows_us_mean", 5_000),
+        (FrameSpan::SeamInputs, "seam_inputs_us_mean", 6_000),
+        (FrameSpan::SeamAnswer, "seam_answer_us_mean", 7_000),
+    ];
+    let c = FrameProfileCensus::with_report_ms(15);
+    assert!(c.note_present(1_000_000, 1_000, false).is_none());
+    // One frame, one draw, one engine bar the seven are carved out of.
+    c.note_draw(1_000);
+    c.note_span(FrameSpan::Engine as usize, 28_000_000);
+    for (bar, _, us) in named {
+        c.note_span(bar as usize, us * 1_000);
+    }
+    let lines = c
+        .note_present(1_020_000, 1_020, false)
+        .expect("a full window must report");
+    let span = lines.span.expect("a window with frames carries its split");
+    for (bar, name, us) in named {
+        assert!(
+            span.contains(&format!("{name}={}", us / 1_000)),
+            "{name} lost its own charge: {span}",
+        );
+        // The seam bars sit after the two rails in the table, so no chain
+        // ordinal can collide with one.
+        assert!(
+            bar as usize >= FrameSpan::RailProvider as usize,
+            "{name} is not in the rail-and-seam half of the table"
+        );
+    }
+    // Every seam bar is inside the engine bar, so the seven plus the two rails
+    // are slices of one span rather than a second charge beside it.
+    let engine = 28_000u64;
+    let charged: u64 = named.iter().map(|(_, _, us)| us / 1_000).sum();
+    assert!(
+        charged < engine,
+        "the seam's seven regions cannot be the whole engine bar in this fixture"
+    );
+    // A phase ordinal can never reach a seam bar, so a chain phase cannot be
+    // charged under one of these names.
+    for (bar, name, _) in named {
+        assert_eq!(
+            FrameSpan::of_chain(bar as usize),
+            None,
+            "{name} is reachable by a chain ordinal"
+        );
+    }
+}
+
 /// The frame interval's tail is the hitch, and a mean hides it.
 ///
 /// Nine 120 Hz frames and one 100 ms stall average to 17.5 ms — healthy-looking
