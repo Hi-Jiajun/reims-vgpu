@@ -186,13 +186,16 @@ impl Backend for VulkanBackend {
         host: &mut M,
         req: &mut DrawEncodeRequest,
         writeback_guest: bool,
+        finish: bool,
         batch: &mut crate::backend::provider_render::RenderBatch,
     ) -> (EncodeStatus, Option<Vec<u8>>) {
-        // The run's tail is the record that publishes, and the walk reaches
-        // this call for it with `multi_draw_store_plan`'s own answer. The
-        // handoff arm is read off that rather than passed, so the two cannot
-        // disagree about which record finishes the run.
-        let handoff = if writeback_guest {
+        // The walk states which record closes the run: the tail parks *and*
+        // finishes (its own answer comes out of the run's one completion), and
+        // every member before it only assembles. `writeback_guest` stays the
+        // walk's store-plan answer and is passed through unchanged — a run the
+        // serial-pool budget cut short ends on a record that keeps its frame,
+        // and that record still has to finish the run.
+        let handoff = if finish {
             draw::vulkan::ChainHandoff::ParkAndFinish(batch)
         } else {
             draw::vulkan::ChainHandoff::Park(batch)

@@ -17270,6 +17270,18 @@ pub struct RenderBatch {
     /// The answers of the run's one submission, in park order, once the run has
     /// been finished.
     outcomes: Vec<RenderRailOutcome>,
+    /// Why the last park step could not carry the record it was handed
+    /// (G3-B/B-1), or `None` when the park joined the run or no park ran.
+    ///
+    /// A run is one trace, so a record the class refuses is a record the run
+    /// cannot carry — and the walk, which owns the records of the packet, is
+    /// the only thing that can give one back to the per-record path. The seam
+    /// states the refusal here rather than inside a `RenderRailOutcome` the
+    /// member's own `Park` arm throws away, because the batch is the object
+    /// both sides already share: the walk reads it back after every park step,
+    /// and a refusal it reads is a run it gives back rather than a record that
+    /// disappears.
+    refusal: Option<String>,
 }
 
 /// How one park step ended (G3-B/B-1).
@@ -17279,8 +17291,12 @@ pub enum RenderParkOutcome {
     /// submitted, and the run's own completion will answer it.
     Parked,
     /// The class kept this record on the engine. A run never falls back: the
-    /// walk's probes proved every member admitted, so this answer is a wiring
-    /// defect and the caller refuses the run rather than executing it twice.
+    /// walk's probes proved every member admitted, so this answer names a
+    /// shape the probe and the park disagreed about — a wiring finding rather
+    /// than a workload one. The run is given back whole (the walk re-runs its
+    /// records on the per-record path), and the record is never executed
+    /// twice: nothing of this record was submitted by the park step, and the
+    /// run's records are re-walked from the run's own first record.
     OutOfClass(OutOfClass),
     /// The class admitted the record and the provider refused it. Fail-closed,
     /// exactly as the single-record arm's own refusal is.
@@ -17294,6 +17310,7 @@ impl RenderBatch {
             records: Vec::new(),
             identity: None,
             outcomes: Vec::new(),
+            refusal: None,
         }
     }
 
@@ -17312,10 +17329,45 @@ impl RenderBatch {
         self.identity
     }
 
+    /// Whether the record parked last states a frame that stays in the run's
+    /// own image (`REIMS_VGPU_RENDER_BATCH`).
+    ///
+    /// A run is one trace whose passes chain through one image, so every member
+    /// before the publishing tail has to *keep* its frame — a member that
+    /// publishes instead would leave the next member loading an image this
+    /// trace never stored, and the trace's one written frame belongs to the
+    /// tail. The class elects that store arm from facts the walk states
+    /// (`chain_keeps_frame`, the relay's own promise, the elected load), and
+    /// this accessor is the answer the class itself gave: read after the park
+    /// step, it is the exact fact the walk needs to decide whether the run may
+    /// stand — one level below the plan, where a load the walk could not
+    /// foresee (the seed door's own guest window) has already been elected.
+    pub fn last_record_keeps_frame(&self) -> Option<bool> {
+        self.records.last().map(|record| record.facts.keeps_frame)
+    }
+
     /// The answers of the run's one submission, in park order. Empty until the
     /// run has been finished.
     pub fn outcomes(&self) -> &[RenderRailOutcome] {
         &self.outcomes
+    }
+
+    /// State why one park step could not carry its record
+    /// (`REIMS_VGPU_RENDER_BATCH`).
+    ///
+    /// Called by the seam's `Park` arm, which is where a class refusal and a
+    /// park refusal both arrive: the walk reads it back after the step and
+    /// gives the whole run to the per-record path, so a record the class will
+    /// not carry is answered by the engine rather than by nothing at all.
+    pub fn note_refusal(&mut self, detail: String) {
+        if self.refusal.is_none() {
+            self.refusal = Some(detail);
+        }
+    }
+
+    /// Take the refusal the last park step recorded, if it recorded one.
+    pub fn take_refusal(&mut self) -> Option<String> {
+        self.refusal.take()
     }
 
     /// Take the last record's answer out of the run.
@@ -17431,10 +17483,37 @@ impl RenderBatch {
                             if index + 1 != records {
                                 published_before_the_tail += 1;
                             }
+                            // G3-B/B-1: a member's answer is the run's, so the
+                            // two per-record readings a lone record charges where
+                            // its own answer is routed are charged here instead —
+                            // once per member, and never for the tail, whose
+                            // answer travels through the seam's own arms (which
+                            // charge them there). The census divides both: a run
+                            // that answered three records and moved
+                            // `render_provider_canonical` by one would read as
+                            // three records the provider never answered, and
+                            // `pass_color_slots_1 == render_provider_canonical`
+                            // is the identity every widening round checks.
+                            if index + 1 != records {
+                                note_member_answered();
+                            }
                             self.outcomes
                                 .push(RenderRailOutcome::ProviderCompleted(output));
                         }
                         RenderCompletion::Resident(frame) => {
+                            if index + 1 != records {
+                                note_member_answered();
+                                // The record's frame stayed in the run's own
+                                // image, which is the fact the walk's
+                                // `provider_chain_middle_kept` names for a
+                                // record answered the same way outside a run.
+                                // Charged from the provider's own answer rather
+                                // than from the walk's promise, so the two arms
+                                // are one population read twice.
+                                crate::runtime::drain::note_store_route(
+                                    "provider_chain_middle_kept",
+                                );
+                            }
                             self.outcomes
                                 .push(RenderRailOutcome::ProviderCompletedResident(frame));
                         }
@@ -17572,6 +17651,23 @@ pub fn park_and_finish_render(
         .ok_or_else(|| ProviderRenderDecline::TraceAdmission {
             detail: "the run's completion answered fewer records than the run parked".to_string(),
         })
+}
+
+/// The two per-record readings a provider answer carries
+/// (`render_provider_canonical`, the frame-draw rail), charged for a run's
+/// member (G3-B/B-1).
+///
+/// The seam charges them where a lone record's answer is routed to its caller,
+/// and a run's members have no such place: their answers arrive with the run's
+/// own completion. Charging them from the completion's own verdict keeps the
+/// census identities that divide these names true for a batched boot as well —
+/// `pass_color_slots_1 == render_provider_canonical + engine_draws + refusals`,
+/// and the provider/engine rail split — rather than reading a run's members as
+/// records no rail answered.
+#[inline]
+fn note_member_answered() {
+    crate::runtime::drain::note_store_route("render_provider_canonical");
+    crate::runtime::drain::note_frame_draw_rail(crate::runtime::drain::FrameDrawRail::Provider);
 }
 
 /// The state one trace's records are assembled into, shared by every record of

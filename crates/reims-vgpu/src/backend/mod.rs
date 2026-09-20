@@ -329,6 +329,13 @@ pub(crate) trait Backend: Copy {
     /// rail that cannot park must say so before the walk has parked anything
     /// else, or the batch it abandoned would be half a trace.
     ///
+    /// `finish` is the walk's own statement that this record is the run's
+    /// publishing tail rather than one of its members. It is passed rather
+    /// than read off `writeback_guest`, because the two are different facts: a
+    /// run cut short by the serial-pool budget ends on a record that *keeps*
+    /// its frame (the record after it is not in the run), and that record has
+    /// to close the run exactly as a publishing tail does.
+    ///
     /// `parked` is the status; `Some` names a provider answer that the record
     /// does not own. The two arms a caller has to keep apart are:
     ///
@@ -351,6 +358,7 @@ pub(crate) trait Backend: Copy {
         _host: &mut M,
         _req: &mut DrawEncodeRequest,
         _writeback_guest: bool,
+        _finish: bool,
         _batch: &mut crate::backend::provider_render::RenderBatch,
     ) -> (EncodeStatus, Option<Vec<u8>>) {
         (
@@ -1378,13 +1386,14 @@ impl Backend for SelectedBackend {
         host: &mut M,
         req: &mut DrawEncodeRequest,
         writeback_guest: bool,
+        finish: bool,
         batch: &mut crate::backend::provider_render::RenderBatch,
     ) -> (EncodeStatus, Option<Vec<u8>>) {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.park_draw_chain(state, host, req, writeback_guest, batch),
+            Self::Metal(b) => b.park_draw_chain(state, host, req, writeback_guest, finish, batch),
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.park_draw_chain(state, host, req, writeback_guest, batch),
+            Self::Vulkan(b) => b.park_draw_chain(state, host, req, writeback_guest, finish, batch),
         }
     }
 
