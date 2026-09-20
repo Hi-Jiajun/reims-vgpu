@@ -19637,7 +19637,18 @@ fn finish_narrow_records(
     let (trace, resources) = if leases.iter().all(Option::is_none) {
         (trace, resources)
     } else {
-        let frame = provider_wire::submit_frame(&trace, &resources).map_err(|decline| {
+        // sp13: the admission bar's first part — the frame itself, whole. Its
+        // own three regions are charged inside `submit_frame`.
+        let framed = {
+            let _span =
+                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvAdmitFrame);
+            if provider_wire::submit_frame_owned_enabled() {
+                provider_wire::submit_frame_owned(trace, resources)
+            } else {
+                provider_wire::submit_frame(&trace, &resources)
+            }
+        };
+        let frame = framed.map_err(|decline| {
             abort_narrow_leases(&mut leases, provider);
             ProviderRenderDecline::StageBufferWire {
                 step: decline.step,
@@ -19645,7 +19656,15 @@ fn finish_narrow_records(
             }
         })?;
         provider_wire::note_submit_frame();
-        match provider_wire::carried_submission(&frame) {
+        // sp13: the admission bar's second part, carved out at the decode the
+        // provider's own reader runs before its admission sees anything.
+        let carried = {
+            let _span = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvAdmitDecode,
+            );
+            provider_wire::carried_submission(&frame)
+        };
+        match carried {
             Ok((trace, resources)) => {
                 note_wire_stage_buffers(&trace);
                 note_wire_render_textures(&trace);
@@ -19660,7 +19679,14 @@ fn finish_narrow_records(
             }
         }
     };
-    let validated = match provider.capabilities().validate_trace(trace, resources) {
+    // sp13: the admission bar's third part — the contract walk itself, which is
+    // charged apart from the wire that produced its input.
+    let admitted = {
+        let _span =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvAdmitValidate);
+        provider.capabilities().validate_trace(trace, resources)
+    };
+    let validated = match admitted {
         Ok(validated) => validated,
         Err(error) => {
             abort_narrow_leases(&mut leases, provider);

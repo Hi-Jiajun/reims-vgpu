@@ -7507,6 +7507,33 @@ fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_secon
          render_provider_out_of_class_guest_backing +0; the registered memory holds the \
          published frame byte for byte"
     );
+
+    // The frame the caller states, re-encoded twice out of the pair the
+    // provider's own decoder produced: once from copies of that pair (the path
+    // every round ran before sp13) and once from the pair itself, moved into
+    // the request. The copy is the only difference between the two encoders, so
+    // the bytes have to be the same ones — and this is the reading that says so
+    // for a frame the rail actually produced rather than for one built here.
+    let copied = provider_wire::submit_frame(&wire_trace, &_wire_resources)
+        .expect("the copying encoder re-encodes the frame it produced");
+    let moved = provider_wire::submit_frame_owned(wire_trace, _wire_resources)
+        .expect("the moving encoder encodes the same request");
+    eprintln!(
+        "sp13 wire frame: {} bytes; the copying encoder re-encodes {} bytes and the moving one {} \
+         — the frame the owner states for one submission scope is a payload, not a pointer",
+        frames[0].len(),
+        copied.len(),
+        moved.len(),
+    );
+    assert_eq!(
+        copied, frames[0],
+        "the frame is a fixed point of the owner's encoder and the provider's decoder"
+    );
+    assert_eq!(
+        moved, copied,
+        "the frame is the same bytes whether its inputs were copied or moved: \
+         REIMS_VGPU_SUBMIT_FRAME_OWNED cannot change what the guest sees"
+    );
 }
 
 /// E-TX14 (RAIL-A): the same tail, the same window, and a device that delivers

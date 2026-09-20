@@ -1590,7 +1590,16 @@ fn submit_narrow(
     let (trace, resources) = if textures.is_empty() {
         (trace, resources)
     } else {
-        let frame = match provider_wire::submit_frame(&trace, &resources) {
+        let framed = {
+            let _span =
+                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvAdmitFrame);
+            if provider_wire::submit_frame_owned_enabled() {
+                provider_wire::submit_frame_owned(trace, resources)
+            } else {
+                provider_wire::submit_frame(&trace, &resources)
+            }
+        };
+        let frame = match framed {
             Ok(frame) => frame,
             Err(decline) => {
                 leases.abort(provider);
@@ -1601,7 +1610,13 @@ fn submit_narrow(
             }
         };
         provider_wire::note_submit_frame();
-        match provider_wire::carried_submission(&frame) {
+        let carried = {
+            let _span = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvAdmitDecode,
+            );
+            provider_wire::carried_submission(&frame)
+        };
+        match carried {
             Ok(pair) => pair,
             Err(decline) => {
                 leases.abort(provider);
@@ -1612,7 +1627,12 @@ fn submit_narrow(
             }
         }
     };
-    let validated = match provider.capabilities().validate_trace(trace, resources) {
+    let admitted = {
+        let _span =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvAdmitValidate);
+        provider.capabilities().validate_trace(trace, resources)
+    };
+    let validated = match admitted {
         Ok(validated) => validated,
         Err(error) => {
             leases.abort(provider);
