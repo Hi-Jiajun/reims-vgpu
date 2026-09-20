@@ -20701,21 +20701,29 @@ fn a_window_copy_reads_only_bytes_its_own_registration_covers() {
     );
 }
 
-/// R9e's refusal half: a gather the seam cannot cut one window from stays on
-/// the engine, each under the bucket its own fact names.
+/// G1-A's refusal half, beside R9e's window half: a gather whose **runs** the
+/// rail cannot read keeps the engine, each under the bucket its own fact names.
 ///
-/// Three shapes, none of them a looser door: bytes scattered over more than one
-/// run, a run whose import the registration ledger never registered, and a
-/// packed bind whose `source_offset` leaves the view's own host pointer off the
-/// device's import granule *and* whose import the owner rail was never handed,
-/// so there is no registration to copy the bytes out of. The first two answer
-/// `..._stage_buffer_gather` (the rail mints no copy for them either), and the
-/// third answers `..._stage_buffer_alignment` — since R18 that bucket is the
-/// *unreadable* window's, not every off-granule one: a window the rail can read
-/// is copied into the staged arm
-/// (`an_unaligned_stage_buffer_window_is_copied_into_the_owner_staged_arm`),
-/// and only a window it cannot read keeps the draw on the engine, because a
-/// declined draw is not a fallback.
+/// R9e's test above states the borrowed window and the derived run list, and
+/// since G1-A a gather whose runs state *no* window at all is gathered into the
+/// staged arm instead
+/// (`a_gather_whose_runs_state_no_window_is_gathered_into_the_staged_arm`) —
+/// which is what a host that cannot import a host pointer produces for every
+/// gather. What is still out of class is the one source this rail has no bytes
+/// to copy from:
+///
+/// - **runs that stop short of the bind**, and a `source_offset` that walks past
+///   them: the copy would pad bytes no record wrote, and the bucket the census
+///   has always read for that answer (`..._stage_buffer_gather`) is this arm's;
+/// - **an off-granule window whose import the owner rail was never handed**: the
+///   borrowed arm cannot import the view pointer and the copy R18 makes out of
+///   the registration has no registration to read
+///   (`owner_unregistered_region`), so the draw stays on the engine under
+///   `..._stage_buffer_alignment` — a window the rail *can* read is copied into
+///   the staged arm
+///   (`an_unaligned_stage_buffer_window_is_copied_into_the_owner_staged_arm`),
+///   and only a window it cannot read keeps the draw on the engine, because a
+///   declined draw is not a fallback.
 #[test]
 fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
     use reims_vgpu::backend::provider_compute::host_import_alignment;
@@ -20787,45 +20795,61 @@ fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
         }
     };
 
-    // Two runs that do **not** tile the bind: each spans the whole granule, so
-    // their clipped lengths sum to more than the bind. The contract's run list
-    // *is* the view's byte range, so this is a declaration about bytes no
-    // record wrote — and a scatter that does tile the bind with registered
-    // windows is the run-list arm instead
-    // (`a_stage_buffer_gather_scattered_over_two_registered_stretches_leaves_without_a_copy`).
-    let scattered = gather(
-        0,
-        vec![
-            GuestWindowRun {
-                window_offset: 0,
-                guest: guest(),
-                window: Some(registered),
-            },
-            GuestWindowRun {
-                window_offset: 8,
-                guest: guest(),
-                window: Some(registered),
-            },
-        ],
+    let delivered = provider_render::provider_submissions();
+    let staged_before = route_count("render_provider_out_of_class_stage_buffer_gather_staged");
+    let staged_bytes_before = route_count("render_provider_out_of_class_stage_buffer_gather_bytes");
+
+    // The runs hold fewer bytes than the window the source states: 16 byte(s)
+    // of bind over one 8 byte run. G1-A's copy stops where the runs stop, and
+    // the remainder is not a byte any record wrote — so the source is refused
+    // rather than padded, and the bucket is the one this class has always read
+    // for a gather it has no arm for.
+    let short_runs = |source_offset: u64| -> BufferContent {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                owner.pointer as usize,
+                2 * page as u64,
+                0,
+                8,
+            )
+            .expect("the run is inside the mapping")]),
+            source_offset,
+            total_len: 16,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        })
+    };
+    let (slug, detail) = answer("runs short of the bind", &short_runs(0));
+    eprintln!("door: {slug}\n  {detail}");
+    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+    assert!(
+        detail.contains("gathers from guest RAM") && detail.contains("owner rail"),
+        "the sentence names the gather and the rail that would carry it: {detail}"
     );
-    let (slug, detail) = answer("scattered gather", &scattered);
+
+    // A `source_offset` that walks past the runs: the window starts after the
+    // last byte the source holds, so there is nothing left to copy either.
+    let (slug, detail) = answer("source offset past the runs", &short_runs(8));
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
     assert!(
         detail.contains("gathers from guest RAM"),
-        "the sentence names the gather: {detail}"
+        "the same sentence answers both arms of the short source: {detail}"
     );
 
-    // Unregistered: the ledger derived no window for this run.
-    let unregistered = gather(
-        0,
-        vec![GuestWindowRun {
-            window_offset: 0,
-            guest: guest(),
-            window: None,
-        }],
-    );
-    let (slug, detail) = answer("unregistered gather", &unregistered);
+    // No runs at all: the same arm with nothing to walk, and the shape the
+    // class's own doors test states beside every other door
+    // (`a_stage_buffer_the_gate_refuses_by_name...`).
+    let no_runs = BufferContent::GuestRuns(engine::GuestRunSource {
+        runs: std::sync::Arc::new(Vec::new()),
+        source_offset: 0,
+        total_len: 16,
+        row_length_texels: 0,
+        pages: None,
+        direct_image: None,
+    });
+    let (slug, detail) = answer("no runs", &no_runs);
     eprintln!("door: {slug}\n  {detail}");
     assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
 
@@ -20853,57 +20877,278 @@ fn a_gather_the_seam_cannot_cut_a_window_from_stays_on_the_engine() {
         "the sentence names the fact that stopped the copy: {detail}"
     );
 
-    // Both buckets are counters, not latches.
-    assert!(route_count("render_provider_out_of_class_stage_buffer_gather") >= 2);
+    // Both buckets are counters, not latches, and neither refusal is the
+    // staged arm: a source the runs cannot cover is copied *not at all*.
+    assert!(route_count("render_provider_out_of_class_stage_buffer_gather") >= 3);
     assert!(route_count("render_provider_out_of_class_stage_buffer_alignment") >= 1);
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_gather_staged"),
+        staged_before,
+        "no unreadable source is staged"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_gather_bytes"),
+        staged_bytes_before,
+        "and no byte of one is charged to the staged arm's own counter"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        delivered,
+        "no refusal the runs cannot cover reaches the provider"
+    );
 }
 
-/// The run-list arm's own refusals (`E-TX6`): every scatter the contract's
-/// ordered list cannot state keeps the engine by name and reaches no provider
-/// submission.
+/// G1-A: a gather whose runs state **no window at all** is gathered into the
+/// staged arm, and the frame that comes out is the engine's own frame for the
+/// same bind, byte for byte.
 ///
-/// The positive sibling above states what a list *is* — one registered window
-/// per stretch, in window order, summing to the bind. These are the four facts
-/// that stop it from being one, each answered under
-/// `render_provider_out_of_class_stage_buffer_gather`:
+/// This is the production shape. The draw path's zero-copy resolution hands the
+/// class a `BufferContent::GuestRuns` whose runs are live host aliases of the
+/// guest's pages, and on a host whose device answer is
+/// `host_pointer_import=disabled_by_env` the registration ledger derives no
+/// window for *any* of them (`window_stretches` answers `None` for a source with
+/// no `pages`), so every gathered bind arrives with neither a window nor a copy.
+/// One driven boot counted 87 040 of them — 88.8 % of everything the canonical
+/// class refused (`evidence/user-interactive-test-2026-09-20`, bucket
+/// `render_provider_out_of_class_stage_buffer_gather`).
 ///
-/// - **a stretch with no registered window** (`window: None`): the ledger holds
-///   no provider region to cut a window from, which is the unregistered
-///   reading R9e's own refusal already names;
-/// - **a window that stops short of the bytes its run carries**: the window is
-///   what the stage would read, so a `head + length` past it names bytes the
-///   declaration never described;
-/// - **runs that do not tile the bind**: the list's concatenation *is* the
-///   view's byte range, so a sum that is not the bind's is a declaration about
-///   bytes no record wrote;
-/// - **runs in two registrations**: the contract pairs every run's reservation
-///   with the *declaring view's* own allocation, so no single declaration can
-///   state a list split across two — this increment's own addition, answered
-///   here rather than left to `provider_owner::plan`'s decline.
+/// The class now reads those runs itself and states the copy as an owner-issued
+/// staged lease, which is the arm a bind whose bytes the owner already holds
+/// takes. The bytes are the window the source's own `total_len` states — the
+/// extent the draw path already narrowed to the shader's proven reach — so the
+/// copy is the window the engine's own CPU staging arm reads for the same bind,
+/// and the two frames are one frame.
 ///
-/// Every case also checks that the draw never became a submission: a refusal by
-/// name is the class staying where it was, not a fallback.
+/// Three facts are checked at once, and none of them alone would be enough: the
+/// frame (equal to the engine's, and it follows the runs when they move, so the
+/// copy is per submission and not cached), the wire (one owner-issued staged
+/// lease over exactly the bind's bytes), and the census (the new arm's routes
+/// count both the binds and the bytes the CPU gather carries).
 #[test]
-fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
+fn a_gather_whose_runs_state_no_window_is_gathered_into_the_staged_arm() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    /// The bind's own bytes: the four floats the fixture's fragment stage reads
+    /// (`reims_buffer_frag`), and therefore also the reach the draw path's
+    /// zero-copy resolution narrows the source to.
+    const BIND_BYTES: u64 = 16;
+
+    let _guard = engine_test_session();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The mapping holds the fragment's red: what the runs read there, and so
+    // what both rails must draw.
+    owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    // The mapping's own address and extent, read once: the source closure below
+    // is called again after the guest's bytes move, so it may not hold a borrow
+    // of the host that its own mutation would then conflict with.
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    // The source the draw path builds for this bind in the production pose: one
+    // live host run over the bind's own bytes, and no `pages` — the reading a
+    // host that cannot register an import gives every gather.
+    let production = || {
+        BufferContent::GuestRuns(engine::GuestRunSource {
+            runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                mapping,
+                mapping_len,
+                0,
+                BIND_BYTES,
+            )
+            .expect("the bind's own bytes are inside the mapping")]),
+            source_offset: 0,
+            total_len: BIND_BYTES,
+            row_length_texels: 0,
+            pages: None,
+            direct_image: None,
+        })
+    };
+    let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
+    let request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    // The engine's own frame for the same request and the same runs, taken
+    // before the provider's device exists: the engine's device context is
+    // created lazily on its first draw.
+    let Some(engine_frame) = engine_pixels("windowless gather", &stages, request(&production()))
+    else {
+        return;
+    };
+    let frame = |label: &str, content: &BufferContent| -> Vec<u8> {
+        let binds = [StageBufferBind {
+            stage: RenderPipelineStage::Fragment,
+            index: 0,
+            content,
+            window: None,
+            landing: None,
+        }];
+        match provider_render::submit_render(
+            &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
+            &request(content),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a gather whose runs hold these bytes is in class since G1-A: {other:?}"
+            ),
+        }
+    };
+    let delivered = provider_render::provider_submissions();
+    let staged_before = route_count("render_provider_out_of_class_stage_buffer_gather_staged");
+    let staged_bytes_before = route_count("render_provider_out_of_class_stage_buffer_gather_bytes");
+
+    let red = frame("no-window gather", &production());
+    eprintln!(
+        "windowless gather: device host-import alignment = {alignment}; {BIND_BYTES} byte(s) of \
+         bind over one run at the owner's own mapping, with no `pages` and no window; texel \
+         (0, 0) {:?}",
+        texel_at(&red, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&red, 0, 0),
+        [255, 0, 0, 255],
+        "the copy read the runs' own bytes"
+    );
+    assert_frames_equal("windowless gather, both rails", &red, &engine_frame);
+
+    // The wire's own reading: the bind crossed as an owner-issued staged lease
+    // over exactly the bind's bytes — the arm a staged bind takes, not a third
+    // shape and not a run list.
+    use reims_vgpu::backend::provider_wire;
+
+    provider_wire::capture_submission_frames(true);
+    let frames_before = provider_wire::wire_counts();
+    let captured_frame = frame("captured", &production());
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    assert_frames_equal(
+        "the captured windowless gather, both rails",
+        &captured_frame,
+        &engine_frame,
+    );
+    assert_eq!(
+        provider_wire::wire_counts().submit_frames,
+        frames_before.submit_frames + 1,
+        "the seam produced exactly one submission frame"
+    );
+    assert_eq!(frames.len(), 1, "and the capture holds it");
+    let (wire_trace, _wire_resources) = provider_wire::carried_submission(&frames[0])
+        .expect("the provider's own decoder reads the frame back");
+    let wire_pass = wire_trace
+        .passes
+        .iter()
+        .find_map(|pass| pass.as_render())
+        .expect("the frame carries the render pass");
+    let view = wire_pass
+        .stage_buffers
+        .first()
+        .expect("the frame carries the declared stage buffer");
+    let source = match &view.view.source {
+        BufferSource::OwnedBytes(bytes) => format!("owned_bytes({})", bytes.len()),
+        BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
+        BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
+        BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+    };
+    eprintln!(
+        "wire stage-buffer view: stage={:?} offset={} length={} source={source}",
+        view.stage, view.view.offset, view.view.length,
+    );
+    let BufferSource::StagedLease(_) = &view.view.source else {
+        panic!("a gather this rail read itself crosses as the owner's staged lease: {source}");
+    };
+    assert_eq!(
+        view.view.length, BIND_BYTES,
+        "the lease holds the bind's own bytes"
+    );
+    assert_eq!(view.view.offset, 0, "and starts at the bind's first byte");
+
+    // The falsifiable half: the copy is made per submission, so moving the
+    // guest's own bytes moves the frame — the freshness the GPU gather arm has,
+    // and not a cached read that would keep drawing the bytes it saw first.
+    owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0, 0]);
+    let black = frame("gather after the bytes moved", &production());
+    eprintln!(
+        "provider texel after moving the runs' first float: {:?}",
+        texel_at(&black, 0, 0),
+    );
+    assert_eq!(
+        texel_at(&black, 0, 0),
+        [0, 0, 0, 255],
+        "the same bind now reads the moved bytes"
+    );
+    assert_frames_differ("the copy follows the runs' bytes", &red, &black);
+
+    // The census: one route per bind that took the arm, one byte total beside
+    // it. Three submissions took it above (the frame, the captured one, the one
+    // after the bytes moved), so both counters move by at least that.
+    let staged = route_count("render_provider_out_of_class_stage_buffer_gather_staged");
+    let staged_bytes = route_count("render_provider_out_of_class_stage_buffer_gather_bytes");
+    eprintln!(
+        "gather-staged census: binds={} bytes={} (bytes per bind {})",
+        staged - staged_before,
+        staged_bytes - staged_bytes_before,
+        (staged_bytes - staged_bytes_before) / (staged - staged_before).max(1),
+    );
+    assert!(
+        staged - staged_before >= 3,
+        "every submission that took the arm is counted"
+    );
+    assert_eq!(
+        staged_bytes - staged_bytes_before,
+        (staged - staged_before) * BIND_BYTES,
+        "and each of them charges the copy's own bytes"
+    );
+    assert!(
+        provider_render::provider_submissions() > delivered,
+        "the census shape reaches the canonical provider instead of the engine"
+    );
+}
+
+/// G1-A: the ways a registration ledger leaves a gather **windowless** are the
+/// same answer as a source with no ledger at all — this rail reads the runs.
+///
+/// The positive sibling above states the production pose (`pages: None`). A
+/// driven boot's gathers are not all of that kind: the ledger can hold the
+/// import and still derive no window that states the bind — a stretch whose
+/// entry is the unregistered reading, a window that stops short of the bytes its
+/// run carries, a scatter whose clipped lengths do not sum to the bind, a list
+/// whose stretches live in two registrations. Each of those kept the engine by
+/// name before this increment (`..._stage_buffer_gather`); each is now gathered
+/// out of the runs the source already carries.
+///
+/// The engine's own frame is the expectation for every one of them, so the
+/// class's copy is not *a* frame but the engine's: the engine reads these same
+/// runs through its CPU staging arm, because none of these sources has the
+/// single stretch the no-copy import needs.
+#[test]
+fn a_gather_the_ledger_leaves_windowless_is_gathered_from_its_runs() {
     use reims_vgpu::runtime::guest_ram::{GuestRamImport, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::{GuestWindowRun, RegisteredWindow};
 
-    /// Bytes one stretch of a well-formed list carries.
+    /// Bytes one stretch of the list carries.
     const RUN_BYTES: u64 = 8;
     /// The bind the list has to tile: two stretches.
     const BIND_BYTES: u64 = 2 * RUN_BYTES;
-    /// The first stretch's own head inside its granule.
-    const HEAD: u64 = 8;
+    /// The first stretch's own head inside its granule. Zero, so the page runs
+    /// and the `runs` beside them describe the *same* bytes: a fixture where
+    /// the two disagree is not a source the seam's own docs admit, and the two
+    /// rails would then be reading two different windows rather than the same
+    /// one (G1-A's frame claim is about the bytes, not about the carrier).
+    const HEAD: u64 = 0;
 
     let _guard = engine_test_session();
     let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
         .expect("the owner rail's provider answers");
-    assert!(
-        alignment > 0,
-        "the refusal half needs the no-copy device too"
-    );
     let page = usize::try_from(alignment).expect("the alignment fits usize");
-    let owner = AlignedHost::new(2 * page, page);
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The mapping holds the fragment's red at the bind's first float: the runs
+    // below read it, and the engine reads the same runs.
+    owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
     let import = std::sync::Arc::new(
         GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
             .expect("a page-aligned synthetic host allocation"),
@@ -20929,9 +21174,8 @@ fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
         length: page as u64,
         epoch: 1,
     };
-    // The same shape the positive test states, with the one fact each case
-    // below varies. `runs` are not read on any refusal arm, so one host run
-    // covers them all.
+    // The source every case below varies one fact of: one host run over the
+    // bind's own bytes, and the page runs a ledger derived windows for.
     let gather = |pages: Vec<GuestWindowRun>| -> BufferContent {
         BufferContent::GuestRuns(engine::GuestRunSource {
             runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
@@ -20963,9 +21207,15 @@ fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
         ]
     };
     let stages = buffer_declaring_stages("render_frag_buffer.air", "reims_buffer_frag");
-    let delivered = provider_render::provider_submissions();
-    let charged_before = route_count("render_provider_out_of_class_stage_buffer_gather");
-    let answer = |label: &str, content: &BufferContent| -> (String, String) {
+    let request = |content: &BufferContent| {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.storage_buffers.push(engine::StorageBufferResource {
+            binding: 0,
+            content: content.clone(),
+        });
+        req
+    };
+    let frame = |label: &str, content: &BufferContent| -> Vec<u8> {
         let binds = [StageBufferBind {
             stage: RenderPipelineStage::Fragment,
             index: 0,
@@ -20975,27 +21225,37 @@ fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
         }];
         match provider_render::submit_render(
             &inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds),
-            &narrow_request(MTL_FORMAT_RGBA8_UNORM),
+            &request(content),
         ) {
-            RenderRailOutcome::NotInNarrowClass(reason) => {
-                (reason.slug().to_owned(), reason.detail().to_owned())
-            }
-            other => panic!("{label}: a list the contract cannot state is out of class: {other:?}"),
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!(
+                "{label}: a windowless gather whose runs hold the bind's bytes is in class: \
+                 {other:?}"
+            ),
         }
     };
+    let refused_before = route_count("render_provider_out_of_class_stage_buffer_gather");
+    let staged_before = route_count("render_provider_out_of_class_stage_buffer_gather_staged");
 
     // A stretch the ledger derived no window for: the unregistered reading.
     let unregistered = gather(both_stretches(Some(first_window), None));
-    let (slug, detail) = answer("run list with an unregistered stretch", &unregistered);
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
-    assert!(
-        detail.contains("gathers from guest RAM"),
-        "the sentence names the gather: {detail}"
+    let Some(engine_unregistered) =
+        engine_pixels("unregistered stretch", &stages, request(&unregistered))
+    else {
+        return;
+    };
+    let staged_unregistered = frame("unregistered stretch", &unregistered);
+    eprintln!(
+        "unregistered stretch: provider texel (0, 0) {:?}",
+        texel_at(&staged_unregistered, 0, 0),
+    );
+    assert_frames_equal(
+        "a gather with an unregistered stretch, both rails",
+        &staged_unregistered,
+        &engine_unregistered,
     );
 
-    // The window stops one byte short of the bytes its own run carries: the
-    // list would name a byte the registration never derived.
+    // The window stops one byte short of the bytes its own run carries.
     let short_window = RegisteredWindow {
         import: first_window.import,
         base: first_window.base,
@@ -21003,9 +21263,16 @@ fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
         epoch: first_window.epoch,
     };
     let short = gather(both_stretches(Some(short_window), Some(second_window)));
-    let (slug, detail) = answer("run list with a window that stops short", &short);
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+    let Some(engine_short) = engine_pixels("window that stops short", &stages, request(&short))
+    else {
+        return;
+    };
+    let frame_short = frame("window that stops short", &short);
+    assert_frames_equal(
+        "a gather behind a short window, both rails",
+        &frame_short,
+        &engine_short,
+    );
 
     // Two runs that do not tile the bind: each spans the whole grant, so the
     // clipped lengths sum past it.
@@ -21021,15 +21288,25 @@ fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
             window: Some(first_window),
         },
     ]);
-    let (slug, detail) = answer("run list that does not tile the bind", &overlapping);
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
+    let Some(engine_overlapping) = engine_pixels(
+        "list that does not tile the bind",
+        &stages,
+        request(&overlapping),
+    ) else {
+        return;
+    };
+    let frame_overlapping = frame("list that does not tile the bind", &overlapping);
+    assert_frames_equal(
+        "a scatter that does not tile the bind, both rails",
+        &frame_overlapping,
+        &engine_overlapping,
+    );
 
     // The two stretches live in two registrations: the contract pairs a run's
     // reservation with the declaring view's own allocation, so no one
-    // declaration can state this list.
-    let mut other_owner = AlignedHost::new(page, page);
-    other_owner.as_mut_slice()[..4].copy_from_slice(&[0, 0, 0x80, 0x3f]);
+    // declaration can state this list — and the runs are still this rail's to
+    // read.
+    let other_owner = AlignedHost::new(page, page);
     let other_import = std::sync::Arc::new(
         GuestRamImport::new_host_allocation(other_owner.pointer as usize, page as u64, alignment)
             .expect("a page-aligned synthetic host allocation"),
@@ -21041,18 +21318,29 @@ fn a_stage_buffer_gather_the_run_list_cannot_state_stays_on_the_engine() {
         epoch: 1,
     };
     let split = gather(both_stretches(Some(first_window), Some(elsewhere)));
-    let (slug, detail) = answer("run list split across two registrations", &split);
-    eprintln!("door: {slug}\n  {detail}");
-    assert_eq!(slug, "render_provider_out_of_class_stage_buffer_gather");
-
-    assert_eq!(
-        provider_render::provider_submissions(),
-        delivered,
-        "no refusal the list cannot state reaches the provider"
+    let Some(engine_split) = engine_pixels(
+        "list split across two registrations",
+        &stages,
+        request(&split),
+    ) else {
+        return;
+    };
+    let frame_split = frame("list split across two registrations", &split);
+    assert_frames_equal(
+        "a list split across two registrations, both rails",
+        &frame_split,
+        &engine_split,
     );
+
+    // Every one of them took the staged arm, and none was refused.
     assert!(
-        route_count("render_provider_out_of_class_stage_buffer_gather") - charged_before >= 4,
-        "every case is charged to the gather bucket the census reads"
+        route_count("render_provider_out_of_class_stage_buffer_gather_staged") - staged_before >= 4,
+        "each windowless gather is charged to the staged arm's own route"
+    );
+    assert_eq!(
+        route_count("render_provider_out_of_class_stage_buffer_gather"),
+        refused_before,
+        "and none of them is charged to the refusal's"
     );
 }
 

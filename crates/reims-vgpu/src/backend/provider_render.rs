@@ -572,11 +572,24 @@
 //!   (`a_stage_buffer_gather_scattered_over_two_registered_stretches_leaves_without_a_copy`).
 //!   One window keeps the borrowed lease above instead, because that is the arm
 //!   with no copy anywhere on the path;
-//! - a gather this rail cannot state — a stretch whose import the ledger never
-//!   registered, a window that stops short of its run's own bytes, a list whose
-//!   lengths do not sum to the bind, or one whose windows live in two
-//!   registrations — keeps the engine by name
-//!   (`render_provider_out_of_class_stage_buffer_gather`);
+//! - since G1-A a gather that derives *no* window from its runs — a stretch
+//!   whose import the ledger never registered, a window that stops short of its
+//!   run's own bytes, a list whose lengths do not sum to the bind, one whose
+//!   windows live in two registrations, or a source with no `pages` at all,
+//!   which is what a host whose device answer is
+//!   `host_pointer_import=disabled_by_env` produces for every one of them — is
+//!   **gathered into the staged arm**: this rail reads the runs' own bytes
+//!   ([`stage_run_bytes`]) and the bind travels exactly as a staged bind does,
+//!   because on such a host a gather is not a slower arm beside the window arm
+//!   but the only arm that can state the declaration's bytes at all. The bytes
+//!   are the window the source itself states (the draw path already narrowed it
+//!   to the shader's proven reach), so they are the bytes the engine's own CPU
+//!   staging arm reads for the same bind;
+//! - and a gather whose runs the source *cannot* cover — a short list, a bind
+//!   longer than the source's own window, an empty one — keeps the engine by
+//!   name (`render_provider_out_of_class_stage_buffer_gather`): a copy that
+//!   would pad what the runs do not hold is a declaration about bytes no record
+//!   wrote;
 //! - R18 gives the window-backed arm its third answer, and it is the one the
 //!   device decides: a window that *does* cover the bind's bytes still cannot be
 //!   imported in place when the view's own host pointer is not a whole number of
@@ -4910,6 +4923,73 @@ fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>>
     Some(windows)
 }
 
+/// The bytes a stage buffer's gather holds, read out of the owner's live pages
+/// (`G1-A`).
+///
+/// A bind the GPU would gather arrives as a [`GuestRunSource`]: the runs are the
+/// GPU's own view of the guest's pages, and on a host whose device answer is
+/// `host_pointer_import=disabled_by_env` they are also the *only* carrier of
+/// these bytes — the window arm is refused by name on such a host
+/// ([`window_binding_admits`]), so a rail that cannot gather the runs by hand
+/// has no arm left and keeps the draw on the engine
+/// (`render_provider_out_of_class_stage_buffer_gather`).
+///
+/// `len` is the byte count the caller states, and the only count this rail may
+/// state: the draw path's zero-copy resolution already narrowed the source's
+/// window to the shader's proven reach
+/// (`runtime::draw::vulkan`'s `extent_cap` → `bound.span` →
+/// [`GuestRunSource::total_len`]), so the bytes here are the same bytes the
+/// engine's own CPU staging arm reads for the same bind — one window, two
+/// readers, no second policy for the two to disagree about. The walk is
+/// `source_offset .. source_offset + len` across the runs in order, the same
+/// walk `write_staging_from_runs` performs on the engine's side.
+///
+/// `None` is the answer for a source the runs cannot cover — a short list, a
+/// window longer than [`GuestRunSource::total_len`], or an empty bind — and it
+/// is the refusal's own arm: a gather this rail may not pad is one it may not
+/// state, and a partial copy would name bytes no record wrote.
+///
+/// Nothing is cached: the copy is made once per submission, at the gate, which
+/// is the same freshness the GPU gather arm has (the bytes are read at
+/// execution) and at least as fresh as the engine's encode-time staging read.
+fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
+    // An empty bind and a window longer than the source states are the two
+    // shapes with nothing to copy: the owner rail refuses an empty staged
+    // request by name (`provider_owner::Decline::StagedEmpty`), which is a
+    // decline on an admitted draw, so both are answered here as a refusal.
+    if len == 0 || len > source.total_len {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(usize::try_from(len).ok()?);
+    let mut skip = source.source_offset;
+    let mut copied = 0_u64;
+    for run in source.runs.iter() {
+        if copied == len {
+            break;
+        }
+        if skip >= run.len() {
+            skip -= run.len();
+            continue;
+        }
+        let within = skip;
+        skip = 0;
+        let take = (run.len() - within).min(len - copied);
+        let start = run.host_ptr().checked_add(usize::try_from(within).ok()?)?;
+        let take = usize::try_from(take).ok()?;
+        // SAFETY: the source's own contract (`GuestRunSource`'s doc) is that
+        // every run's `host_ptr..+len` is already a live `HostOps::map_pages`
+        // alias when the source is built — the engine reads these same runs at
+        // execute time (`write_staging_from_runs`) and the sampled rails read
+        // them through `fold_runs`. `take <= run.len() - within` keeps the read
+        // inside the run, and the mapping outlives the copy: it is the guest's
+        // own RAMBlock, valid for the VM lifetime.
+        let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, take) };
+        out.extend_from_slice(bytes);
+        copied += take as u64;
+    }
+    (copied == len).then_some(out)
+}
+
 /// The attachment's own previous contents as the ordered list of owner windows
 /// the contract's `BufferSource::GuestRuns` arm states (`R32`,
 /// `research/docs/23` §113 / E-TX6).
@@ -9144,12 +9224,13 @@ fn stage_buffer_gate<'a>(
                 ),
             ));
         }
-        let bytes = match bind.content {
-            BufferContent::Bytes(bytes) => Some(bytes.as_slice()),
+        let mut bytes = match bind.content {
+            BufferContent::Bytes(bytes) => Some(Cow::Borrowed(bytes.as_slice())),
             // A gather the GPU would perform from guest RAM is not staged
             // bytes: the two arms this rail mints are the owner's staged copy
             // and the owner's registered window, and R9e derives the second
-            // from the gather's own page runs below.
+            // from the gather's own page runs below. G1-A adds the third
+            // answer below, for the gather that derives no window at all.
             BufferContent::GuestRuns(_) => None,
         };
         let windows = match bind.window {
@@ -9193,6 +9274,51 @@ fn stage_buffer_gate<'a>(
                 BufferContent::Bytes(_) => Vec::new(),
             },
         };
+        // G1-A: the gather whose runs state no window is *gathered here*.
+        //
+        // The two arms above are the ones a registered guest RAM window gives:
+        // the borrowed no-copy window, or — when a registration exists but the
+        // view pointer misses the device's granules — the owner's own copy of
+        // that window (R18). A bind whose import the device cannot take at all
+        // has neither: the ledger derives no window for its runs
+        // (`window_stretches` answers `None` when the source carries no `pages`,
+        // which is what `host_pointer_import=disabled_by_env` produces), so the
+        // gather arrives here with no window and no staged copy. Before this
+        // arm, that shape kept the engine by name: 87 040 of one production
+        // boot's 98 072 refusals, all of them vertex stage buffers
+        // (`evidence/user-interactive-test-2026-09-20`, `REIMS_VGPU_GUEST_IMPORT=off`),
+        // and 91 736 in the census shape beside it
+        // (`evidence/gate3-census-fp22-2026-09-19`).
+        //
+        // The copy is made from the runs the source already holds
+        // ([`stage_run_bytes`]), at the byte count the source states, and the
+        // bind then travels exactly as a staged bind does: the same
+        // `bytes = Some(copy)`, the same empty window list, the same
+        // `provider_owner::Request::Staged` and owner-issued lease. What the
+        // class states is therefore the *same bytes* the engine's own CPU
+        // staging arm reads for this bind, which is what makes the two frames
+        // comparable byte for byte.
+        //
+        // Fail-closed: a source whose runs cannot cover the window keeps the
+        // engine under the refusal's own sentence below, unchanged.
+        if bytes.is_none() && windows.is_empty() {
+            if let BufferContent::GuestRuns(source) = bind.content {
+                if let Some(copy) = stage_run_bytes(source, bind_bytes) {
+                    // The census' own reading of this arm: one route per bind
+                    // that took it, and one byte total beside it, so a boot can
+                    // say how much of the class's traffic the CPU gather
+                    // carries and what it costs per draw.
+                    crate::runtime::drain::note_store_route(
+                        "render_provider_out_of_class_stage_buffer_gather_staged",
+                    );
+                    crate::runtime::drain::note_store_route_n(
+                        "render_provider_out_of_class_stage_buffer_gather_bytes",
+                        u64::try_from(copy.len()).unwrap_or(u64::MAX),
+                    );
+                    bytes = Some(Cow::Owned(copy));
+                }
+            }
+        }
         if bytes.is_none() && windows.is_empty() {
             return Err(OutOfClass::owned(
                 "render_provider_out_of_class_stage_buffer_gather",
@@ -9537,7 +9663,11 @@ fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor
     for (index, buffer) in pass.stage_buffers.iter().enumerate() {
         let view = &mut descriptor.stage_buffers[index].view;
         let label = stage_buffer_owner_binding(buffer.stage, buffer.index);
-        let bytes = match (buffer.borrowed_window(), buffer.run_list(), buffer.bytes) {
+        let bytes = match (
+            buffer.borrowed_window(),
+            buffer.run_list(),
+            buffer.bytes.as_deref(),
+        ) {
             (Some(window), _, _) => {
                 provider_owner::window_bytes(owner_window(label, window)).ok()?
             }
@@ -13743,7 +13873,15 @@ struct NarrowStageBuffer<'a> {
     proof: FootprintProof,
     /// The owner's staged bytes, when the bind's content is a copy the owner
     /// holds. `None` is a bind whose bytes exist only behind its windows.
-    bytes: Option<&'a [u8]>,
+    ///
+    /// Borrowed for the copy the request already carries
+    /// (`BufferContent::Bytes`), owned for the one this rail makes
+    /// ([`stage_run_bytes`], `G1-A`): a gather whose runs state no window is
+    /// gathered into these bytes, so the arm is the *same* arm a staged bind
+    /// takes — one `provider_owner::Request::Staged`, one owner-issued lease —
+    /// rather than a third shape the plan would have to learn. The two differ
+    /// in who owns the copy, which is why the field is a `Cow`.
+    bytes: Option<Cow<'a, [u8]>>,
     /// The registered windows the bind's bytes were cut from, in window order
     /// ([`gather_run_windows`]). One is the borrowed no-copy arm
     /// ([`Self::borrowed_window`]); several are the contract's ordered run list
@@ -17889,8 +18027,13 @@ fn window_arm_request<'a>(
 /// is imported as an owner-issued staged lease (`BufferSource::StagedLease`).
 /// The third arm — trace-owned bytes — is what a *staged* stream travels as,
 /// and it is not a stage buffer's arm: a stage buffer's bytes belong to the
-/// guest's buffer, which is why the gate admits only the two owner arms
-/// (`..._stage_buffer_gather` is the name for everything else).
+/// guest's buffer, which is why the gate admits only the two owner arms — and,
+/// since `G1-A`, the gather the gate itself reads into the first of them: a
+/// bind whose runs state no window is copied by [`stage_run_bytes`] and stated
+/// as an owner-issued staged lease like any other staged bind, because such a
+/// gather is not a third arm of this plan but the bytes the first arm carries.
+/// `..._stage_buffer_gather` names only a gather whose runs the rail cannot
+/// read.
 ///
 /// R9q puts the *window* arm of the vertex streams in the same plan, and R11
 /// the index stream's beside it: a stream the request holds as a gather whose
@@ -17988,6 +18131,7 @@ fn plan_owner_leases(
                     // only under its own name, so this arm is total here.
                     bytes: buffer
                         .bytes
+                        .as_deref()
                         .expect("a stage buffer without a window carries the owner's staged bytes"),
                 }))
             }

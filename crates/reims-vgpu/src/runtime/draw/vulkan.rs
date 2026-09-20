@@ -11361,8 +11361,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // one window a bind could be cut from is what a later increment
             // derives from those runs. A bind with no window travels as the
             // owner's staged lease — the arm the canonical rail calls
-            // `BufferSource::StagedLease` — and a gather with no window keeps
-            // the draw on the engine (`..._stage_buffer_gather`).
+            // `BufferSource::StagedLease` — which since G1-A is also where a
+            // gather with no window goes: the class reads those runs itself. A
+            // gather whose runs the class cannot read keeps the draw on the
+            // engine (`..._stage_buffer_gather`).
             //
             // R9j: a bind whose stage declares it *writable* is a landing
             // (R9f), so it also states where those bytes go back to. The
