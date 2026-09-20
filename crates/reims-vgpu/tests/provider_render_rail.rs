@@ -31649,3 +31649,179 @@ fn a_non_indexed_draw_cuts_a_windowless_vertex_stream_to_its_own_vertex_count() 
     assert_eq!(cut, 2);
     assert_eq!(slack, 2 * (TABLE_BYTES - REACH));
 }
+
+/// G3-B/B-1: a run of kept records travels as **one** trace and **one**
+/// submission.
+///
+/// The walk hands the provider a run it has already proven keepable — here the
+/// R42 pair: a head that keeps its frame under the relay's promise and the
+/// record after it, which loads that image and publishes the composite. The
+/// provider assembles both into one trace, submits it once (`fence`, `wait` and
+/// the completion are the trace's), and answers one outcome per record.
+///
+/// Three things are asserted, and they are the increment's whole claim:
+///
+/// * parking a record submits nothing, and finishing the run submits exactly
+///   once — `provider_submissions` moves by one for two records;
+/// * the records before the tail come back as `ProviderCompletedResident` under
+///   the run's own identity (their frames stayed in the provider's image);
+/// * the run's published frame is the frame the *two-submission* arm produced,
+///   byte for byte — the store→load edge inside one trace is the same edge a
+///   submission boundary used to make visible.
+#[test]
+fn a_run_of_kept_records_travels_as_one_trace_and_one_submission() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let identity = gva_identity(0x42_00_01, ash::vk::Format::R8G8B8A8_UNORM);
+    let attachment = provider_render::resident_attachment(&identity);
+
+    // The two-record run the walk elects, in the shapes its probes admitted.
+    let head_inputs = inputs_relay(&stages, RenderChainRole::Head, true, false);
+    let head = resident_seed_request(&identity);
+    let tail_inputs = inputs_relay(&stages, RenderChainRole::SoleOrTail, false, true);
+    let tail = resident_load_request(&identity, true);
+
+    let submissions_before = provider_render::provider_submissions();
+    let mut batch = provider_render::RenderBatch::new();
+    match provider_render::park_render(&head_inputs, &head, &mut batch) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the relay's head joins the run: {other:?}"),
+    }
+    assert_eq!(batch.len(), 1, "one record parked");
+    assert_eq!(
+        batch.identity(),
+        Some((attachment.allocation.get(), attachment.view.get())),
+        "the run's identity is the pair the head's own attachment names"
+    );
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before,
+        "the park step submits nothing"
+    );
+    match provider_render::park_render(&tail_inputs, &tail, &mut batch) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the record that loads the kept image joins the run: {other:?}"),
+    }
+    assert_eq!(batch.len(), 2, "two records parked");
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before,
+        "two parked records are still no submission"
+    );
+
+    provider_render::finish_render_batch(&mut batch).expect("the run's own submission is admitted");
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before + 1,
+        "a run of two records is exactly one submission"
+    );
+
+    let outcomes = batch.outcomes();
+    assert_eq!(outcomes.len(), 2, "one answer per record, in park order");
+    let frame = match &outcomes[0] {
+        RenderRailOutcome::ProviderCompletedResident(frame) => frame,
+        other => panic!("an intermediate record's frame stays in the provider's image: {other:?}"),
+    };
+    assert_eq!(
+        frame.attachment, attachment,
+        "the frame stayed under the run's own identity"
+    );
+    assert!(
+        !frame.loaded,
+        "a head that clears cannot have loaded the image it keeps"
+    );
+    assert!(
+        !frame.landed,
+        "an intermediate record of a run delivers nothing: the tail is the record whose frame \
+         the guest's own Store lands"
+    );
+    let provider = match &outcomes[1] {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes.clone(), out.bgra),
+        other => panic!("the run's tail publishes the composite: {other:?}"),
+    };
+    assert_texel_count("one-trace run (provider)", &provider);
+    assert_texel_near(
+        "one-trace run: the last texel inside the rectangle",
+        texel_at(&provider, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&provider, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the kept frame's own bytes: a trace whose store→load edge is \
+             missing a dependency, or whose second record reads an image the first never stored, \
+             lands another colour here",
+            height / 2,
+        );
+    }
+
+    // The oracle: the same two records as two submissions. The batch's frame
+    // has to be the frame the submission boundary made, or the increment bought
+    // its divisor with a different picture.
+    let head_frame = match provider_render::submit_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &resident_seed_request(&identity),
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => frame,
+        other => panic!("the two-submission head keeps its frame: {other:?}"),
+    };
+    assert_eq!(head_frame.attachment, attachment);
+    let one_at_a_time = match provider_render::submit_render(
+        &inputs_relay(&stages, RenderChainRole::SoleOrTail, false, true),
+        &resident_load_request(&identity, true),
+    ) {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+        other => panic!("the two-submission tail publishes: {other:?}"),
+    };
+    assert_eq!(
+        provider, one_at_a_time,
+        "the run's frame and the two-submission arm's frame land the same bytes"
+    );
+}
+
+/// G3-B/B-1: a run whose records do not name one image is refused by name.
+///
+/// A trace states one attachment identity for the whole run — that is what makes
+/// a run a chain rather than two images filed together — so a record that names
+/// another pair is refused at the park step. The walk checks the same fact from
+/// its probes before it hands anything over; this is the seam's own check, and
+/// the census reads it as `render_provider_batch_member_refused`.
+#[test]
+fn a_run_refuses_a_record_that_names_another_image() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let first = gva_identity(0x42_00_02, ash::vk::Format::R8G8B8A8_UNORM);
+    let second = gva_identity(0x42_00_03, ash::vk::Format::R8G8B8A8_UNORM);
+    let refused_before = route_count("render_provider_batch_member_refused");
+
+    let mut batch = provider_render::RenderBatch::new();
+    match provider_render::park_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &resident_seed_request(&first),
+        &mut batch,
+    ) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the run's first record joins it: {other:?}"),
+    }
+    match provider_render::park_render(
+        &inputs_relay(&stages, RenderChainRole::Head, true, false),
+        &resident_seed_request(&second),
+        &mut batch,
+    ) {
+        provider_render::RenderParkOutcome::Declined(_) => {}
+        other => panic!("a second image is refused by name, not filed as one trace: {other:?}"),
+    }
+    assert_eq!(
+        route_count("render_provider_batch_member_refused") - refused_before,
+        1,
+        "the refusal is counted under its own name"
+    );
+    assert_eq!(
+        batch.len(),
+        2,
+        "the refused record is held, so its leases are given back"
+    );
+    batch.abandon();
+}
