@@ -11381,8 +11381,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // dropped where its region ends rather than left to the enclosing
             // block: a scope would re-indent the region and the whole point of
             // this round is that its diff says nothing but "a span was added".
-            let _seam_targets =
-                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamTargets);
+            //
+            // They charge the real encode only. `probe_draw_chain` enters this
+            // same function for the chain-middle walk, assembles the same
+            // inputs and returns at the sink below without either rail — and it
+            // is **not** inside the Engine bar, because it runs from the exec
+            // walk and is charged to `fin_retarget` there. A bar that is not
+            // smaller than its parent is a bracket bug, not a finding: the
+            // first eg1 round read exactly that (rails plus seam at 165 % of
+            // `engine_us`), and the probe's own cost is read where it is paid.
+            let seam_span = |bar| {
+                probe
+                    .is_none()
+                    .then(|| crate::runtime::drain::frame_span(bar))
+                    .flatten()
+            };
+            let _seam_targets = seam_span(crate::runtime::drain::FrameSpan::SeamTargets);
             let mut stage_buffer_destinations: Vec<(
                 RenderPipelineStage,
                 u32,
@@ -11445,8 +11459,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             drop(_seam_targets);
             // The stage-buffer bind list built out of the destinations above:
             // one `Vec` and two linear scans, per draw.
-            let _seam_binds =
-                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamBinds);
+            let _seam_binds = seam_span(crate::runtime::drain::FrameSpan::SeamBinds);
             let stage_buffer_binds: Vec<StageBufferBind<'_>> = vtx_storage
                 .iter()
                 .map(|(index, content)| StageBufferBind {
@@ -11485,8 +11498,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             drop(_seam_binds);
             // The two reflected lists the rail's own numbering needs, derived
             // per draw from lists the pipeline resolve already holds.
-            let _seam_decls =
-                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamDecls);
+            let _seam_decls = seam_span(crate::runtime::drain::FrameSpan::SeamDecls);
             // The fragment stage's `[[texture(i)]]` declarations, moved into
             // the same device numbering the request's own binds were resolved
             // in (R10): the fragment sampled-band relocation is applied to the
@@ -11552,8 +11564,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // the mapper-ref-texture seed and the `chain_middle_source_frame`
             // pair. Full-image copies on the draws that take them, `None` on
             // the rest.
-            let _seam_frames =
-                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamFrames);
+            let _seam_frames = seam_span(crate::runtime::drain::FrameSpan::SeamFrames);
             // R23: the chain's own frame, materialized for the canonical rail's
             // byte arm (`RenderRailInputs::resident_source_bytes`) when this
             // record's previous contents are the engine's registry resident.
@@ -11708,8 +11719,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             drop(_seam_frames);
             // The preserving-window door's page walk: the seam's second
             // guest-memory walk, and the one place `gva_attachment_window` runs.
-            let _seam_windows =
-                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamWindows);
+            let _seam_windows = seam_span(crate::runtime::drain::FrameSpan::SeamWindows);
             // B5: the third window. The elision door above cuts the pages an
             // elision already read; this one cuts the pages a record that never
             // elided begins from — the attachment's own storage, named by the
@@ -11791,8 +11801,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // route that says what the rail may state about them, and
             // `render_present_request` — which is where the present door's own
             // capability ask lives.
-            let _seam_inputs =
-                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamInputs);
+            let _seam_inputs = seam_span(crate::runtime::drain::FrameSpan::SeamInputs);
             #[cfg(feature = "provider-render")]
             let mut sampled_target_frame_store = Vec::new();
             #[cfg(feature = "provider-render")]
@@ -12034,8 +12043,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // class's refusal is priced, because the out-of-class line and the
             // shape latch below run once per draw the class refuses — which is
             // every draw of a boot without guest import.
-            let _seam_answer =
-                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamAnswer);
+            let _seam_answer = seam_span(crate::runtime::drain::FrameSpan::SeamAnswer);
             match outcome {
                 RenderRailOutcome::ProviderCompleted(out) => {
                     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
