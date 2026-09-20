@@ -487,14 +487,13 @@ pub fn encode_draw_chain_handoff<M: HostMemory + HostOps>(
     writeback_guest: bool,
     handoff: ChainHandoff<'_>,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
-    // The run's tail is the one record of a run that publishes, and the walk
-    // reaches this call for it with `multi_draw_store_plan`'s own answer. A
-    // tail without the Store would build the run's whole trace and then answer
-    // `Ok` with no frame — a run the guest never sees and no counter names.
-    debug_assert!(
-        !matches!(handoff, ChainHandoff::ParkAndFinish(_)) || writeback_guest,
-        "a run's tail parks with the Store the walk's own plan gave it"
-    );
+    // The run's tail is the record that closes the run, and it parks *and*
+    // finishes it (`ChainHandoff::ParkAndFinish`). `writeback_guest` is the
+    // walk's store plan for the record and stays one: a tail on the packet's
+    // last record publishes the frame the guest reads, and a run the serial
+    // pool cut short ends on a record that keeps its frame — both reach here
+    // with the store plan's own answer, and the run's one completion answers
+    // each of them exactly as a submission of its own would have.
     let mut handoff = handoff;
     // Charges this chain to one phase at a time all the way down, including the
     // parts of it that live inside `try_metal2vulkan_draw`. Held here rather
@@ -593,29 +592,6 @@ pub fn encode_draw_chain_handoff<M: HostMemory + HostOps>(
     // member, which has no answer because the run it belongs to is still open,
     // and every record that predates the batch.
     let mut engine_answer: Option<crate::backend::provider_render::RenderRailOutcome> = None;
-    // G3-B/B-1: a run's *member* answers nothing — the run it belongs to is
-    // still open, so there is no completion to read and no span to route. The
-    // walk hands a member `ChainHandoff::Park`, and a tail
-    // `ChainHandoff::ParkAndFinish`, so this arm is exactly "the run's middle":
-    // return the same pair a resident-chain intermediate returns, and let the
-    // run's one completion answer it.
-    //
-    // Taken *before* the seam and not after it, for two reasons: the seam is
-    // where the record's assembly happens (and it already has, by the time this
-    // is reached), and the flags the seam's own guard below resets are the ones
-    // a parked record has to carry out of here.
-    if matches!(handoff, ChainHandoff::Park(_)) {
-        debug_assert!(
-            req.vertex_count > 0 || req.indexed.is_some(),
-            "a run's member declares color-0 geometry"
-        );
-        // The same flag the resident-chain intermediate sets, for the same
-        // reason: the frame this record's pass will produce is the run's own
-        // image, and a caller that asked whether the record produced pixels
-        // would be asking the wrong question.
-        req.chain_resident_established = true;
-        return (EncodeStatus::Parked, None);
-    }
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         record_plane_draw(req);
         req.chain_resident_established = false;
@@ -775,15 +751,18 @@ pub fn encode_draw_chain_handoff<M: HostMemory + HostOps>(
             }
             // G3-B/B-1: a record of a run was assembled and nothing of it ran,
             // so there is no span to route and no frame to store. The run's own
-            // completion answers it, and the answer is read one block down —
-            // after this match, because it belongs to the *submission* handling
-            // rather than to span routing, and the two are otherwise the same
-            // five hundred lines written twice.
+            // completion answers it, and the walk reads that answer back through
+            // the batch it owns rather than through a span here. The status is
+            // stated rather than left to the Store route below: a parked record
+            // has no bytes, no guest Store and no completion of its own, and the
+            // pair it returns is the same "the run has it" the resident-chain
+            // intermediate returns.
             Ok(M2vDrawSpan::Parked) => {
                 crate::observe::line(format!(
                     "linux_m2v_draw parked pipe={} {}x{}",
                     req.pipeline_ref, pass_w, pass_h
                 ));
+                return (EncodeStatus::Parked, None);
             }
             Ok(M2vDrawSpan::BorrowedLanding {
                 bytes,
@@ -12301,37 +12280,61 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     return Ok(M2vDrawSpan::Probed);
                 }
                 ChainHandoff::Park(batch) => {
-                    let answer = provider_render::park_render(&inputs, &resources, batch);
-                    match answer {
-                        provider_render::RenderParkOutcome::Parked => {
-                            return Ok(M2vDrawSpan::Parked);
-                        }
+                    // G3-B/B-1: assemble the record into the run under
+                    // construction and submit nothing.
+                    //
+                    // A refusal here is *not* an answer for this record: the
+                    // run is one trace, so a record the class will not carry is
+                    // a run the walk has to give back — and the walk, which
+                    // owns the packet's records, is the only caller that can
+                    // re-run them on the per-record path. The reason is stated
+                    // on the batch rather than in `engine_answer`, because a
+                    // member's span is routed nowhere (it never reached a
+                    // submission) and an answer in that slot would be dropped
+                    // with it. This is the one door a refused member leaves
+                    // through, so "parked and then lost" is not a shape the
+                    // code can express: either the park joined the run, or the
+                    // walk reads the refusal back and gives the run back whole.
+                    match provider_render::park_render(&inputs, &resources, batch) {
+                        provider_render::RenderParkOutcome::Parked => {}
                         provider_render::RenderParkOutcome::OutOfClass(reason) => {
-                            *engine_answer = Some(RenderRailOutcome::NotInNarrowClass(reason));
-                            return Ok(M2vDrawSpan::Parked);
+                            crate::runtime::drain::note_store_route(
+                                "render_provider_batch_member_refused",
+                            );
+                            batch.note_refusal(format!("out_of_class: {}", reason.detail()));
                         }
                         provider_render::RenderParkOutcome::Declined(decline) => {
-                            *engine_answer = Some(RenderRailOutcome::ProviderDeclined(decline));
-                            return Ok(M2vDrawSpan::Parked);
+                            crate::runtime::drain::note_store_route(
+                                "render_provider_batch_member_refused",
+                            );
+                            batch.note_refusal(format!("declined: {decline:?}"));
                         }
                     }
+                    return Ok(M2vDrawSpan::Parked);
                 }
                 ChainHandoff::ParkAndFinish(batch) => {
-                    return match provider_render::park_and_finish_render(&inputs, &resources, batch)
-                    {
-                        // Nothing of this record ran and nothing was routed:
-                        // the run's one completion answered it, and that answer
-                        // travels out through the sink rather than through a
-                        // span a reader would have to interpret.
-                        Ok(outcome) => {
-                            *engine_answer = Some(outcome);
-                            Ok(M2vDrawSpan::Parked)
-                        }
-                        Err(decline) => {
-                            *engine_answer = Some(RenderRailOutcome::ProviderDeclined(decline));
-                            Ok(M2vDrawSpan::Parked)
-                        }
-                    };
+                    // G3-B/B-1: the run's publishing tail — parked *and*
+                    // finished, so the run's one completion is the submission
+                    // and this record's own answer comes out of it. The answer
+                    // is handed to the routing below rather than returned here,
+                    // which is the whole point of the tail parking instead of
+                    // short-circuiting: every arm a lone record's answer runs
+                    // through (the Store route, the landing arms, the chain
+                    // flags the next record reads) is reached by the tail's
+                    // answer exactly as it is reached by a submission of its
+                    // own, with no second copy to keep in step.
+                    *engine_answer = Some(
+                        match provider_render::park_and_finish_render(&inputs, &resources, batch) {
+                            Ok(outcome) => outcome,
+                            // A run the provider refused gives every one of its
+                            // records back: the walk reads this refusal off the
+                            // batch and re-runs them on the per-record path.
+                            Err(decline) => {
+                                batch.note_refusal(format!("run_refused: {decline:?}"));
+                                RenderRailOutcome::ProviderDeclined(decline)
+                            }
+                        },
+                    );
                 }
             }
             // G3-B/B-1: the run's tail already has its answer — the run's one

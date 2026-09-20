@@ -31781,6 +31781,154 @@ fn a_run_of_kept_records_travels_as_one_trace_and_one_submission() {
     );
 }
 
+/// G3-B/B-1: a run of **three** records is one trace, one submission and one
+/// answer per record.
+///
+/// The walk elects runs of every length the keep plan supports, and the
+/// shortest one is not the only shape a packet offers: a chain of two keepers
+/// and the tail that publishes them is three passes in one scope. This is the
+/// length the census reads in `render_batch_passes_3_4`, and it is the length
+/// at which an assembly that parks "all but one" of a run shows up as a trace
+/// of two passes rather than one — which is exactly what a batch built per
+/// record would produce.
+///
+/// Three things are asserted:
+///
+/// * three parks submit nothing and the run's own completion submits once;
+/// * both members come back as `ProviderCompletedResident` under the run's own
+///   identity, and each of them reads the assembly's own answer to "does this
+///   record keep its frame" (`last_record_keeps_frame`) — the fact the walk
+///   reads back before it lets a run stand;
+/// * the run's published frame is the frame the *three-submission* arm
+///   produced, byte for byte, so the two store→load edges that used to be
+///   submission boundaries are the same edges inside one trace.
+#[test]
+fn a_run_of_three_records_is_one_submission_and_keeps_both_members() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let (width, height) = extent();
+    let identity = gva_identity(0x42_00_04, ash::vk::Format::R8G8B8A8_UNORM);
+    let attachment = provider_render::resident_attachment(&identity);
+
+    let head_inputs = inputs_relay(&stages, RenderChainRole::Head, true, false);
+    let head = resident_seed_request(&identity);
+    let middle_inputs = inputs_relay(&stages, RenderChainRole::Middle, true, true);
+    let middle = resident_load_request(&identity, false);
+    let tail_inputs = inputs_relay(&stages, RenderChainRole::SoleOrTail, false, true);
+    let tail = resident_load_request(&identity, true);
+
+    let answered_before = route_count("render_provider_canonical");
+    let submissions_before = provider_render::provider_submissions();
+    let mut batch = provider_render::RenderBatch::new();
+    match provider_render::park_render(&head_inputs, &head, &mut batch) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the run's head joins the run: {other:?}"),
+    }
+    assert_eq!(
+        batch.last_record_keeps_frame(),
+        Some(true),
+        "a head that clears and keeps its frame is a member the run may carry"
+    );
+    assert_eq!(
+        batch.take_refusal(),
+        None,
+        "a parked record leaves no refusal for the walk to read back"
+    );
+    match provider_render::park_render(&middle_inputs, &middle, &mut batch) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the run's middle joins the run: {other:?}"),
+    }
+    assert_eq!(
+        batch.last_record_keeps_frame(),
+        Some(true),
+        "a middle that loads the run's image keeps its own frame for the tail"
+    );
+    match provider_render::park_render(&tail_inputs, &tail, &mut batch) {
+        provider_render::RenderParkOutcome::Parked => {}
+        other => panic!("the run's tail joins the run: {other:?}"),
+    }
+    assert_eq!(batch.len(), 3, "a run of three records parks three");
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before,
+        "no park step of a three-record run submits anything"
+    );
+
+    provider_render::finish_render_batch(&mut batch).expect("the run's own submission is admitted");
+    assert_eq!(
+        provider_render::provider_submissions(),
+        submissions_before + 1,
+        "a run of three records is exactly one submission"
+    );
+    let outcomes = batch.outcomes();
+    assert_eq!(outcomes.len(), 3, "one answer per record, in park order");
+    for (index, outcome) in outcomes[..2].iter().enumerate() {
+        match outcome {
+            RenderRailOutcome::ProviderCompletedResident(frame) => assert_eq!(
+                frame.attachment, attachment,
+                "member {index}'s frame stayed under the run's own identity"
+            ),
+            other => panic!("member {index} of a run stays in the provider's image: {other:?}"),
+        }
+    }
+    let provider = match &outcomes[2] {
+        RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes.clone(), out.bgra),
+        other => panic!("the run's tail publishes the composite: {other:?}"),
+    };
+    assert_texel_count("three-record run (provider)", &provider);
+    assert_texel_near(
+        "three-record run: the last texel inside the rectangle",
+        texel_at(&provider, half_of(width) - 1, height / 2),
+        FRAGMENT_TEXEL,
+    );
+    for x in half_of(width)..width {
+        assert_eq!(
+            texel_at(&provider, x, height / 2),
+            RESIDENT_SEED_TEXEL,
+            "texel ({x}, {}) keeps the kept frame's own bytes across two passes of one trace",
+            height / 2,
+        );
+    }
+    // The members' answers are the run's, so the two per-record readings a lone
+    // record charges where its own answer is routed are charged by the batch:
+    // the tail's own answer is the seam's business (a boot reads the third
+    // there). A run that answered three records and moved this counter by one
+    // would read as two records no rail answered.
+    assert_eq!(
+        route_count("render_provider_canonical") - answered_before,
+        2,
+        "the run charges one `render_provider_canonical` per member it answers"
+    );
+
+    // The oracle: the same three records as three submissions. The batch's
+    // frame has to be the frame the submission boundaries made, or the
+    // increment bought its divisor with a different picture.
+    let head_frame =
+        match provider_render::submit_render(&head_inputs, &resident_seed_request(&identity)) {
+            RenderRailOutcome::ProviderCompletedResident(frame) => frame,
+            other => panic!("the three-submission head keeps its frame: {other:?}"),
+        };
+    assert_eq!(head_frame.attachment, attachment);
+    let middle_frame = match provider_render::submit_render(
+        &middle_inputs,
+        &resident_load_request(&identity, false),
+    ) {
+        RenderRailOutcome::ProviderCompletedResident(frame) => frame,
+        other => panic!("the three-submission middle keeps its frame: {other:?}"),
+    };
+    assert_eq!(middle_frame.attachment, attachment);
+    let one_at_a_time =
+        match provider_render::submit_render(&tail_inputs, &resident_load_request(&identity, true))
+        {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!("the three-submission tail publishes: {other:?}"),
+        };
+    assert_eq!(
+        provider, one_at_a_time,
+        "a run of three lands the bytes three submissions landed"
+    );
+}
+
 /// G3-B/B-1: a run whose records do not name one image is refused by name.
 ///
 /// A trace states one attachment identity for the whole run — that is what makes
