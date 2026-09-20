@@ -11580,9 +11580,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // answers.
             #[cfg(feature = "provider-render")]
             let mut chain_source_miss = None;
+            // The class gate reads the two frames below in exactly one place —
+            // the load arm's `match (resident_source_bytes,
+            // surface_resident_source_bytes)` — and that match stands inside
+            // `if !inputs.resident_frames_fetchable && !inputs.chain_loads_resident`,
+            // whose first term is `false` at this seam's only construction of
+            // `RenderRailInputs`. A record that states `chain_loads_resident`,
+            // or whose attachment window is already stated, therefore hands the
+            // class a value it structurally cannot reach, and the readback just
+            // paid for is bought for a reader that cannot ask. See
+            // `config::SEAM_UNREAD_FRAMES` for the round that priced it.
+            let unread_frames = crate::config::switch(crate::config::SEAM_UNREAD_FRAMES)
+                == crate::config::Switch::On
+                && (req.chain_loads_resident || attachment_window_runs.is_some());
+            if unread_frames && chain_source_is_engine_resident {
+                crate::runtime::drain::note_store_route("render_provider_unread_frame_chain");
+            }
             let _seam_frame_chain = seam_span(crate::runtime::drain::FrameSpan::SeamFrameChain);
             #[cfg(feature = "provider-render")]
-            let resident_source_frame = if chain_source_is_engine_resident {
+            let resident_source_frame = if chain_source_is_engine_resident && !unread_frames {
                 match resources.target_identity.as_ref() {
                     Some(identity) => match resident_chain_source_frame(&resources, identity) {
                         Ok(frame) => Some(frame),
@@ -11619,47 +11635,57 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // ready; those keep the class's refusal by name.
             #[cfg(feature = "provider-render")]
             let mut mapper_ref_source_miss = None;
+            if unread_frames && mapper_ref_load_handover.is_some() {
+                crate::runtime::drain::note_store_route("render_provider_unread_frame_surface");
+            }
             let _seam_frame_surface = seam_span(crate::runtime::drain::FrameSpan::SeamFrameSurface);
             #[cfg(feature = "provider-render")]
-            let surface_resident_source_frame = match mapper_ref_load_handover.as_ref() {
-                // The identity the elision named has to be the identity this
-                // record's own attachment names, or the frame read here would
-                // be the previous contents of an image the pass is not
-                // declaring. The two are the same call
-                // (`mapper_ref_texture_render_identity`) at two moments in this
-                // function, and a guest write that moved the mapping's
-                // generation in between would part them — so the agreement is
-                // asked rather than assumed, and a disagreement hands nothing
-                // over (the class then refuses the record by name).
-                Some(identity) if resources.target_identity.as_ref() == Some(identity) => {
-                    match resident_chain_source_frame(&resources, identity) {
-                        Ok(frame) => {
-                            crate::runtime::drain::note_store_route(
-                                "mapper_ref_texture_seed_carried",
-                            );
-                            Some(frame)
-                        }
-                        // R34: this door's third route, one arm for all four of
-                        // `ChainFrameMiss`'s — the door's first question is
-                        // whether it landed at all.
-                        Err(_) => {
-                            mapper_ref_source_miss = Some(MapperRefFrameMiss::Frame);
-                            None
+            let surface_resident_source_frame = if unread_frames {
+                // `mapper_ref_source_miss` stays empty on this arm. That is the
+                // reading rather than a loss: the route it feeds is read only
+                // by the one refusal this arm makes unreachable.
+                None
+            } else {
+                match mapper_ref_load_handover.as_ref() {
+                    // The identity the elision named has to be the identity this
+                    // record's own attachment names, or the frame read here would
+                    // be the previous contents of an image the pass is not
+                    // declaring. The two are the same call
+                    // (`mapper_ref_texture_render_identity`) at two moments in this
+                    // function, and a guest write that moved the mapping's
+                    // generation in between would part them — so the agreement is
+                    // asked rather than assumed, and a disagreement hands nothing
+                    // over (the class then refuses the record by name).
+                    Some(identity) if resources.target_identity.as_ref() == Some(identity) => {
+                        match resident_chain_source_frame(&resources, identity) {
+                            Ok(frame) => {
+                                crate::runtime::drain::note_store_route(
+                                    "mapper_ref_texture_seed_carried",
+                                );
+                                Some(frame)
+                            }
+                            // R34: this door's third route, one arm for all four of
+                            // `ChainFrameMiss`'s — the door's first question is
+                            // whether it landed at all.
+                            Err(_) => {
+                                mapper_ref_source_miss = Some(MapperRefFrameMiss::Frame);
+                                None
+                            }
                         }
                     }
-                }
-                Some(_) => {
-                    mapper_ref_source_miss = Some(MapperRefFrameMiss::Identity);
-                    None
-                }
-                // R34: the elision fired and this record's own frame does not
-                // land in the mapping's guest pages. The flag is what separates
-                // this arm from the record that was never a candidate at all —
-                // the hand-over is `None` for both, and only one of them is
-                // this bucket's population.
-                None => {
-                    mapper_ref_source_miss = Some(MapperRefFrameMiss::NoLanding);
-                    None
+                    Some(_) => {
+                        mapper_ref_source_miss = Some(MapperRefFrameMiss::Identity);
+                        None
+                    }
+                    // R34: the elision fired and this record's own frame does not
+                    // land in the mapping's guest pages. The flag is what separates
+                    // this arm from the record that was never a candidate at all —
+                    // the hand-over is `None` for both, and only one of them is
+                    // this bucket's population.
+                    None => {
+                        mapper_ref_source_miss = Some(MapperRefFrameMiss::NoLanding);
+                        None
+                    }
                 }
             };
             drop(_seam_frame_surface);

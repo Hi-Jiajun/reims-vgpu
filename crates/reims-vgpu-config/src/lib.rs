@@ -1260,6 +1260,56 @@ pub const RENDER_PRESENT: &str = "REIMS_VGPU_RENDER_PRESENT";
 /// bracket is one relaxed load of a value decided at bootstrap, and the bars
 /// `chain_phase` already computed are handed over rather than re-measured.
 pub const FRAME_PROFILE: &str = "REIMS_VGPU_FRAME_PROFILE";
+
+/// `on` stops the seam reading a resident frame back that the class gate cannot
+/// read, because the walk has already promised this record the resident's own
+/// contents (`chain_loads_resident`) or the record's attachment window is
+/// stated (`AttachmentGuestWindow::Runs`).
+///
+/// # Why the frames are unread in exactly those two cases
+///
+/// The two byte arms are consulted in **one place**: the load arm's
+/// `match (inputs.resident_source_bytes, inputs.surface_resident_source_bytes)`,
+/// which stands inside
+///
+/// ```text
+/// if !inputs.resident_frames_fetchable && !inputs.chain_loads_resident {
+///     if let Some(AttachmentGuestWindow::Runs(runs)) = inputs.attachment_guest_window { … }
+///     else { match (resident_source_bytes, surface_resident_source_bytes) { … } }
+/// }
+/// ```
+///
+/// `resident_frames_fetchable` is `false` at this seam's only construction of
+/// [`crate::backend::provider_render::RenderRailInputs`], by construction rather
+/// than by a flag: this caller cannot fetch a frame for the *guest's* readers.
+/// So a record that states `chain_loads_resident` never reaches the match, and a
+/// record whose window is stated takes the arm above it and never reaches it
+/// either. In both cases the full-frame readback the seam just paid for is
+/// bought for a reader that cannot ask for it.
+///
+/// # The reading that motivated it
+///
+/// `frame_span`'s eg1c round (300 s, 64 981 draws, guest import off — the
+/// shipping rail) divides the engine bar as: `engine_us_mean` 449.1 µs/draw, of
+/// which `seam_frame_chain_us_mean` **155.3 (34.6 %)** and
+/// `seam_sample_frames_us_mean` 139.2 (31.0 %). Both are image→host copies of a
+/// whole resident, and both are taken once by the walk's probe and again by the
+/// encode the probe stands for: `finish_phase` reads `fin_retarget_us` 34.1 s
+/// against `fin_encode_us` 31.9 s over the same boot, and `engine_delta` reads
+/// `target_reads` 153 800 against 233 GB of target bytes.
+///
+/// The probe is where this switch bites hardest and where it is easiest to
+/// state: it sets `chain_from_resident = chain_loads_resident = di > 0`, so
+/// every probe but a packet head opens the readback door *and* states the flag
+/// that keeps the gate out of the match below it.
+///
+/// # It only narrows
+///
+/// The arm is a read the class cannot reach, so `on` removes a copy and changes
+/// no decision: the same `RenderRailInputs` reach the same gate with the same
+/// values in every field the gate can read. Off is today's device exactly, and
+/// unset and an unrecognized value are `off`.
+pub const SEAM_UNREAD_FRAMES: &str = "REIMS_VGPU_SEAM_UNREAD_FRAMES";
 }
 
 counts! {
