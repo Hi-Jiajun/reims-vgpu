@@ -564,11 +564,111 @@ pub(crate) enum FrameSpan {
     /// and `stage_buffer_writebacks`: the writeback of this record's writable
     /// views, after the completion.
     ProvSettle = 25,
+    /// The seam's own assembly, between the entry to the provider block and
+    /// the two rail brackets: the seven bars below split what
+    /// [`Self::Engine`] minus [`Self::RailProvider`] and [`Self::RailEngine`]
+    /// used to leave unnamed.
+    ///
+    /// # Why these exist
+    ///
+    /// The two rails were the only parts of `engine_us` with a bar of their
+    /// own, and on the 2026-09-20 interactive session that division left
+    /// **94 % of an `engine_us` of 1402 µs/draw in no bar at all**: the
+    /// per-second `chain_phase` line read `engine_us` against `draw_phase`'s
+    /// eighty-five microseconds, and nothing named the difference. The seam
+    /// assembles the canonical rail's whole input — the writable binds'
+    /// destination windows, the stage-buffer bind list, the reflected
+    /// declarations, the frame the rail may carry as bytes, the attachment
+    /// window, and the input struct itself — on **every** draw, whichever
+    /// rail finally answers it. On the engine rail the assembly is paid for a
+    /// rail whose gate then refuses the record, which is the regime this
+    /// device ships and the frame probe was run in.
+    ///
+    /// The seven do not claim to sum to the residue: what the gaps between
+    /// them hold is read by subtracting, the same way `binds_us` is read
+    /// against `bind_phase`'s three parts.
+    ///
+    /// The per-writable-declaration destination loop: `resolve_buffer_backing`
+    /// (an object-list read) and `staged_span_pages` (a page walk) for every
+    /// stage buffer the pipeline declares writable.
+    ///
+    /// A guest-memory walk taken once per draw for a backing that changes when
+    /// the guest reallocates, not when it draws. The fix is a memo keyed on
+    /// what the walk reads.
+    SeamTargets = 26,
+    /// Building `stage_buffer_binds` — one `Vec` and two linear scans of
+    /// [`Self::SeamTargets`]' answer, per draw.
+    ///
+    /// A pure function of the two storage lists and the destinations, so it
+    /// belongs with them: a bar that tracks `SeamTargets` is the same finding
+    /// seen again, and one that does not is the assembly's own allocation
+    /// churn.
+    SeamBinds = 27,
+    /// `fragment_texture_declarations` and `sampler_family`: the reflected
+    /// declaration lists re-built and re-cloned in the rail's own numbering,
+    /// per draw, out of an `Arc` the pipeline resolve holds.
+    ///
+    /// The fix is to hold the relocated lists beside the plan instead of
+    /// deriving them again.
+    SeamDecls = 28,
+    /// Materializing the frames the rail may carry as bytes: the chain's own
+    /// resident (`resident_source_frame`), the mapper-ref-texture seed, and
+    /// the `chain_middle_source_frame` pair. Each is a full-image copy out of
+    /// the resident on the draws that take it, and `None` on the rest.
+    SeamFrames = 29,
+    /// `gva_attachment_window` under the preserving-window door: the page walk
+    /// that turns the attachment's GVA into the runs the rail may hand over.
+    SeamWindows = 30,
+    /// `sampled_target_frames`, the source-route decision, the
+    /// `RenderRailInputs` struct itself and `render_present_request` inside
+    /// it: the rest of the seam's assembly.
+    SeamInputs = 31,
+    /// The answer's own handling: the `RenderRailOutcome` match's
+    /// bookkeeping, including the out-of-class line and shape latch that an
+    /// engine-rail boot pays on every draw the class refuses.
+    SeamAnswer = 32,
+    /// The four bars below divide [`Self::SeamFrames`] and [`Self::SeamInputs`]
+    /// at the calls that name different fixes, and are charged the same way —
+    /// on the encode, not on the walk's probe.
+    ///
+    /// # Why the first split was not enough
+    ///
+    /// The first eg1b round (300 s, 61 716 draws, guest import off) read the
+    /// seam as **322 µs of a 436.7 µs engine bar — 73.7 %** — with two bars
+    /// carrying it: `seam_frames_us_mean` 179.5 µs/draw (41.1 %) and
+    /// `seam_inputs_us_mean` 132.8 (30.4 %). Both are frame-sized work and
+    /// both are *inside one function*, but they are four different calls with
+    /// four different fixes, and the round cannot say which one to take.
+    ///
+    /// The pressure is real rather than academic: the same round read
+    /// `engine_delta target_reads=153 800` (2.5 per draw) against 233 GB of
+    /// target bytes, while only ~11 % of draws take either of the two
+    /// chain-frame doors — so most of that readback is somewhere inside these
+    /// four bars and none of them is named.
+    ///
+    /// `resident_chain_source_frame` — the chain's own resident, read out of
+    /// the registry for the byte arm. `read_target` plus the four-byte-colour
+    /// narrow, per draw that takes it.
+    SeamFrameChain = 33,
+    /// The mapper-ref-texture seed's own frame: the same read, under the
+    /// second naming of the same fact (R26), taken only for the record whose
+    /// frame lands in the mapping's guest pages.
+    SeamFrameSurface = 34,
+    /// `chain_middle_source_frame`, once for the middle arm and once for the
+    /// seed arm (R25/R32): a `to_vec` of the request's own `target_rgba8` with
+    /// an in-place channel swap when the two orders disagree — a full-frame
+    /// **memcpy** per draw, on every draw that carries one.
+    SeamFrameCarry = 35,
+    /// `sampled_target_frames`: the sampled GPU targets this caller can read
+    /// out for the record, one registry read per target the bind names (R24).
+    /// The only one of the four that scales with the *bind count* rather than
+    /// with the record.
+    SeamSampleFrames = 36,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::ProvSettle as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::SeamSampleFrames as usize + 1;
 
 impl FrameSpan {
     /// The bar a [`crate::runtime::chain_phase::Phase`] ordinal names.
@@ -647,6 +747,17 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "prov_admit_us_mean",
     "prov_submit_us_mean",
     "prov_settle_us_mean",
+    "seam_targets_us_mean",
+    "seam_binds_us_mean",
+    "seam_decls_us_mean",
+    "seam_frames_us_mean",
+    "seam_windows_us_mean",
+    "seam_inputs_us_mean",
+    "seam_answer_us_mean",
+    "seam_frame_chain_us_mean",
+    "seam_frame_surface_us_mean",
+    "seam_frame_carry_us_mean",
+    "seam_sample_frames_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.
