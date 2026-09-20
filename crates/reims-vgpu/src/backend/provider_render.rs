@@ -682,6 +682,45 @@
 //! ([`stream_run_bytes`], cached in `NarrowStageBuffers::index_bytes`), so a
 //! gather with no window is bounded, stated and executed over one copy.
 //!
+//! G1-C cuts what the two streams' and the sampled gather's self-read arms
+//! **copy**, because `G1-B`'s own reading said the copy was mostly bytes no
+//! draw reads: one `g1b` boot carried **85.0 GB** of them
+//! (`evidence/gate3-census-g1b-2026-09-20`) — 77.8 GB of vertex streams at
+//! **185 000 B** a bind, beside index binds of the same draws at **36.7 B**.
+//! The mismatch is the bind's *declared* length against the draw's *reach*:
+//!
+//! - an **index** bind is gathered to the index count's own width (the draw
+//!   path's `extent_cap` proves it), which is why the same census read it at
+//!   tens of bytes;
+//! - a **per-vertex stream** bind carries no such cap — a vertex table is a
+//!   `[[stage_in]]` fetch table, which no shader reach proof bounds — so its
+//!   `total_len` is the whole view the guest bound and the `G1-B` copy carried
+//!   all of it. What a draw can read is bounded by the draw's own form instead
+//!   ([`vertex_reach_bytes`], from [`highest_index`] on the indexed arm and
+//!   the draw's `vertex_count` on the other): the fetch of vertex `v` reads
+//!   `attribute offset..+ format bytes` inside record `v` of the stride, so a
+//!   draw's reach is `records × stride` and no fetch of it names a byte beyond
+//!   that. The copy is cut to the reach ([`stream_run_bytes`]' `reach`), which
+//!   is also the span the class's own coverage rules already weigh the stream
+//!   against — `render_provider_out_of_class_vertex_staging`'s capacity, and
+//!   [`nonindexed_vertex_span`]'s `draw_count × stride` — so what the cut drops
+//!   is what admission had already stopped asking for;
+//! - the **sampled gather** has no reach to cut: the bytes it gathers are the
+//!   texture's own tightly packed extent ([`sampled_rows`]), which is the same
+//!   span the window arm would have bound, so its two length readings come out
+//!   equal and say so beside the copies that repeated one bind's bytes;
+//! - the two new histograms (`..._declared_*` / `..._copied_*`, six buckets
+//!   each, [`LengthCensus`]) are the census' own reading of that decision —
+//!   what each bind declared against what its copy carried — and the vertex
+//!   arm's cut is summed beside them
+//!   (`..._vertex_staging_reach_cut` / `..._vertex_staging_reach_slack_bytes`);
+//! - [`note_texture_copy_identity`] counts the copies that repeated one bind's
+//!   bytes: the *rate* half of the cache question `G1-B` left open. The cache
+//!   itself is **not** landed, because a `(bind, generation)` cache needs a
+//!   generation to be readable, and this arm — a gather the ledger registered
+//!   **no** window for — is exactly the arm the device has no guest-write
+//!   gossip about; a hit it cannot invalidate is a stale frame, not a saving.
+//!
 //! R32 puts the attachment's own load seed in the same channel. The two shapes
 //! that carry one are the two the request's seed door resolves: the surface's
 //! own guest pages, stated as the contract's ordered run list
@@ -1284,6 +1323,10 @@ fn gathered_texture_source<'a>(
     let span = source.total_len;
     let padded = stage_run_bytes(source, span)
         .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
+    // The bytes this copy carried, read before the repack below consumes them:
+    // G1-C's histogram of the arm's own lengths reads this number, and it is the
+    // `span` the source declared unless the arm *is* this one.
+    let carried = u64::try_from(padded.len()).unwrap_or(u64::MAX);
     let texels = match rows {
         // The repack's own shape check, the same one the window arm's copy
         // takes: the bytes on hand have to be the span the guest's stride and
@@ -1311,10 +1354,108 @@ fn gathered_texture_source<'a>(
         "render_provider_out_of_class_texture_source_bytes",
         u64::try_from(texels.len()).unwrap_or(u64::MAX),
     );
+    // G1-C's two readings of the same copy: the length histograms (declared
+    // against carried — equal by construction here, which is the point) and the
+    // repeat rate of the bytes themselves.
+    note_length(TEXTURE_SOURCE_LENGTHS.declared, span);
+    note_length(TEXTURE_SOURCE_LENGTHS.copied, carried);
+    note_texture_copy_identity(source, span);
     Ok(match fold {
         Some(plan) => NarrowTextureSource::Gathered(fold_channel_plan(&plan, &texels)),
         None => NarrowTextureSource::Gathered(texels),
     })
+}
+
+/// One sampled gather's copy, as the census identifies it (`G1-C`).
+///
+/// The runs it reads — each one's host address and length, in order — the
+/// offset it starts at inside them, and the bytes it copies. All three are read
+/// off the source rather than dereferenced: an identity is comparable across
+/// submissions without touching guest memory, and a *different* list of runs is
+/// a different identity by construction, which a hash of the list would not
+/// promise.
+type CopyIdentity = (Vec<(u64, u64)>, u64, u64);
+
+/// The identity [`note_texture_copy_identity`] files one copy under.
+fn copy_identity(source: &GuestRunSource, copied: u64) -> CopyIdentity {
+    (
+        source
+            .runs
+            .iter()
+            .map(|run| (run.host_ptr() as u64, run.len()))
+            .collect(),
+        source.source_offset,
+        copied,
+    )
+}
+
+/// The identity table [`note_texture_copy_identity`] counts in, built on first
+/// use (`G1-C`).
+fn copy_identities() -> &'static std::sync::Mutex<std::collections::HashMap<CopyIdentity, ()>> {
+    static IDENTITIES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<CopyIdentity, ()>>,
+    > = std::sync::OnceLock::new();
+    IDENTITIES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Count one sampled gather's copy by the bind bytes it carried (`G1-C`).
+///
+/// # What this answers, and what it does not licence
+///
+/// `G1-B` §6.3 left a `(bind, generation)` cache as candidate (c) and asked for
+/// the repeat rate before the design. This is the rate: a copy whose identity
+/// the boot has already carried is one a cache could have served, and the two
+/// routes beside it (`..._texture_source_first_copies` /
+/// `..._repeat_copies` / `..._repeat_bytes`) say how often that happened.
+///
+/// What the reading is **not** is a licence to cache. A cache is sound only
+/// with an invalidation source, and this arm has none: it is the arm the
+/// registration ledger names *no* window for — on the production host
+/// (`host_pointer_import=disabled_by_env`) that is every gathered bind — so the
+/// device holds no registration, no lease and no declared write for these
+/// pages, and a guest that rewrites them between two draws moves no counter
+/// this process can read. The census measures the *upper bound* a cache could
+/// save; the increment that lands one owes a generation first.
+///
+/// # The bound
+///
+/// One entry per identity, capped at [`COPY_IDENTITIES_MAX`] — a sampled
+/// gather's identities are the distinct sampled binds a boot reads, which one
+/// census read as **11 203**, and this is why the census is scoped to this arm
+/// rather than the vertex streams' 420 549. At the cap the table stops
+/// admitting new identities instead of evicting: an evicted identity would read
+/// as a *first* copy when it returned, which under-reports the repeat rate and
+/// hides the fact that it did, while a frozen table keeps counting every repeat
+/// of the identities it holds and charges the rest to
+/// `..._texture_source_identity_overflow`, which a reader can correct for.
+fn note_texture_copy_identity(source: &GuestRunSource, copied: u64) {
+    /// The most identities one boot's sampled gathers may be counted under.
+    const COPY_IDENTITIES_MAX: usize = 65_536;
+
+    let identity = copy_identity(source, copied);
+    let Ok(mut table) = copy_identities().lock() else {
+        return;
+    };
+    if table.contains_key(&identity) {
+        crate::runtime::drain::note_store_route(
+            "render_provider_out_of_class_texture_source_repeat_copies",
+        );
+        crate::runtime::drain::note_store_route_n(
+            "render_provider_out_of_class_texture_source_repeat_bytes",
+            copied,
+        );
+        return;
+    }
+    if table.len() >= COPY_IDENTITIES_MAX {
+        crate::runtime::drain::note_store_route(
+            "render_provider_out_of_class_texture_source_identity_overflow",
+        );
+        return;
+    }
+    table.insert(identity, ());
+    crate::runtime::drain::note_store_route(
+        "render_provider_out_of_class_texture_source_first_copies",
+    );
 }
 
 /// The bytes one pass copies out of its window-backed binds (`R18`, `R28`),
@@ -5873,10 +6014,54 @@ impl StreamSource<'_> {
     }
 }
 
-/// The two census routes one stream shape's gathered-from-runs arm is counted
-/// under (`G1-B`).
+/// How many buckets one self-read arm's length histograms are cut into
+/// (`G1-C`).
 ///
-/// One pair per stream shape rather than one pair for both, because the two are
+/// Six, because the sizes these arms carry are three orders of magnitude
+/// apart and the decision they inform is a ratio: the `g1b` census read
+/// **185 000 B** a vertex bind beside **36.7 B** an index bind of the same
+/// draws, and a bucket count that could not separate those two would not have
+/// answered the question the cut is decided on.
+const LENGTH_BUCKETS: usize = 6;
+
+/// One arm's per-bucket counters: `≤64 B`, `≤512 B`, `≤4 KiB`, `≤64 KiB`,
+/// `≤1 MiB`, and above.
+type LengthHistogram = [&'static str; LENGTH_BUCKETS];
+
+/// The two histograms one self-read arm charges (`G1-C`).
+///
+/// `declared` is the `total_len` each gathered bind stated — the bytes this
+/// rail would have copied for it with no reach at all — and `copied` is what
+/// its copy really carried. A census that read only the byte totals could not
+/// tell "every bind was a little too long" from "one bind in a thousand was a
+/// megabyte too long"; the two histograms are what separates them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LengthCensus {
+    declared: LengthHistogram,
+    copied: LengthHistogram,
+}
+
+/// Which bucket a length falls in (`G1-C`).
+fn length_bucket(len: u64) -> usize {
+    match len {
+        0..=64 => 0,
+        65..=512 => 1,
+        513..=4096 => 2,
+        4097..=65536 => 3,
+        65_537..=1_048_576 => 4,
+        _ => 5,
+    }
+}
+
+/// Charge one length to its own bucket (`G1-C`).
+fn note_length(histogram: LengthHistogram, len: u64) {
+    crate::runtime::drain::note_store_route(histogram[length_bucket(len)]);
+}
+
+/// The census routes one stream shape's gathered-from-runs arm is counted
+/// under (`G1-B`), and the reach the same arm's copies were cut to (`G1-C`).
+///
+/// One set per stream shape rather than one set for both, because the two are
 /// two shapes of one request: a draw has one index stream and up to four vertex
 /// streams, so a boot that reads one total could not say which half the copy
 /// serves — and the buckets they answer for are apart for the same reason
@@ -5887,6 +6072,16 @@ struct StreamStagingRoutes {
     staged: &'static str,
     /// The byte total beside it: how much the CPU gather carries for this shape.
     bytes: &'static str,
+    /// One count per bind whose copy a draw's own reach shortened, for the
+    /// stream shape that states one (`G1-C`). `None` on the shape whose copy is
+    /// already the reach — the index bind [`gather_single_window`]'s own
+    /// `extent_cap` narrowed, which the census reads at tens of bytes.
+    truncated: Option<&'static str>,
+    /// The bytes those cuts left in the runs, summed over every bind that took
+    /// the arm (`G1-C`).
+    slack: Option<&'static str>,
+    /// The declared-and-copied histograms (`G1-C`).
+    lengths: LengthCensus,
 }
 
 /// The routes an index stream's own copy out of a windowless gather is read
@@ -5894,6 +6089,26 @@ struct StreamStagingRoutes {
 const INDEX_STREAM_STAGING: StreamStagingRoutes = StreamStagingRoutes {
     staged: "render_provider_out_of_class_index_staging_staged",
     bytes: "render_provider_out_of_class_index_staging_bytes",
+    truncated: None,
+    slack: None,
+    lengths: LengthCensus {
+        declared: [
+            "render_provider_out_of_class_index_staging_declared_le64",
+            "render_provider_out_of_class_index_staging_declared_le512",
+            "render_provider_out_of_class_index_staging_declared_le4k",
+            "render_provider_out_of_class_index_staging_declared_le64k",
+            "render_provider_out_of_class_index_staging_declared_le1m",
+            "render_provider_out_of_class_index_staging_declared_gt1m",
+        ],
+        copied: [
+            "render_provider_out_of_class_index_staging_copied_le64",
+            "render_provider_out_of_class_index_staging_copied_le512",
+            "render_provider_out_of_class_index_staging_copied_le4k",
+            "render_provider_out_of_class_index_staging_copied_le64k",
+            "render_provider_out_of_class_index_staging_copied_le1m",
+            "render_provider_out_of_class_index_staging_copied_gt1m",
+        ],
+    },
 };
 
 /// The routes a vertex stream's own copy out of a windowless gather is read
@@ -5901,6 +6116,54 @@ const INDEX_STREAM_STAGING: StreamStagingRoutes = StreamStagingRoutes {
 const VERTEX_STREAM_STAGING: StreamStagingRoutes = StreamStagingRoutes {
     staged: "render_provider_out_of_class_vertex_staging_staged",
     bytes: "render_provider_out_of_class_vertex_staging_bytes",
+    truncated: Some("render_provider_out_of_class_vertex_staging_reach_cut"),
+    slack: Some("render_provider_out_of_class_vertex_staging_reach_slack_bytes"),
+    lengths: LengthCensus {
+        declared: [
+            "render_provider_out_of_class_vertex_staging_declared_le64",
+            "render_provider_out_of_class_vertex_staging_declared_le512",
+            "render_provider_out_of_class_vertex_staging_declared_le4k",
+            "render_provider_out_of_class_vertex_staging_declared_le64k",
+            "render_provider_out_of_class_vertex_staging_declared_le1m",
+            "render_provider_out_of_class_vertex_staging_declared_gt1m",
+        ],
+        copied: [
+            "render_provider_out_of_class_vertex_staging_copied_le64",
+            "render_provider_out_of_class_vertex_staging_copied_le512",
+            "render_provider_out_of_class_vertex_staging_copied_le4k",
+            "render_provider_out_of_class_vertex_staging_copied_le64k",
+            "render_provider_out_of_class_vertex_staging_copied_le1m",
+            "render_provider_out_of_class_vertex_staging_copied_gt1m",
+        ],
+    },
+};
+
+/// The sampled gather's own length histograms (`G1-C`).
+///
+/// The texture arm has no *reach* to cut: what it gathers is the extent's own
+/// span ([`sampled_rows`]' padded or tight bytes), which is the same span the
+/// window arm would have bound, so `declared` and `copied` read the same number
+/// for every bind that takes it. Recording both is how that claim is checked
+/// rather than asserted — and a bind where the two ever came apart would be a
+/// gather whose copy is longer than the texture it serves, which is exactly the
+/// shape a future increment would have to answer.
+const TEXTURE_SOURCE_LENGTHS: LengthCensus = LengthCensus {
+    declared: [
+        "render_provider_out_of_class_texture_source_declared_le64",
+        "render_provider_out_of_class_texture_source_declared_le512",
+        "render_provider_out_of_class_texture_source_declared_le4k",
+        "render_provider_out_of_class_texture_source_declared_le64k",
+        "render_provider_out_of_class_texture_source_declared_le1m",
+        "render_provider_out_of_class_texture_source_declared_gt1m",
+    ],
+    copied: [
+        "render_provider_out_of_class_texture_source_copied_le64",
+        "render_provider_out_of_class_texture_source_copied_le512",
+        "render_provider_out_of_class_texture_source_copied_le4k",
+        "render_provider_out_of_class_texture_source_copied_le64k",
+        "render_provider_out_of_class_texture_source_copied_le1m",
+        "render_provider_out_of_class_texture_source_copied_gt1m",
+    ],
 };
 
 /// The bytes a stream's gather holds when the registration ledger derives no
@@ -5927,14 +6190,59 @@ const VERTEX_STREAM_STAGING: StreamStagingRoutes = StreamStagingRoutes {
 /// `None` is a source whose runs cannot cover `source_offset..+total_len`
 /// ([`stage_run_bytes`]' own fail-closed answer: no padding, no half copy), and
 /// each caller turns it into its own shape's named refusal.
-fn stream_run_bytes(source: &GuestRunSource, routes: StreamStagingRoutes) -> Option<Vec<u8>> {
+///
+/// # The reach the copy is cut to (`G1-C`)
+///
+/// `reach` is the byte count the *caller* has proved this draw can read out of
+/// the bind ([`vertex_reach_bytes`], the vertex arm's own number; the index
+/// arm states none because its `total_len` is already the reach). The copy is
+/// `min(declared, reach)` bytes and never more: the fetch of a vertex reads
+/// inside its record, so a draw whose highest fetched record is `r` can name no
+/// byte at or past `(r + 1) × stride`, and the class's coverage rules already
+/// weigh the stream against that very span — a copy longer than the reach is
+/// bytes this draw has no arm for. `None` keeps the declared length, which is
+/// the shape every caller had before this increment and the only shape an arm
+/// with no proved reach may take.
+///
+/// `None` for `reach` is not "no reach proved, copy less": a reader that has not
+/// read the draw's index bytes cannot cut a vertex stream at all, because the
+/// records the draw names are a fact only those bytes state. Such a draw is the
+/// one the coverage rule below keeps on the engine, and its copy is the
+/// declared one it always was — the cut is never a guess.
+///
+/// The cut is what the runs have to cover, too, and that is the same fact
+/// rather than a relaxation of it: a source whose runs hold the draw's reach but
+/// not the whole table it declared is a bind whose every *fetched* byte is one
+/// the runs wrote, so the copy carries exactly the bytes the draw reads and the
+/// declaration states no byte no record wrote. A reach the runs do not cover is
+/// the same refusal it always was ([`stage_run_bytes`]' `None`), and never a
+/// padded copy.
+fn stream_run_bytes(
+    source: &GuestRunSource,
+    routes: StreamStagingRoutes,
+    reach: Option<u64>,
+) -> Option<Vec<u8>> {
     if gather_run_windows(source).is_some() {
         return None;
     }
-    let copy = stage_run_bytes(source, source.total_len)?;
+    let declared = source.total_len;
+    let len = reach.map_or(declared, |reach| reach.min(declared));
+    let copy = stage_run_bytes(source, len)?;
     // The census' own reading of this arm: one route per bind that took it and
     // one byte total beside it, so a boot can say how much of the streams' own
-    // traffic the CPU gather carries and what it costs per bind.
+    // traffic the CPU gather carries and what it costs per bind — beside the
+    // two histograms that say what the bind declared against what the copy
+    // carried, and the summed slack of every cut (`G1-C`).
+    note_length(routes.lengths.declared, declared);
+    note_length(routes.lengths.copied, len);
+    if len < declared {
+        if let Some(route) = routes.truncated {
+            crate::runtime::drain::note_store_route(route);
+        }
+        if let Some(route) = routes.slack {
+            crate::runtime::drain::note_store_route_n(route, declared - len);
+        }
+    }
     crate::runtime::drain::note_store_route(routes.staged);
     crate::runtime::drain::note_store_route_n(
         routes.bytes,
@@ -5972,12 +6280,13 @@ fn stream_run_bytes(source: &GuestRunSource, routes: StreamStagingRoutes) -> Opt
 fn stream_source<'a>(
     content: &'a BufferContent,
     routes: StreamStagingRoutes,
+    reach: Option<u64>,
 ) -> Option<StreamSource<'a>> {
     match content {
         BufferContent::Bytes(bytes) => Some(StreamSource::Staged(bytes)),
         BufferContent::GuestRuns(source) => match gather_single_window(source) {
             Some(window) => Some(StreamSource::Window(window)),
-            None => stream_run_bytes(source, routes).map(StreamSource::Copied),
+            None => stream_run_bytes(source, routes, reach).map(StreamSource::Copied),
         },
     }
 }
@@ -6011,8 +6320,18 @@ fn gather_single_window(source: &GuestRunSource) -> Option<StageBufferWindow> {
 /// sentence, byte for byte; `G1-B`'s coverage half (a stream it read whose bytes
 /// do not cover the draw's span) answers the same slug with its own detail, so
 /// a census reads one bucket with two facts in it.
-fn vertex_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, OutOfClass> {
-    stream_source(content, VERTEX_STREAM_STAGING).ok_or_else(|| {
+///
+/// `reach` is the draw's own reach in bytes for this stream
+/// ([`vertex_reach_bytes`], `G1-C`), which the copy arm cuts its read to. It
+/// moves nothing else: the staged and window arms are already the bytes the
+/// trace states, the refusals answer the same gathers, and a stream the reach
+/// does not cover is the `G1-B` coverage rule's (the copy is then the declared
+/// it always was, and the sentence is that rule's own).
+fn vertex_stream_source(
+    content: &BufferContent,
+    reach: Option<u64>,
+) -> Result<StreamSource<'_>, OutOfClass> {
+    stream_source(content, VERTEX_STREAM_STAGING, reach).ok_or_else(|| {
         OutOfClass::new(
             "render_provider_out_of_class_vertex_staging",
             "a vertex stream the GPU gathers from guest RAM stays on the engine when the \
@@ -6037,7 +6356,7 @@ fn vertex_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, Out
 /// `render_provider_out_of_class_index_staging` is the gather with neither arm —
 /// the bucket every index gather answered with before this increment.
 fn index_stream_source(content: &BufferContent) -> Result<StreamSource<'_>, OutOfClass> {
-    stream_source(content, INDEX_STREAM_STAGING).ok_or_else(index_staging_refusal)
+    stream_source(content, INDEX_STREAM_STAGING, None).ok_or_else(index_staging_refusal)
 }
 
 /// The index stream's own refusal for a gather no one registered window covers
@@ -8446,6 +8765,53 @@ fn highest_index(
     Some(highest)
 }
 
+/// The bytes a per-vertex stream's self-read copy may be cut to, for the draw
+/// this request states (`G1-C`).
+///
+/// The draw's own *reach* rather than the bind's declared length: the fetch of
+/// vertex `v` reads `attribute offset..+ format bytes` inside record `v` of the
+/// stream's stride, and the class already refuses a layout whose attribute does
+/// not fit its stride, so every byte this draw can fetch lies in
+/// `0..records × stride`. `None` is a draw whose records nobody has read — the
+/// index stream that still travels as the owner's lease (`R11`) — and a copy
+/// that is not cut at all, because the records are what the index bytes state
+/// and those bytes are not in hand: the cut is a proof, never a guess.
+///
+/// The two arms of the canonical contract name their records differently and
+/// this is where that difference lands (the same two arms
+/// [`nonindexed_vertex_span`] and [`highest_index`] answer for the coverage
+/// rules):
+///
+/// - the **indexed** arm reads the vertices its own index bytes name, so the
+///   reach is `highest index + 1` records — one more than the highest index,
+///   because the index names the record and the copy has to hold it. That is
+///   the same `+ 1` the affine proof's axis-0 count carries
+///   (`stage_buffer_affine_counts`), so the stream's cut and the stage buffers'
+///   bound are one arithmetic over one draw;
+/// - the **non-indexed** arm names its vertices `0..draw_count` (this class
+///   refuses a non-zero `firstVertex` by name), so the reach is the draw's own
+///   count — a number the request carries rather than one this rail has to find
+///   in bytes — which is exactly the `draw_count × stride` the non-indexed span
+///   proof weighs the same stream against.
+///
+/// Saturating on the product, exactly as both coverage rules are: a reach too
+/// large to state is larger than any bind this provider admits, and the only
+/// decision the number is read for is a `min` against the bind's declared
+/// length.
+fn vertex_reach_bytes(
+    indexed: bool,
+    draw_count: u32,
+    index_highest: Option<u64>,
+    stride: u64,
+) -> Option<u64> {
+    let records = if indexed {
+        index_highest?.saturating_add(1)
+    } else {
+        u64::from(draw_count)
+    };
+    Some(records.saturating_mul(stride))
+}
+
 /// The two invocation counts one draw's affine stage-buffer footprint is
 /// bounded by (`research/docs/23` §3.3, v86).
 ///
@@ -8534,7 +8900,7 @@ fn stage_buffer_affine_counts(
             if index_bytes.is_none() {
                 *index_bytes = Some(match gather_single_window(source) {
                     Some(window) => read_index_window(window)?,
-                    None => stream_run_bytes(source, INDEX_STREAM_STAGING)
+                    None => stream_run_bytes(source, INDEX_STREAM_STAGING, None)
                         .ok_or_else(index_staging_refusal)?,
                 });
             }
@@ -16232,7 +16598,17 @@ fn narrow_class<'a>(
         // shorter than one record is `vertex_short` exactly as a staged copy
         // is, and a gather that is no window at all is the named refusal
         // [`vertex_stream_source`] states.
-        let source = vertex_stream_source(&attribute.content)?;
+        //
+        // G1-C: a gather this rail reads itself is cut to the draw's own reach
+        // first ([`vertex_reach_bytes`]), because the bytes past it are records
+        // no fetch of this draw names — the class's own coverage rules prove
+        // the stream against exactly that span. Every other arm is untouched,
+        // and the reach is `None` for a draw whose index stream still travels
+        // as the owner's lease: those records are stated by bytes nobody has
+        // read, so the copy stays the declared one and the coverage rule below
+        // keeps the draw on the engine.
+        let reach = vertex_reach_bytes(req.indexed.is_some(), draw_count, index_highest, stride);
+        let source = vertex_stream_source(&attribute.content, reach)?;
         if source.len() < stride {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_vertex_short",
