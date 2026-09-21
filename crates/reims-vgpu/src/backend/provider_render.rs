@@ -14243,10 +14243,16 @@ fn one_election_per_source() -> bool {
         _ => {}
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // On only for the spellings that say so: an unset variable is this cut
+    // **off**, which is the state the delivered default is read in (the arms of
+    // the A/B are the default and `=on`, and the rail's own cases force the arm
+    // in-process). The GW1 cuts beside this one flip the other way -- they were
+    // merged default-on after their rounds -- and copying that spelling is how
+    // this cut ran both arms on the first pair of boots.
     *ON.get_or_init(|| {
-        !matches!(
+        matches!(
             crate::config::switch(crate::config::ONE_ELECTION_PER_SOURCE),
-            crate::config::Switch::Off
+            crate::config::Switch::On
         )
     })
 }
