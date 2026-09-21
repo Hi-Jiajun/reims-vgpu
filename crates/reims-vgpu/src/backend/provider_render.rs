@@ -14243,16 +14243,17 @@ fn one_election_per_source() -> bool {
         _ => {}
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On only for the spellings that say so: an unset variable is this cut
-    // **off**, which is the state the delivered default is read in (the arms of
-    // the A/B are the default and `=on`, and the rail's own cases force the arm
-    // in-process). The GW1 cuts beside this one flip the other way -- they were
-    // merged default-on after their rounds -- and copying that spelling is how
-    // this cut ran both arms on the first pair of boots.
+    // **Unset is on** (flipped 2026-09-22 once its round had read it): the
+    // ws4/ws4b arms read copies/table 4.000 -> 1.000, reused/record 0.000 ->
+    // 0.750, streams_attr_source 650 -> 297 µs a frame and walk_streams
+    // 1 268 -> 894 (3.8× the untouched regions' 7.1–7.7 % band), with both
+    // populations' identities closed. Only `0/off/false/no` restore the
+    // per-record election; the rail's own cases still force either arm
+    // in-process.
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             crate::config::switch(crate::config::ONE_ELECTION_PER_SOURCE),
-            crate::config::Switch::On
+            crate::config::Switch::Off
         )
     })
 }
