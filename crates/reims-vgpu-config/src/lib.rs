@@ -1474,8 +1474,10 @@ pub const SEAM_FRAME_BORROW: &str = "REIMS_VGPU_SEAM_FRAME_BORROW";
 /// the publish path, never on the encoder's.
 pub const SEAM_READ_GENERATION: &str = "REIMS_VGPU_SEAM_READ_GENERATION";
 
-/// **Default off.** `on` lets one class gate read the provider's capability
-/// frame **once** for the whole call, instead of once per answer it asks.
+/// **Unset is on** (flipped 2026-09-21 once its A/B had read it); the control
+/// words `0`/`off`/`false`/`no` restore the per-answer path. It lets one class
+/// gate read the provider's capability frame **once** for the whole call,
+/// instead of once per answer it asks.
 ///
 /// # The reading that motivated it
 ///

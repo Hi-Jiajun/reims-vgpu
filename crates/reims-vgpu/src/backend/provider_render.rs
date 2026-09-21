@@ -13299,6 +13299,14 @@ pub fn set_gate_one_frame_arm(arm: Option<bool>) {
 /// Whether the class gate reads one capability frame for the whole call
 /// ([`GATE_ONE_FRAME`](crate::config::GATE_ONE_FRAME), R-RG1).
 ///
+/// **On unless a control word turns it off**: the round priced it at
+/// `wire_capability_frames` 811 909 / 765 149 → 150 190 (−82 %) and 6.42 → 1.17
+/// frames per gate call, with the p50 asks bar 4 000 → 2 795 µs — 11.7–12.7×
+/// the two identical control arms' own spread — and the rail carries the two
+/// arms' equivalence case
+/// (`one_gate_frame_lands_the_same_frame_and_encodes_fewer_of_them`). Only
+/// `0/off/false/no` restore the per-answer path.
+///
 /// Read once per gate call, so the environment lookup is cached: the gate is
 /// handed every draw's class probe and every draw's submission, and
 /// `config::switch` parses the variable each time it is asked.
@@ -13311,9 +13319,9 @@ fn gate_one_frame_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             crate::config::switch(crate::config::GATE_ONE_FRAME),
-            crate::config::Switch::On
+            crate::config::Switch::Off
         )
     })
 }
@@ -13350,7 +13358,7 @@ fn submit_render_inner(
     // R-RG1's own cut: every device answer below is a field of the one snapshot
     // the provider published, so the gate decodes that snapshot **once** here
     // and the asks that follow read it instead of encoding their own
-    // (`REIMS_VGPU_GATE_ONE_FRAME`, default off). A provider that cannot be read
+    // (`REIMS_VGPU_GATE_ONE_FRAME`, unset is on). A provider that cannot be read
     // — or a snapshot the codec refuses — leaves the slot empty on purpose: the
     // asks then answer exactly where, and exactly how, they did before this
     // cut. The guard goes back to the wire when the gate ends, so nothing
