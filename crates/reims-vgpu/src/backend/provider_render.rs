@@ -13780,12 +13780,13 @@ pub fn set_gate_modules_one_memo_arm(arm: Option<bool>) {
 /// parse and one translation
 /// ([`GATE_MODULES_ONE_MEMO`](crate::config::GATE_MODULES_ONE_MEMO), R-GM1).
 ///
-/// **Off unless a control word turns it on**: the round's control arm is the
-/// two-paths-per-module pose every round before this increment ran, and the
-/// three memos' own bars and counts
-/// (`prov_gate_module_*_us_mean`, `render_gate_module_*_parse_n` /
-/// `_xlate_n`) are what the increment arm is read against. Only
-/// `1/on/true/yes` turn it on.
+/// **On unless a control word turns it off**: the round priced it at 98 → 35
+/// parses and translations for the fragment module (−64 %, with
+/// `render_register_fragment_reuse_n = 30` saying where the registration
+/// path's other thirty went) and `prov_gate_modules_us_mean`
+/// 1 878 645 → 881 060 µs at the startup spike (−53 %), with both arms in the
+/// same control plane and the rail holding the two arms' frames to each other.
+/// Only `0/off/false/no` restore the three-memos-per-module path.
 ///
 /// Read once per module question, so the environment lookup is cached: the gate
 /// is handed every draw's class probe and every draw's submission, and
@@ -13799,9 +13800,9 @@ fn modules_one_memo_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             crate::config::switch(crate::config::GATE_MODULES_ONE_MEMO),
-            crate::config::Switch::On
+            crate::config::Switch::Off
         )
     })
 }
