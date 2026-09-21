@@ -33348,3 +33348,334 @@ fn one_modules_memo_lands_the_same_frame_and_translates_fewer_modules() {
         merged[11]
     );
 }
+
+/// R-GW1: the class gate *proves* a tight sampled gather's read instead of
+/// making it, and the frame is the same frame.
+///
+/// The walk reads one windowless gather's bytes out of the bind's own live runs
+/// (`stage_run_bytes`, the G1-B arm). R-GW1 split that walk out of the class
+/// gate and priced it at ~70 % of the gate's **4 778 µs per present frame**
+/// (`prov_gate_walk`, steady p50), with 97.8 % of its bytes sampled textures —
+/// and the gate is reached twice for every record a chain handoff probes before
+/// it submits it, so one declaration's bytes were read once for the probe, once
+/// for the submission, and copied a third time by the trace that states them.
+///
+/// `REIMS_VGPU_GATE_PROVE_GATHER` answers the runs' own coverage question with
+/// the same walk and no bytes (`stage_run_len`: one loop, two sinks) and lets
+/// the trace read them once per submission
+/// (`NarrowTextureSource::stated_bytes`). This case holds the two arms to each
+/// other on the shape the arm is for:
+///
+/// - the same draw lands the same texel on both arms, and the same frame the
+///   engine's own staging read lands (the bytes travel from the guest's runs to
+///   the declaration either way);
+/// - the census reads **one population**: both arms charge one gathered bind and
+///   the same bytes, because the proof counts what a copy would have carried;
+/// - the arm that is taken is named: the proof arm charges
+///   `render_gate_walk_gather_proofs_n` once and the trait's own bytes, the read
+///   arm charges neither — while `render_gate_walk_texture_tight_n` (the shape
+///   the two arms agree about) counts one on both;
+/// - and the *copy* is one on either arm: the read arm makes it at the gate, the
+///   proof arm at the trace that states the declaration, and an arm that made
+///   both (a proof that left the gate's own copy behind it) would read two
+///   (`render_gather_copy_texture_n`, charged inside `stage_run_bytes`).
+#[test]
+fn the_proved_gather_lands_the_same_frame_and_proves_the_read_once() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let (read_x, read_y) = SAMPLED_TEXEL;
+    let extent = u64::from(width) * u64::from(height) * 4;
+    let read_bytes = |texels: &[Vec<u8>]| {
+        let texel = &texels[read_y * width as usize + read_x];
+        [texel[0], texel[1], texel[2], texel[3]]
+    };
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let packed: Vec<u8> = texels.iter().flatten().copied().collect();
+    assert!(
+        u64::try_from(packed.len()).expect("the extent fits u64") == extent,
+        "the fixture's texels are the texture's own extent"
+    );
+    owner.as_mut_slice()[..packed.len()].copy_from_slice(&packed);
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    // The production pose's own reading of this bind: one live host run over the
+    // texture's own bytes and **no `pages`**, so the ledger names no window and
+    // the gate is the one that reads them.
+    let source = || {
+        SampledSource::GuestRuns(
+            engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                    mapping,
+                    mapping_len,
+                    0,
+                    extent,
+                )
+                .expect("the texture's own bytes are inside the mapping")]),
+                source_offset: 0,
+                total_len: extent,
+                row_length_texels: 0,
+                pages: None,
+                direct_image: None,
+            },
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        )
+    };
+    let request = || {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].source = source();
+        request
+    };
+    // The engine's own frame is the expectation: the two arms have to land
+    // *that* frame, not merely each other's.
+    let engine = engine_pixels("R-GW1 proved gather", &stages, request())
+        .expect("the engine gathers this shape");
+    assert_uniform_frame(
+        "R-GW1 proved gather (engine)",
+        &engine,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+
+    let run = |arm: Option<bool>| {
+        provider_render::set_gate_prove_gather_arm(arm);
+        let gathered = route_count("render_provider_out_of_class_texture_source_gathered");
+        let gathered_bytes = route_count("render_provider_out_of_class_texture_source_bytes");
+        let proofs = route_count("render_gate_walk_gather_proofs_n");
+        let proven_bytes = route_count("render_gate_walk_gather_proven_bytes");
+        let copies = route_count("render_gather_copy_texture_n");
+        let trace_reads = route_count("render_trace_texture_gather_n");
+        let tight = route_count("render_gate_walk_texture_tight_n");
+        let refusals = route_count("render_provider_out_of_class_texture_source");
+        let submissions = provider_render::provider_submissions();
+        let frame = provider_pixels("R-GW1 proved gather (provider)", &stages, &request());
+        let out = (
+            frame,
+            route_count("render_provider_out_of_class_texture_source_gathered") - gathered,
+            route_count("render_provider_out_of_class_texture_source_bytes") - gathered_bytes,
+            route_count("render_gate_walk_gather_proofs_n") - proofs,
+            route_count("render_gate_walk_gather_proven_bytes") - proven_bytes,
+            route_count("render_gather_copy_texture_n") - copies,
+            route_count("render_trace_texture_gather_n") - trace_reads,
+            route_count("render_gate_walk_texture_tight_n") - tight,
+            route_count("render_provider_out_of_class_texture_source") - refusals,
+            provider_render::provider_submissions() - submissions,
+        );
+        provider_render::set_gate_prove_gather_arm(None);
+        out
+    };
+    let (
+        read_frame,
+        read_binds,
+        read_bytes_n,
+        read_proofs,
+        _,
+        read_copies,
+        read_trace_reads,
+        read_tight,
+        read_refusals,
+        read_subs,
+    ) = run(Some(false));
+    let (
+        proved_frame,
+        proved_binds,
+        proved_bytes_n,
+        proved_proofs,
+        proved_proven,
+        proved_copies,
+        proved_trace_reads,
+        proved_tight,
+        proved_refusals,
+        proved_subs,
+    ) = run(Some(true));
+
+    assert_uniform_frame(
+        "R-GW1 proved gather (read arm)",
+        &read_frame,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    assert_uniform_frame(
+        "R-GW1 proved gather (proof arm)",
+        &proved_frame,
+        width,
+        height,
+        read_bytes(&texels),
+    );
+    assert_frames_equal(
+        "R-GW1 proved gather, the two arms of the switch",
+        &proved_frame,
+        &read_frame,
+    );
+    assert_frames_equal("R-GW1 proved gather, both rails", &read_frame, &engine);
+
+    assert_eq!(
+        (read_binds, proved_binds),
+        (1, 1),
+        "the gate admits the same one bind on both arms"
+    );
+    assert_eq!(
+        (read_bytes_n, proved_bytes_n),
+        (extent, extent),
+        "and the census reads the same bytes: the proof counts what the copy would have carried"
+    );
+    assert_eq!(
+        (read_tight, proved_tight),
+        (1, 1),
+        "the shape the two arms agree about is counted either way"
+    );
+    assert_eq!(
+        (read_proofs, proved_proofs),
+        (0, 1),
+        "the proof is what the switch adds: the read arm proves nothing"
+    );
+    assert_eq!(
+        proved_proven, extent,
+        "the proof carries exactly the bytes the declaration states"
+    );
+    assert_eq!(
+        (read_copies, proved_copies),
+        (1, 1),
+        "one declaration's bytes are read once on either arm: the read arm copies at the gate, the \
+         proof arm at the trace -- an arm that copied at the gate *and* read at the trace would \
+         count two"
+    );
+    assert_eq!(
+        (read_trace_reads, proved_trace_reads),
+        (0, 1),
+        "and the trace is what reads them on the proof arm: the read arm's declaration carries the \
+         gate's own copy, so it reads nothing there"
+    );
+    assert_eq!(
+        (read_refusals, proved_refusals),
+        (0, 0),
+        "neither arm is a texture_source refusal: the bind the gate proves is the bind the copy \
+         covered"
+    );
+    assert_eq!(
+        (read_subs, proved_subs),
+        (1, 1),
+        "both arms reach the provider rather than the engine"
+    );
+    eprintln!(
+        "R-GW1: one windowless sampled gather of {extent} bytes -- the read arm copied it at the \
+         gate ({read_proofs} proofs), the proof arm answered the same coverage question with no \
+         bytes read ({proved_proofs} proof carrying {proved_proven} bytes) and left the read to \
+         the trace; both landed the engine's own frame"
+    );
+}
+
+/// R-GW1: the proof arm answers the runs' own refusal with the copy's own slug
+/// and sentence.
+///
+/// The arm `REIMS_VGPU_GATE_PROVE_GATHER` adds answers a shape by *proving* a
+/// read it does not make, so the one thing it may not do is answer a different
+/// question: a gather whose runs do not hold the bind's own extent has to stay
+/// on the engine under `render_provider_out_of_class_texture_source` with the
+/// sentence the copy's own `None` produced. The fixture is the case above with
+/// the source's first byte moved off the texture's own start, so the runs hold
+/// `extent - 4` bytes of the span the bind declares.
+#[test]
+fn the_proved_gather_refuses_the_runs_the_copy_refused() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    let _guard = engine_test_session();
+    let stages = sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let texels = sampled_texels(width, height);
+    let extent = u64::from(width) * u64::from(height) * 4;
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    let packed: Vec<u8> = texels.iter().flatten().copied().collect();
+    owner.as_mut_slice()[..packed.len()].copy_from_slice(&packed);
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    let source = || {
+        SampledSource::GuestRuns(
+            engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+                    mapping,
+                    mapping_len,
+                    0,
+                    extent,
+                )
+                .expect("the texture's own bytes are inside the mapping")]),
+                // The move: the bind's first byte is four into the run, so the
+                // runs hold `extent - 4` bytes of the span the bind declares.
+                source_offset: 4,
+                total_len: extent,
+                row_length_texels: 0,
+                pages: None,
+                direct_image: None,
+            },
+            reims_vgpu::runtime::gather_witness::GatherVouch::Fresh,
+        )
+    };
+    let request = || {
+        let mut request = sampled_request(&stages, texels.clone(), (width, height));
+        request.sampled_images[0].source = source();
+        request
+    };
+    let inputs = inputs(&stages, RenderChainRole::SoleOrTail);
+
+    let refuse = |arm: Option<bool>| {
+        provider_render::set_gate_prove_gather_arm(arm);
+        let gathered = route_count("render_provider_out_of_class_texture_source_gathered");
+        let proofs = route_count("render_gate_walk_gather_proofs_n");
+        let submissions = provider_render::provider_submissions();
+        let reason = match provider_render::submit_render(&inputs, &request()) {
+            RenderRailOutcome::NotInNarrowClass(reason) => reason,
+            other => panic!("a gather its runs cannot cover stays on the engine: {other:?}"),
+        };
+        let out = (
+            reason.slug().to_owned(),
+            reason.detail().to_owned(),
+            route_count("render_provider_out_of_class_texture_source_gathered") - gathered,
+            route_count("render_gate_walk_gather_proofs_n") - proofs,
+            provider_render::provider_submissions() - submissions,
+        );
+        provider_render::set_gate_prove_gather_arm(None);
+        out
+    };
+    let (read_slug, read_sentence, read_binds, read_proofs, read_subs) = refuse(Some(false));
+    let (proved_slug, proved_sentence, proved_binds, proved_proofs, proved_subs) =
+        refuse(Some(true));
+
+    eprintln!("R-GW1 refusal: {read_slug}\n  {read_sentence}");
+    assert_eq!(
+        read_slug, "render_provider_out_of_class_texture_source",
+        "the shape the copy cannot cover is the bucket it always was"
+    );
+    assert_eq!(
+        proved_slug, read_slug,
+        "the proof arm answers the same by-name refusal as the read arm"
+    );
+    assert_eq!(
+        proved_sentence, read_sentence,
+        "and the sentence is the copy's own, byte for byte: a proof may not answer a different \
+         question than the read it replaces"
+    );
+    assert_eq!(
+        (read_binds, proved_binds),
+        (0, 0),
+        "a bind the runs cannot cover never reaches the gathered arm's own census"
+    );
+    assert_eq!(
+        (read_proofs, proved_proofs),
+        (0, 0),
+        "and neither arm proves a read it could not make"
+    );
+    assert_eq!(
+        (read_subs, proved_subs),
+        (0, 0),
+        "no submission is made for a bind the pure gate refuses"
+    );
+}

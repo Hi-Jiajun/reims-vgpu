@@ -1571,6 +1571,56 @@ pub const GATE_ONE_FRAME: &str = "REIMS_VGPU_GATE_ONE_FRAME";
 /// inside one process and compare the landed frame, the three facts and the
 /// walk counts.
 pub const GATE_MODULES_ONE_MEMO: &str = "REIMS_VGPU_GATE_MODULES_ONE_MEMO";
+
+/// **Unset is off** — every gathered sampled bind the class gate admits is read
+/// at the gate, which is the path every round before this increment ran. On,
+/// the *tight* shape of that read is **proved** instead of made: the gate
+/// answers the runs' own coverage question with the same walk and no bytes, and
+/// the trace that states the declaration reads them — once per submission
+/// instead of once per walk.
+///
+/// # The reading that motivated it
+///
+/// R-RG1 priced the class gate's `narrow_class` bar at **4 778 µs per present
+/// frame** at the steady p50 and named it as the region no increment had ever
+/// split. R-GW1's own split prices it inside that bar: `stage_run_bytes` — the
+/// CPU gather one windowless bind's bytes are read out of — is **~70 % of the
+/// walk** at the steady p50 (2.9 of 4.2 ms/frame), and **97.8 % of its bytes
+/// are sampled textures** (10.56 GB of one round's 10.82 GB, an average of
+/// 793 KiB per bind).
+///
+/// # Why the walk reads them twice, and the trace a third time
+///
+/// The gate is reached **twice** for a record whose packet is handed over as a
+/// chain: once as the probe the record before it asks with
+/// (`render_class_probe`, ~48 % of all gate calls in that round) and once as
+/// the submission itself — and *both* walks read the same bind's runs. The
+/// submission's trace then states the declaration by copying the bytes the gate
+/// already read (`owned_bytes(...).to_vec()`), so one declaration's bytes were
+/// read twice and copied a third time.
+///
+/// # What `on` does, and what it cannot change
+///
+/// The proof arm answers the refusal with the same walk the copy makes
+/// (`stage_run_len`: one loop, two sinks), so every shape the gate refused
+/// before is refused now, by the same slug and sentence; the two shapes whose
+/// answer is read *out of* the bytes (R36's repacked rows, R41's folded lane)
+/// keep reading at the gate, and a probe never reaches the trace. The bytes are
+/// read once per submission, at `TextureSource::OwnedBytes` — exactly where the
+/// declaration that carries them is built.
+///
+/// The census keeps reading one population across the two arms: the gate counts
+/// what it proved (`render_gate_walk_gather_proofs_n`,
+/// `render_gate_walk_gather_proven_bytes`) beside the counters it charged while
+/// it was reading (`render_provider_out_of_class_texture_source_*`), and the
+/// gather's own bar (`lease_gather_bytes_*`) follows the bytes to the trace.
+///
+/// # What it costs
+///
+/// Off is one relaxed load per gathered bind and nothing else. On adds one pass
+/// over the runs' coordinates per proved bind — no bytes — and the read the
+/// trace makes instead.
+pub const GATE_PROVE_GATHER: &str = "REIMS_VGPU_GATE_PROVE_GATHER";
 }
 
 counts! {

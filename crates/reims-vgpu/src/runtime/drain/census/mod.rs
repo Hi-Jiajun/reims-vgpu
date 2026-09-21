@@ -954,11 +954,98 @@ pub(crate) enum FrameSpan {
     /// fallback separately (`render_gate_module_half_walk_n`) rather than
     /// assuming the two policies are the same one.
     ProvGateModuleHalf = 68,
+    /// `narrow_class`'s head inside [`Self::ProvGateWalk`]: the chain role's own
+    /// admission, both stages and their entry names, the attachment's format,
+    /// clear and extent, the present tail's three position rules, and the
+    /// present/resident derivations the arms below read.
+    ///
+    /// # Why the parent was not enough
+    ///
+    /// R-RG1 priced [`Self::ProvGateWalk`] as one number — **4 778 µs/window**
+    /// at the steady p50, against ~594 gate calls in the same window, and it is
+    /// the *pure CPU* half of `prov_gate`. Nothing had ever split it, so the
+    /// only nameable object inside it was "the walk". Nine bars (this one and
+    /// the eight below it) carve the walk into the regions its own code already
+    /// has — disjoint, so their sum against the parent is an identity a reader
+    /// can check — and the route denominators beside them
+    /// (`render_gate_walk_*_n`) turn each region's µs into µs per record, which
+    /// is the reading a cut has to be chosen from.
+    ProvGateWalkHead = 69,
+    /// The load election inside [`Self::ProvGateWalk`]: the resident identity
+    /// the attachment's `LoadOp` names, the three byte doors the caller can
+    /// hand a previous frame over through, the relay guard, and the run-list
+    /// copies those arms make ([`Self::ProvGateWalkCopies`] prices the copies
+    /// themselves).
+    ProvGateWalkLoad = 70,
+    /// The store election inside [`Self::ProvGateWalk`]: the readback-skip
+    /// arms, the keep-frame promise, the landing view a guest-backed tail
+    /// resolves through, and the by-name rules that guard them.
+    ProvGateWalkStore = 71,
+    /// The walk's own by-name judgements inside [`Self::ProvGateWalk`], charged
+    /// at the two places they stand: the tail ladder after the store election
+    /// (a continuing record, secondary targets, the superset and 16-bit doors,
+    /// multisampling, depth) and the same ladder's raster half (occlusion,
+    /// blend, viewport, scissor, cull, instancing, topology).
+    ///
+    /// One slot with two brackets rather than two slots because the two are the
+    /// same *mechanism* — a comparison against the request's own fields and a
+    /// refusal naming the one that failed — and the cut they support is the
+    /// same one; the two positions are disjoint in time, so the slot is their
+    /// sum and not a nesting.
+    ProvGateWalkRules = 72,
+    /// `stage_buffer_gate` inside [`Self::ProvGateWalk`]: the guest-run
+    /// windows, the affine footprint proofs and the folded-set-0 rules the
+    /// stage-buffer section states.
+    ProvGateWalkStageBuffers = 73,
+    /// `sampled_textures` inside [`Self::ProvGateWalk`]: the sampled
+    /// declarations the trace states, the view/format/lane rules each bind is
+    /// weighed against, and the frame reads the texture-source arms elect.
+    ProvGateWalkSampling = 74,
+    /// `recorded_production` inside [`Self::ProvGateWalkSampling`]: the one
+    /// reading in the walk that takes a **global** mutex and clones an `Arc`
+    /// out of it, charged per sampled bind that samples a GPU target.
+    ///
+    /// Nested deliberately: the lock belongs to the declaration's own arm, and
+    /// the region above it is what the arm is worth against the walk.
+    ProvGateWalkRegistry = 75,
+    /// The index and vertex stream tables inside [`Self::ProvGateWalk`]: the
+    /// per-attribute loop and its sources, the index stream's own read of the
+    /// bytes it names (`highest_index`), the reach cuts, the surplus-stream
+    /// proof and the non-indexed span.
+    ProvGateWalkStreams = 76,
+    /// The run-list copies inside [`Self::ProvGateWalk`]: `runs.to_vec()` at the
+    /// three load arms and the landing view, one `Vec` per record that takes
+    /// the arm.
+    ///
+    /// Nested inside the arm that makes the copy, and charged beside its own
+    /// two counts (`render_gate_walk_run_copies_n`, `render_gate_walk_run_copied_n`),
+    /// because "how much does the walk spend on small allocations" is a
+    /// question about per-record cost and not about the arm's own arithmetic.
+    ProvGateWalkCopies = 77,
+    /// The walk's tail inside [`Self::ProvGateWalk`]: the serial-pool view
+    /// budget and the `NarrowPass` the walk hands back — the two entry names'
+    /// `to_owned` calls and the move of every table the regions above built.
+    ///
+    /// The one region a *probe* pays for nothing: a class-only call reaches
+    /// this point having answered every question, and the pass it builds is
+    /// dropped by its caller (`render_gate_walk_probe_n` is that population).
+    ProvGateWalkTail = 78,
+    /// The walk one gathered read is *proved* by inside [`Self::ProvGateWalk`]:
+    /// `stage_run_len`, the same run walk [`Self::LeaseGatherBytes`] makes with
+    /// no bytes read, on the arm `REIMS_VGPU_GATE_PROVE_GATHER` selects
+    /// (`R-GW1`).
+    ///
+    /// The pair to [`Self::LeaseGatherBytes`], and the two are read against each
+    /// other: that bar is the copy, this one is the answer about the copy that
+    /// replaces it on the increment arm — and the bytes it proves are the bytes
+    /// the copy would have carried, so a round can say what a read cost from
+    /// what it costs to decide whether to make it.
+    GateGatherProof = 79,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::ProvGateModuleHalf as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::GateGatherProof as usize + 1;
 
 /// One byte source the owner mints for the attachment's own declaration, with
 /// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
@@ -1369,6 +1456,25 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "prov_gate_module_pixel_us_mean",
     "prov_gate_module_superset_us_mean",
     "prov_gate_module_half_us_mean",
+    // R-GW1: the walk itself, in the nine regions its own code already has --
+    // disjoint, so their sum against `prov_gate_walk_us_mean` is an identity a
+    // reader can check before believing any one of them. The two nested slots
+    // (the production registry's lock, the run-list copies) are the two places
+    // inside a region that name a mechanism of their own.
+    "prov_gate_walk_head_us_mean",
+    "prov_gate_walk_load_us_mean",
+    "prov_gate_walk_store_us_mean",
+    "prov_gate_walk_rules_us_mean",
+    "prov_gate_walk_stage_buffers_us_mean",
+    "prov_gate_walk_sampling_us_mean",
+    "prov_gate_walk_registry_us_mean",
+    "prov_gate_walk_streams_us_mean",
+    "prov_gate_walk_copies_us_mean",
+    "prov_gate_walk_tail_us_mean",
+    // R-GW1's cut: the proof that replaces one gathered read on the arm
+    // `REIMS_VGPU_GATE_PROVE_GATHER` selects, read against `lease_gather_bytes`
+    // -- the copy it is the answer about.
+    "gate_gather_proof_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.

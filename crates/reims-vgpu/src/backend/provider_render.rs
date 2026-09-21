@@ -1317,14 +1317,40 @@ fn texture_gather_refusal(index: u32, exit: &SampledGatherExit) -> OutOfClass {
 /// guess at.
 fn gathered_texture_source<'a>(
     index: u32,
-    source: &GuestRunSource,
+    // The source's own lifetime is the pass's: the proof arm hands the bind's
+    // runs to the declaration the trace states, exactly as the request's own
+    // byte arms hand over a slice of the request (`R-GW1`).
+    source: &'a GuestRunSource,
     extent: TextureExtent,
     fold: Option<crate::protocol::pixel_format::SwizzlePlan>,
 ) -> Result<NarrowTextureSource<'a>, OutOfClass> {
     let SampledRows { rows, .. } =
         sampled_rows(source, extent).map_err(|exit| texture_gather_refusal(index, &exit))?;
     let span = source.total_len;
-    let padded = stage_run_bytes(source, span)
+    // R-GW1: which *shape* this bind is, and whether this call reads it or
+    // *proves* it. Both are read before the copy below, because the proof arm
+    // exists to **not** make it: the two shapes that keep reading need the bytes
+    // themselves — the repack reads them to answer about the rows it drops, and
+    // the fold reads them to widen one byte per texel — so the proof arm is the
+    // tight shape's, which is the one shape whose declaration states exactly the
+    // bytes the runs hold.
+    //
+    // The order of the two answers is the copy's own: `sampled_rows` first (the
+    // shape the source states), then the runs' coverage of `span` — which is why
+    // the proof is `stage_run_len` and not a second question. The proof arm's
+    // refusal is the copy's, byte for byte, from the same walk
+    // ([`stage_run_walk`]); what it does not do is read the bytes.
+    let repacked = rows.is_some();
+    if !repacked && fold.is_none() && gate_prove_gather() {
+        let carried = stage_run_len(source, span)
+            .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
+        note_gathered_texture(source, span, carried, false, false, carried);
+        return Ok(NarrowTextureSource::Gathered(GatheredTexels::Proved {
+            source,
+            span,
+        }));
+    }
+    let padded = stage_run_bytes(source, span, GatherSite::Texture)
         .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
     // The bytes this copy carried, read before the repack below consumes them:
     // G1-C's histogram of the arm's own lengths reads this number, and it is the
@@ -1347,26 +1373,71 @@ fn gathered_texture_source<'a>(
         })?,
         None => padded,
     };
-    // The census' own reading of this arm, charged once the copy *is* the
-    // texture's own bytes: one route per bind that took it and one byte total
-    // beside it — the gather's own span, which a padded source carries with its
-    // padding, so the two halves of the arm can be counted from the log rather
-    // than inferred.
+    note_gathered_texture(
+        source,
+        span,
+        carried,
+        repacked,
+        fold.is_some(),
+        u64::try_from(texels.len()).unwrap_or(u64::MAX),
+    );
+    Ok(match fold {
+        Some(plan) => {
+            NarrowTextureSource::Gathered(GatheredTexels::Read(fold_channel_plan(&plan, &texels)))
+        }
+        None => NarrowTextureSource::Gathered(GatheredTexels::Read(texels)),
+    })
+}
+
+/// The census' own reading of one gathered sampled texture (`G1-C`, `R-GW1`).
+///
+/// One function for the two arms of `REIMS_VGPU_GATE_PROVE_GATHER`, because the
+/// two have to charge the same numbers or the round cannot tell a population
+/// that moved from one that stopped being counted: `carried` is the bytes a
+/// copy would carry (measured on the read arm, proven by the same walk on the
+/// proof arm) and `stated` is the bytes the declaration states — the same
+/// number on the tight shape either way.
+fn note_gathered_texture(
+    source: &GuestRunSource,
+    span: u64,
+    carried: u64,
+    repacked: bool,
+    folded: bool,
+    stated: u64,
+) {
+    // One route per bind that took this arm and one byte total beside it — the
+    // gather's own span, which a padded source carries with its padding, so the
+    // two halves of the arm can be counted from the log rather than inferred.
     crate::runtime::drain::note_store_route("render_provider_out_of_class_texture_source_gathered");
     crate::runtime::drain::note_store_route_n(
         "render_provider_out_of_class_texture_source_bytes",
-        u64::try_from(texels.len()).unwrap_or(u64::MAX),
+        stated,
     );
-    // G1-C's two readings of the same copy: the length histograms (declared
-    // against carried — equal by construction here, which is the point) and the
-    // repeat rate of the bytes themselves.
+    // G1-C's two readings of the same read: the length histograms (declared
+    // against carried — equal by construction on the tight shape, which is the
+    // point) and the repeat rate of the bytes themselves.
     note_length(TEXTURE_SOURCE_LENGTHS.declared, span);
     note_length(TEXTURE_SOURCE_LENGTHS.copied, carried);
     note_texture_copy_identity(source, span);
-    Ok(match fold {
-        Some(plan) => NarrowTextureSource::Gathered(fold_channel_plan(&plan, &texels)),
-        None => NarrowTextureSource::Gathered(texels),
-    })
+    // R-GW1: the shape the caller read out of the request, counted here beside
+    // the bytes it carried, so the three populations are read as populations
+    // rather than as one arm's total.
+    let (shape_n, shape_bytes) = match (repacked, folded) {
+        (true, _) => (
+            "render_gate_walk_texture_padded_n",
+            "render_gate_walk_texture_padded_bytes",
+        ),
+        (false, false) => (
+            "render_gate_walk_texture_tight_n",
+            "render_gate_walk_texture_tight_bytes",
+        ),
+        (false, true) => (
+            "render_gate_walk_texture_folded_n",
+            "render_gate_walk_texture_folded_bytes",
+        ),
+    };
+    crate::runtime::drain::note_store_route(shape_n);
+    crate::runtime::drain::note_store_route_n(shape_bytes, stated);
 }
 
 /// One sampled gather's copy, as the census identifies it (`G1-C`).
@@ -3916,7 +3987,20 @@ fn sampled_textures<'a>(
                             ),
                         ));
                     }
-                    match recorded_production(identity) {
+                    // R-GW1: the walk's one global lock, bracketed on its own.
+                    // The bar covers the lookup and nothing beside it — the
+                    // arms below weigh the production they got, and a shape
+                    // refusal's own `format!` is theirs, not this read's.
+                    let recorded = {
+                        let _registry = crate::runtime::drain::frame_span(
+                            crate::runtime::drain::FrameSpan::ProvGateWalkRegistry,
+                        );
+                        crate::runtime::drain::note_store_route(
+                            "render_gate_walk_registry_reads_n",
+                        );
+                        recorded_production(identity)
+                    };
+                    match recorded {
                         Some(production) => {
                             // The sampled declaration has to restate the stored
                             // surface's format and extent, exactly as the contract
@@ -5291,14 +5375,7 @@ fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>>
 /// Nothing is cached: the copy is made once per submission, at the gate, which
 /// is the same freshness the GPU gather arm has (the bytes are read at
 /// execution) and at least as fresh as the engine's encode-time staging read.
-fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
-    // An empty bind and a window longer than the source states are the two
-    // shapes with nothing to copy: the owner rail refuses an empty staged
-    // request by name (`provider_owner::Decline::StagedEmpty`), which is a
-    // decline on an admitted draw, so both are answered here as a refusal.
-    if len == 0 || len > source.total_len {
-        return None;
-    }
+fn stage_run_bytes(source: &GuestRunSource, len: u64, site: GatherSite) -> Option<Vec<u8>> {
     // The seventh cut's own meter: this copy is the gather's product, one per
     // bind whose runs state no registered window, and every reader of these
     // bytes downstream (the staged lease's own `Vec`, the provider's upload)
@@ -5307,6 +5384,94 @@ fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
     let _span =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::LeaseGatherBytes);
     let mut out: Vec<u8> = Vec::with_capacity(usize::try_from(len).ok()?);
+    stage_run_walk(source, len, |start, take| {
+        // SAFETY: the source's own contract (`GuestRunSource`'s doc) is that
+        // every run's `host_ptr..+len` is already a live `HostOps::map_pages`
+        // alias when the source is built — the engine reads these same runs at
+        // execute time (`write_staging_from_runs`) and the sampled rails read
+        // them through `fold_runs`. `take <= run.len() - within` keeps the read
+        // inside the run, and the mapping outlives the copy: it is the guest's
+        // own RAMBlock, valid for the VM lifetime.
+        let bytes = unsafe { std::slice::from_raw_parts(start, take) };
+        out.extend_from_slice(bytes);
+    })?;
+    crate::runtime::drain::note_lease_vec(
+        crate::runtime::drain::LeaseVecMeter::GatherBytes,
+        1,
+        u64::try_from(out.len()).unwrap_or(u64::MAX),
+    );
+    // R-GW1: *which* of the walk's three gathers made this copy. The meter
+    // above is one number for all of them and is charged from the trace too
+    // (a proved declaration reads its bytes there), so it cannot say whether a
+    // call site stopped reading or merely moved; these two counts say it per
+    // site, and the arm that proves a read is held to one copy per declaration
+    // by `the_proved_gather_lands_the_same_frame_and_proves_the_read_once`.
+    let (copies, bytes) = site.routes();
+    crate::runtime::drain::note_store_route(copies);
+    crate::runtime::drain::note_store_route_n(bytes, u64::try_from(out.len()).unwrap_or(u64::MAX));
+    Some(out)
+}
+
+/// Which of the walk's three gathers one copy belongs to (`R-GW1`).
+///
+/// The three are the three call sites of [`stage_run_bytes`], and they are kept
+/// apart because a round that prices them together cannot tell a site that
+/// stopped copying from one whose bytes moved: the texture site is the one the
+/// proof arm leaves (its bytes are read by the trace instead), the two stream
+/// sites keep their reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GatherSite {
+    /// A sampled texture's own texels: the gate's `gathered_texture_source`, or
+    /// the trace that states a proved declaration.
+    Texture,
+    /// A vertex or index stream ([`stream_run_bytes`]).
+    Stream,
+    /// A stage buffer's bytes ([`stage_buffer_gate`]).
+    StageBuffer,
+}
+
+impl GatherSite {
+    /// This site's two counts, as `(copies, bytes)` route names.
+    fn routes(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Texture => (
+                "render_gather_copy_texture_n",
+                "render_gather_copy_texture_bytes",
+            ),
+            Self::Stream => (
+                "render_gather_copy_stream_n",
+                "render_gather_copy_stream_bytes",
+            ),
+            Self::StageBuffer => (
+                "render_gather_copy_stage_buffer_n",
+                "render_gather_copy_stage_buffer_bytes",
+            ),
+        }
+    }
+}
+
+/// The walk one gathered read is made of: `len` bytes from the source's own
+/// first byte, run by run, in copy order (`R-GW1`).
+///
+/// `at` is handed each run's own byte span — the pointer and the count a copy
+/// would read — so the caller decides whether to read it. One walk and two
+/// callers ([`stage_run_bytes`] and [`stage_run_len`]) rather than two walks
+/// because the *answer* has to be the same one: `None` is the same refusal in
+/// both, and a second implementation of this arithmetic could only drift from
+/// the copy it is supposed to be pricing.
+///
+/// An empty bind and a window longer than the source states are the two shapes
+/// with nothing to copy: the owner rail refuses an empty staged request by name
+/// (`provider_owner::Decline::StagedEmpty`), which is a decline on an admitted
+/// draw, so both are answered here as a refusal.
+fn stage_run_walk(
+    source: &GuestRunSource,
+    len: u64,
+    mut at: impl FnMut(*const u8, usize),
+) -> Option<u64> {
+    if len == 0 || len > source.total_len {
+        return None;
+    }
     let mut skip = source.source_offset;
     let mut copied = 0_u64;
     for run in source.runs.iter() {
@@ -5322,26 +5487,34 @@ fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
         let take = (run.len() - within).min(len - copied);
         let start = run.host_ptr().checked_add(usize::try_from(within).ok()?)?;
         let take = usize::try_from(take).ok()?;
-        // SAFETY: the source's own contract (`GuestRunSource`'s doc) is that
-        // every run's `host_ptr..+len` is already a live `HostOps::map_pages`
-        // alias when the source is built — the engine reads these same runs at
-        // execute time (`write_staging_from_runs`) and the sampled rails read
-        // them through `fold_runs`. `take <= run.len() - within` keeps the read
-        // inside the run, and the mapping outlives the copy: it is the guest's
-        // own RAMBlock, valid for the VM lifetime.
-        let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, take) };
-        out.extend_from_slice(bytes);
+        at(start as *const u8, take);
         copied += take as u64;
     }
     if copied != len {
         return None;
     }
-    crate::runtime::drain::note_lease_vec(
-        crate::runtime::drain::LeaseVecMeter::GatherBytes,
-        1,
-        u64::try_from(out.len()).unwrap_or(u64::MAX),
-    );
-    Some(out)
+    Some(copied)
+}
+
+/// Whether these runs cover `len` bytes from the source's own first byte, and
+/// how many bytes a copy would carry (`R-GW1`).
+///
+/// The same walk [`stage_run_bytes`] makes with no bytes read: the two answers
+/// are one function's, so a declaration the gate *proves* is a declaration the
+/// trace's read can state — the refusal is the copy's own, not a second rule
+/// that happens to agree with it.
+///
+/// Used by the arms that have to answer about a gathered read without stating
+/// its bytes (`REIMS_VGPU_GATE_PROVE_GATHER`, and the class probe's own calls):
+/// the bytes a copy would carry are counted here rather than measured, which is
+/// what makes the two arms' censuses read one population.
+fn stage_run_len(source: &GuestRunSource, len: u64) -> Option<u64> {
+    let _span =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::GateGatherProof);
+    let copied = stage_run_walk(source, len, |_, _| {})?;
+    crate::runtime::drain::note_store_route("render_gate_walk_gather_proofs_n");
+    crate::runtime::drain::note_store_route_n("render_gate_walk_gather_proven_bytes", copied);
+    Some(copied)
 }
 
 /// The attachment's own previous contents as the ordered list of owner windows
@@ -6306,7 +6479,7 @@ fn texture_payload_arm(source: &NarrowTextureSource<'_>) -> PayloadArm {
 #[cfg(test)]
 mod sampled_bind_read_tests {
     use super::{
-        note_sampled_bind_read, sampled_bind_arm, sampled_bind_pages, FoldedTexels,
+        note_sampled_bind_read, sampled_bind_arm, sampled_bind_pages, FoldedTexels, GatheredTexels,
         NarrowTextureSource, PaddedRows, StageBufferWindow,
     };
     use crate::backend::vulkan::engine::GuestRunSource;
@@ -6759,7 +6932,9 @@ mod sampled_bind_read_tests {
             );
         }
         assert_eq!(
-            sampled_bind_arm(&NarrowTextureSource::Gathered(Vec::new())),
+            sampled_bind_arm(&NarrowTextureSource::Gathered(GatheredTexels::Read(
+                Vec::new(),
+            ))),
             "gathered"
         );
         assert_eq!(sampled_bind_arm(&NarrowTextureSource::Bytes(&[])), "bytes");
@@ -7080,7 +7255,7 @@ fn stream_run_bytes(
     }
     let declared = source.total_len;
     let len = reach.map_or(declared, |reach| reach.min(declared));
-    let copy = stage_run_bytes(source, len)?;
+    let copy = stage_run_bytes(source, len, GatherSite::Stream)?;
     // The census' own reading of this arm: one route per bind that took it and
     // one byte total beside it, so a boot can say how much of the streams' own
     // traffic the CPU gather carries and what it costs per bind — beside the
@@ -10024,6 +10199,14 @@ fn highest_index(
     count: u32,
 ) -> Option<u64> {
     use crate::backend::vulkan::engine::IndexType;
+    // R-GW1: this decode is the one place in the walk that reads *bytes the
+    // guest wrote* rather than the request's own fields, so its cost scales with
+    // the draw's index count rather than with the walk's call count. Two counts:
+    // the population (every call that asked) and the work (the values the loop
+    // below would scan — charged beside the loop, so a buffer shorter than the
+    // draw's own count, which the caller refuses by name, is counted as the ask
+    // it was rather than as a scan that never happened).
+    crate::runtime::drain::note_store_route("render_gate_walk_index_scan_n");
     let width = match index_type {
         IndexType::U16 => 2,
         IndexType::U32 => 4,
@@ -10034,6 +10217,10 @@ fn highest_index(
         return None;
     }
     let mut highest = 0u64;
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_index_scanned_n",
+        u64::try_from(count).unwrap_or(u64::MAX),
+    );
     for chunk in bytes.chunks_exact(width).take(count) {
         let value = match index_type {
             IndexType::U16 => u64::from(u16::from_ne_bytes([chunk[0], chunk[1]])),
@@ -11232,7 +11419,7 @@ fn stage_buffer_gate<'a>(
         // engine under the refusal's own sentence below, unchanged.
         if bytes.is_none() && windows.is_empty() {
             if let BufferContent::GuestRuns(source) = bind.content {
-                if let Some(copy) = stage_run_bytes(source, bind_bytes) {
+                if let Some(copy) = stage_run_bytes(source, bind_bytes, GatherSite::StageBuffer) {
                     // The census' own reading of this arm: one route per bind
                     // that took it, and one byte total beside it, so a boot can
                     // say how much of the class's traffic the CPU gather
@@ -13852,6 +14039,61 @@ fn modules_one_memo_enabled() -> bool {
     })
 }
 
+/// The cut's own arm, forced by a test (`None` gives the switch back) — the
+/// shape [`set_gate_modules_one_memo_arm`] gives its own cut.
+static GATE_PROVE_GATHER_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the gathered sampled texture's proof arm for a test (R-GW1).
+///
+/// `None` restores the switch's own reading. The values are the three states
+/// one byte can carry: unset, off, on.
+pub fn set_gate_prove_gather_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    GATE_PROVE_GATHER_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the class gate *proves* a tight sampled gather's read instead of
+/// making it ([`GATE_PROVE_GATHER`](crate::config::GATE_PROVE_GATHER), R-GW1).
+///
+/// **Off unless a control word turns it on**: this is the arm the round that
+/// chose it fires, and the one that has to stay inert until that round has
+/// read it. Off, `gathered_texture_source` makes the copy it always made and
+/// every count, bar and landed byte is the path every round before this
+/// increment ran.
+///
+/// On, the *tight* shape — a bind whose gather carries no registered window,
+/// whose rows are the guest's own tight rows, and whose lane needs no channel
+/// plan — answers `SampledGatherExit::Uncovered` through the same run walk with
+/// no bytes read ([`stage_run_len`]), and the declaration states its bytes in
+/// the trace instead ([`GatheredTexels::Proved`]). The padded and folded shapes
+/// keep reading at the gate: their refusals are read out of the bytes.
+///
+/// Read once per gathered bind, so the environment lookup is cached: the gate
+/// is handed every draw's class probe and every draw's submission, and
+/// `config::switch` parses the variable each time it is asked.
+fn gate_prove_gather() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match GATE_PROVE_GATHER_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::switch(crate::config::GATE_PROVE_GATHER),
+            crate::config::Switch::On
+        )
+    })
+}
+
 fn submit_render_inner(
     inputs: &RenderRailInputs<'_>,
     req: &DrawRequest,
@@ -15950,7 +16192,89 @@ enum NarrowTextureSource<'a> {
     /// frame, R36's repacked rows and R41's folded plan do: no lease is minted
     /// for this arm either, so a pass whose only guest-backed bind is one of
     /// these keeps the in-process path.
-    Gathered(Vec<u8>),
+    Gathered(GatheredTexels<'a>),
+}
+
+/// The texels one gathered sampled bind's declaration states (`R-GW1`).
+///
+/// Two shapes, and the difference between them is *who reads the guest's own
+/// runs*: the walk, for the two arms whose answer is read out of the bytes
+/// (and for every arm while `REIMS_VGPU_GATE_PROVE_GATHER` is off, which is the
+/// default), or the trace that states the declaration.
+///
+/// # Why the read can move
+///
+/// The tight shape's refusal is the runs' own coverage
+/// ([`SampledGatherExit::Uncovered`]) and nothing about the bytes: the gate
+/// asks whether these runs hold this span, and the copy is only how it used to
+/// answer. [`stage_run_len`] is the same walk [`stage_run_bytes`] makes with no
+/// bytes read, so a declaration the gate proves is one the copy would have
+/// carried — and the walk that reaches `narrow_class` twice per record (the
+/// chain handoff's probe, then the submission) reads the guest's runs twice for
+/// one declaration, in a region R-GW1 measures at **2.9 ms per present frame**
+/// on the production shape.
+///
+/// The bytes are still read exactly once per *submission*, by
+/// [`NarrowTextureSource::stated_bytes`] — where the declaration's bytes are
+/// stated — so nothing about a landed frame changes, and the census keeps
+/// reading one population: `stage_run_len` counts the bytes it proved, so
+/// `render_provider_out_of_class_texture_source_bytes` reads the same number on
+/// both arms of the switch.
+#[derive(Clone)]
+enum GatheredTexels<'a> {
+    /// The texels the walk read itself: the padded rows it repacked (R36), the
+    /// lane's plan it folded (R41), or the one copy the tight shape makes while
+    /// the proof arm is off.
+    Read(Vec<u8>),
+    /// The read the walk proved instead of making: the bind's own live runs,
+    /// and the span the gate measured them to cover.
+    Proved {
+        /// The runs the declaration's bytes live in, in the source's own order.
+        source: &'a GuestRunSource,
+        /// The bytes the declaration states: the span [`stage_run_len`] proved
+        /// these runs cover.
+        span: u64,
+    },
+}
+
+impl GatheredTexels<'_> {
+    /// How many bytes this declaration states, without reading them (`R-GW1`).
+    fn declared_len(&self) -> u64 {
+        match self {
+            Self::Read(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Self::Proved { span, .. } => *span,
+        }
+    }
+
+    /// The bytes this declaration states, reading them if the walk only proved
+    /// them (`R-GW1`).
+    ///
+    /// The read arm hands back its own copy; the proved arm makes the read the
+    /// gate refused to make — the same walk, over the same runs, for the span
+    /// the gate measured — which is why the `Option` here is the same `Option`
+    /// the gate answered with rather than a second refusal that could disagree
+    /// with it.
+    fn stated_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Read(bytes) => Some(bytes.clone()),
+            Self::Proved { source, span } => {
+                // `R-GW1`'s own reading of where the read went: one route per
+                // declaration the trace reads out of the guest's runs, with its
+                // bytes beside it, so a round can read the walk's proofs
+                // (`render_gate_walk_gather_proofs_n`) against the reads that
+                // replaced them. The two have to be read together: the proof
+                // population is the *walk's*, which is reached twice per record
+                // a chain handoff probes, and this one is the submissions'.
+                let read = stage_run_bytes(source, *span, GatherSite::Texture)?;
+                crate::runtime::drain::note_store_route("render_trace_texture_gather_n");
+                crate::runtime::drain::note_store_route_n(
+                    "render_trace_texture_gather_bytes",
+                    u64::try_from(read.len()).unwrap_or(u64::MAX),
+                );
+                Some(read)
+            }
+        }
+    }
 }
 
 /// Where the one-byte texels of a folded bind come from (R41).
@@ -15999,18 +16323,49 @@ impl NarrowTextureSource<'_> {
     /// byte count — [`input_allocations`] when the view's allocation is minted
     /// and the declaration when the bytes are stated — so a padded gather's
     /// copy cannot be sized by one and stated by the other.
-    fn owned_bytes<'a>(
-        &'a self,
-        texture_copies: &'a TextureCopies,
-        index: u32,
-    ) -> Option<&'a [u8]> {
+    ///
+    /// Split in two by `R-GW1`, because the two readers no longer read the same
+    /// thing: this one answers the *count*, which a proved gather knows without
+    /// reading anything (`GatheredTexels::declared_len`), and
+    /// [`Self::stated_bytes`] answers the *bytes*, which only the trace that
+    /// states the declaration needs.
+    fn declared_len(&self, texture_copies: &TextureCopies, index: u32) -> Option<u64> {
         match self {
-            Self::Bytes(bytes) | Self::Frame(bytes) => Some(bytes),
-            Self::Gathered(bytes) => Some(bytes.as_slice()),
-            Self::Depadded { .. } | Self::Folded { .. } => texture_copies.bytes(index),
+            Self::Bytes(bytes) | Self::Frame(bytes) => {
+                Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            }
+            Self::Gathered(texels) => Some(texels.declared_len()),
+            Self::Depadded { .. } | Self::Folded { .. } => texture_copies
+                .bytes(index)
+                .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
             // E-TX15's snapshot carries no bytes of its own: what it reads is
             // the attachment's image, on the device, and the declaration names
             // the attachment's own allocation rather than minting one here.
+            Self::Produced { .. } | Self::Window { .. } | Self::EntrySnapshot => None,
+        }
+    }
+
+    /// The bytes this declaration states, read where the walk left them
+    /// (`R-GW1`).
+    ///
+    /// The reader that *states* a declaration: the request's own copy and the
+    /// caller's frame (R24) are already in hand, R36's repacked rows and R41's
+    /// widened ones (R41) come out of the gate's own copies, and a gathered bind
+    /// hands back either the copy the walk made or the read it proved
+    /// ([`GatheredTexels::stated_bytes`]).
+    ///
+    /// Returns owned bytes for every arm, because the declaration this feeds
+    /// (`TextureSource::OwnedBytes`) carries them; the arms that already have
+    /// the bytes on hand copy them here exactly as they did before this
+    /// increment, and the proved gather is the one arm that reads them here
+    /// instead of at the gate.
+    fn stated_bytes(&self, texture_copies: &TextureCopies, index: u32) -> Option<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) | Self::Frame(bytes) => Some(bytes.to_vec()),
+            Self::Gathered(texels) => texels.stated_bytes(),
+            Self::Depadded { .. } | Self::Folded { .. } => {
+                texture_copies.bytes(index).map(<[u8]>::to_vec)
+            }
             Self::Produced { .. } | Self::Window { .. } | Self::EntrySnapshot => None,
         }
     }
@@ -16677,6 +17032,46 @@ fn nonindexed_vertex_span(
     None
 }
 
+/// The walk's own denominator, and the two populations it is spent on
+/// (`R-GW1`).
+///
+/// One call per [`narrow_class`] entry, before any rule can return, so the count
+/// is the gate's whole population rather than the records that reached one arm.
+/// It is two counts and not one because the walk is reached **twice** for a
+/// record whose packet is handed over as a chain: once as the probe the record
+/// before it asks with (`render_class_probe`, `class_only == true`) and once as
+/// the submission itself, and only the second one's answer is used. A cut that
+/// prices the walk without that divisor cannot tell a walk that got cheaper
+/// from a walk that stopped being asked.
+#[inline]
+fn note_gate_walk_call(class_only: bool) {
+    crate::runtime::drain::note_store_route("render_gate_walk_n");
+    crate::runtime::drain::note_store_route(if class_only {
+        "render_gate_walk_probe_n"
+    } else {
+        "render_gate_walk_submit_n"
+    });
+}
+
+/// The run-list copy the walk's load arms and its landing view make (`R-GW1`).
+///
+/// One helper rather than four inline `to_vec` calls: the four sites are one
+/// mechanism (a `Vec` per record, sized by the window's own run count), and the
+/// reading a cut needs is that mechanism's total against the walk — which is
+/// what [`FrameSpan::ProvGateWalkCopies`] and the two counts beside it are.
+///
+/// Nothing about the answer moves: this is `runs.to_vec()` behind a name.
+fn copy_run_list(runs: &[StageBufferWindow]) -> Vec<StageBufferWindow> {
+    let _copy =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkCopies);
+    crate::runtime::drain::note_store_route("render_gate_walk_run_copies_n");
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_run_copied_n",
+        u64::try_from(runs.len()).unwrap_or(u64::MAX),
+    );
+    runs.to_vec()
+}
+
 /// Whether one request is the narrow class, and the facts the trace is built
 /// from when it is.
 ///
@@ -16792,6 +17187,13 @@ fn narrow_class<'a>(
     // module the provider cannot translate from reaching the registration.
     render_half_capabilities: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
+    // R-GW1: the walk's own denominator and its first region. The count is
+    // charged before any rule can return, so it is the gate's whole population;
+    // the bar below covers everything up to the load election, which is where
+    // the second region opens.
+    note_gate_walk_call(class_only);
+    let _walk_head =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkHead);
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
     // the mapping's generation, which the guest may advance between two records
@@ -17001,6 +17403,11 @@ fn narrow_class<'a>(
     // ordered window list (R32, E-TX6), or the guest's byte-exact clear. What
     // is left — a record whose previous contents are the attachment's own guest
     // backing — keeps the engine by name.
+    // R-GW1: the head region closes here and the load election's opens. The
+    // flags below are the arms' own bookkeeping and belong to the election.
+    drop(_walk_head);
+    let _walk_load =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkLoad);
     let mut carried_chain_middle = false;
     // R32: the two seed doors, counted where the bytes are chosen so the census
     // reads one positive number per arm rather than only the bucket that moved.
@@ -17140,7 +17547,7 @@ fn narrow_class<'a>(
             // elision's own currency test read.
             if let Some(AttachmentGuestWindow::Runs(runs)) = inputs.attachment_guest_window {
                 carried_attachment_guest_window = true;
-                NarrowLoad::GuestRuns(runs.to_vec())
+                NarrowLoad::GuestRuns(copy_run_list(runs))
             } else {
                 let (bytes, from_surface_resident) = match (
                     inputs.resident_source_bytes,
@@ -17244,7 +17651,7 @@ fn narrow_class<'a>(
             Some(AttachmentGuestWindow::Runs(runs)) => {
                 carried_attachment_guest_window = true;
                 carried_seed_guest_window = true;
-                NarrowLoad::GuestRuns(runs.to_vec())
+                NarrowLoad::GuestRuns(copy_run_list(runs))
             }
             Some(AttachmentGuestWindow::Refused(route)) => {
                 // The run-list facts answer under R32's own four names; the
@@ -17308,7 +17715,7 @@ fn narrow_class<'a>(
             })
         {
             carried_attachment_guest_window = true;
-            NarrowLoad::GuestRuns(runs.to_vec())
+            NarrowLoad::GuestRuns(copy_run_list(runs))
         } else
         // The mapper-ref-texture surface's seed: the request carries the
         // bytes themselves, as the ordered list of windows inside the surface's
@@ -17431,6 +17838,11 @@ fn narrow_class<'a>(
     // other identity does, and for a surface that is the whole of the relay's
     // population the census reads as `render_provider_out_of_class_relay_surface`
     // (3 257 refusals in census v42, 22 of one window's 47 refused probes).
+    // R-GW1: the load election closes here; the store election (the readback
+    // arms, the keep-frame promise, the landing view) is the next region.
+    drop(_walk_load);
+    let _walk_store =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkStore);
     let seed_is_guest_runs = matches!(load, NarrowLoad::GuestRuns(_));
     // R42c: keeping a frame is the moment the promise commits, so the keeper
     // re-states it against its own identity one last time. `chain_keeps_frame`
@@ -17707,7 +18119,7 @@ fn narrow_class<'a>(
             None
         };
         if let Some(runs) = landing_window {
-            landing = Some(runs.to_vec());
+            landing = Some(copy_run_list(runs));
             // E-TX14: the same window, delivered the other way round. The
             // caller states whether the device executes a landing-only entry
             // (`RenderRailInputs::kept_frame_landing`, read out of the same
@@ -17774,6 +18186,12 @@ fn narrow_class<'a>(
     // beside `resident_source_bytes`). A continuing record that would begin
     // from guest bytes of unknown provenance, or from nothing at all, keeps the
     // engine.
+    // R-GW1: the store election closes and the walk's own by-name ladder opens —
+    // this region and the raster half below it share one slot, because they are
+    // one mechanism at two positions.
+    drop(_walk_store);
+    let _walk_rules =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkRules);
     if req.continues_render_pass && !matches!(load, NarrowLoad::Resident(_) | NarrowLoad::Bytes(_))
     {
         return Err(OutOfClass::new(
@@ -17854,6 +18272,12 @@ fn narrow_class<'a>(
     // bytes as the trace's own, which is the only arm a *snapshot* admission can
     // evaluate an affine footprint over — and the same bytes the proof was
     // weighed against, so the two cannot be two readings of one window.
+    // R-GW1: the ladder's first half closes; the stage-buffer section is the
+    // next region.
+    drop(_walk_rules);
+    let _walk_stage_buffers = crate::runtime::drain::frame_span(
+        crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffers,
+    );
     let NarrowStageBuffers {
         buffers: stage_buffers,
         index_bytes: index_window_bytes,
@@ -17866,11 +18290,24 @@ fn narrow_class<'a>(
         stage_buffer_per_stage_ceiling,
         stage_buffer_binding_range,
     )?;
+    // The section's own denominator: one entry per stage buffer the statement
+    // carries, read off the statement the region just built rather than counted
+    // inside it, so a refused shape's partial count cannot be read as a walk
+    // that stated fewer buffers.
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_stage_buffers_n",
+        u64::try_from(stage_buffers.len()).unwrap_or(u64::MAX),
+    );
     // The sampled textures the fragment stage reads (v101, `research/docs/23`
     // §101): the class states the module's own declarations beside the draw's
     // binds — the canonical pass carries both, and the wire carries the pass's
     // texture list like any other view — and every shape the provider or the
     // module refuses keeps the engine under its own name ([`sampled_textures`]).
+    // R-GW1: the stage-buffer section closes; the sampled declarations are the
+    // next region.
+    drop(_walk_stage_buffers);
+    let _walk_sampling =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkSampling);
     let sampling = sampled_textures(
         inputs,
         req,
@@ -17896,6 +18333,17 @@ fn narrow_class<'a>(
         // section, which keeps the census's sentence for the wider list.
         render_texture_count_ceiling,
     )?;
+    // The region's own denominator: one entry per sampled texture the pass
+    // states.
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_textures_n",
+        u64::try_from(sampling.textures.len()).unwrap_or(u64::MAX),
+    );
+    // R-GW1: the sampled declarations close; the ladder's raster half opens,
+    // charged to the same slot as the half above the stage-buffer section.
+    drop(_walk_sampling);
+    let _walk_rules_raster =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkRules);
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_visibility",
@@ -17995,6 +18443,11 @@ fn narrow_class<'a>(
     // contract reads as `0..vertices` — and what it owes instead of those doors
     // is the span proof [`nonindexed_vertex_span`] states, answered below
     // because it is a statement about the vertex streams.
+    // R-GW1: the raster half of the ladder closes; the two stream tables and
+    // their proofs are the next region.
+    drop(_walk_rules_raster);
+    let _walk_streams =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkStreams);
     let (draw_count, index_stream, index_highest) = match req.indexed.as_ref() {
         Some(index) => {
             if index.index_count == 0 {
@@ -18169,6 +18622,11 @@ fn narrow_class<'a>(
     let mut vertex_streams: Vec<NarrowVertexStream<'_>> =
         Vec::with_capacity(req.vertex_attributes.len());
     for (head, attribute) in req.vertex_attributes.iter().enumerate() {
+        // R-GW1: the record loop's own denominator — one per attribute the
+        // request's layout declares, charged where the loop body starts so a
+        // shape refused inside the body is still counted as the record the walk
+        // read.
+        crate::runtime::drain::note_store_route("render_gate_walk_vertex_attrs_n");
         if attribute.step_function != VertexStepFunction::PerVertex {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_vertex_step",
@@ -18408,6 +18866,11 @@ fn narrow_class<'a>(
     // absent on the non-indexed one, so the sum this gate compares with the
     // pool's own bound is the number of views the trace really declares —
     // [`NarrowPass::views`] is the same sum read back at completion time.
+    // R-GW1: the stream region closes; the tail (the pool budget and the pass
+    // the walk hands back) is the last region.
+    drop(_walk_streams);
+    let _walk_tail =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkTail);
     let views = 1
         + vertex_streams.len()
         + usize::from(index_stream.is_some())
@@ -19882,10 +20345,11 @@ fn assemble_narrow_record(
         // a count and the bytes, and no byte of the declaration changes.
         crate::backend::texture_payload_census::note_declared(
             texture_payload_arm(&texture.source),
-            texture
-                .source
-                .owned_bytes(texture_copies, texture.index)
-                .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+            // R-GW1 renamed the helper: the census wants the *count* a
+            // declaration states, which a proved gather knows without reading
+            // its bytes (`declared_len`), not a borrow of bytes that may not
+            // have been read yet.
+            texture.source.declared_len(texture_copies, texture.index),
         );
         let (view_id, allocation_id, source) = match &texture.source {
             // R24's frame is the same arm one step further in: the bytes are
@@ -19911,9 +20375,8 @@ fn assemble_narrow_record(
                 TextureSource::OwnedBytes(
                     texture
                         .source
-                        .owned_bytes(texture_copies, texture.index)
-                        .expect("an admitted byte-bearing texture carries its bytes")
-                        .to_vec(),
+                        .stated_bytes(texture_copies, texture.index)
+                        .expect("an admitted byte-bearing texture carries its bytes"),
                 ),
             ),
             NarrowTextureSource::Produced { production, .. } => {
@@ -22400,14 +22863,13 @@ fn input_allocations(
         // the trace's view names that allocation rather than one of this
         // rail's own — its view *identity* below still advances, so a texture's
         // identity never depends on which arm it took.
-        let Some(bytes) = texture.source.owned_bytes(texture_copies, texture.index) else {
+        // R-GW1: the *count* only, which is what this call is for and the one
+        // thing a proved gather knows without reading its runs.
+        let Some(bytes) = texture.source.declared_len(texture_copies, texture.index) else {
             continue;
         };
         let view_number = texture_base + u64::try_from(index).unwrap_or(u64::MAX);
-        out.push((
-            input_allocation(view_number),
-            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        ));
+        out.push((input_allocation(view_number), bytes));
     }
     out
 }
