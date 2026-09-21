@@ -1326,25 +1326,20 @@ fn gathered_texture_source<'a>(
     let SampledRows { rows, .. } =
         sampled_rows(source, extent).map_err(|exit| texture_gather_refusal(index, &exit))?;
     let span = source.total_len;
-    let padded = stage_run_bytes(source, span)
-        .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
-    // The bytes this copy carried, read before the repack below consumes them:
-    // G1-C's histogram of the arm's own lengths reads this number, and it is the
-    // `span` the source declared unless the arm *is* this one.
-    let carried = u64::try_from(padded.len()).unwrap_or(u64::MAX);
-    // R-GW1: which *shape* this arm read, read before the match below moves the
-    // rows. The three are the three answers the copy is a function of, and they
-    // are the population a cut is chosen against: the tight and folded shapes'
-    // bytes are what the declaration states, while the padded shape's `depad`
-    // reads the bytes to *answer* (the repack's own row arithmetic is the
-    // refusal below). Padded takes precedence for a bind that is both, because
-    // the repack is the read that cannot be moved.
+    // R-GW1: which *shape* this bind is, and whether this call reads it or
+    // *proves* it. Both are read before the copy below, because the proof arm
+    // exists to **not** make it: the two shapes that keep reading need the bytes
+    // themselves — the repack reads them to answer about the rows it drops, and
+    // the fold reads them to widen one byte per texel — so the proof arm is the
+    // tight shape's, which is the one shape whose declaration states exactly the
+    // bytes the runs hold.
+    //
+    // The order of the two answers is the copy's own: `sampled_rows` first (the
+    // shape the source states), then the runs' coverage of `span` — which is why
+    // the proof is `stage_run_len` and not a second question. The proof arm's
+    // refusal is the copy's, byte for byte, from the same walk
+    // ([`stage_run_walk`]); what it does not do is read the bytes.
     let repacked = rows.is_some();
-    // R-GW1: whether this call reads the texels or *proves* the read. The two
-    // shapes below need the bytes themselves — the repack reads them to answer
-    // about the rows it drops, and the fold reads them to widen one byte per
-    // texel — so the proof arm is the tight shape's, which is the one shape
-    // whose declaration states exactly the bytes the runs hold.
     if !repacked && fold.is_none() && gate_prove_gather() {
         let carried = stage_run_len(source, span)
             .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
@@ -1354,6 +1349,12 @@ fn gathered_texture_source<'a>(
             span,
         }));
     }
+    let padded = stage_run_bytes(source, span, GatherSite::Texture)
+        .ok_or_else(|| texture_gather_refusal(index, &SampledGatherExit::Uncovered { span }))?;
+    // The bytes this copy carried, read before the repack below consumes them:
+    // G1-C's histogram of the arm's own lengths reads this number, and it is the
+    // `span` the source declared unless the arm *is* this one.
+    let carried = u64::try_from(padded.len()).unwrap_or(u64::MAX);
     let texels = match rows {
         // The repack's own shape check, the same one the window arm's copy
         // takes: the bytes on hand have to be the span the guest's stride and
@@ -5373,7 +5374,7 @@ fn gather_run_windows(source: &GuestRunSource) -> Option<Vec<StageBufferWindow>>
 /// Nothing is cached: the copy is made once per submission, at the gate, which
 /// is the same freshness the GPU gather arm has (the bytes are read at
 /// execution) and at least as fresh as the engine's encode-time staging read.
-fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
+fn stage_run_bytes(source: &GuestRunSource, len: u64, site: GatherSite) -> Option<Vec<u8>> {
     // The seventh cut's own meter: this copy is the gather's product, one per
     // bind whose runs state no registered window, and every reader of these
     // bytes downstream (the staged lease's own `Vec`, the provider's upload)
@@ -5398,7 +5399,54 @@ fn stage_run_bytes(source: &GuestRunSource, len: u64) -> Option<Vec<u8>> {
         1,
         u64::try_from(out.len()).unwrap_or(u64::MAX),
     );
+    // R-GW1: *which* of the walk's three gathers made this copy. The meter
+    // above is one number for all of them and is charged from the trace too
+    // (a proved declaration reads its bytes there), so it cannot say whether a
+    // call site stopped reading or merely moved; these two counts say it per
+    // site, and the arm that proves a read is held to one copy per declaration
+    // by `the_proved_gather_lands_the_same_frame_and_proves_the_read_once`.
+    let (copies, bytes) = site.routes();
+    crate::runtime::drain::note_store_route(copies);
+    crate::runtime::drain::note_store_route_n(bytes, u64::try_from(out.len()).unwrap_or(u64::MAX));
     Some(out)
+}
+
+/// Which of the walk's three gathers one copy belongs to (`R-GW1`).
+///
+/// The three are the three call sites of [`stage_run_bytes`], and they are kept
+/// apart because a round that prices them together cannot tell a site that
+/// stopped copying from one whose bytes moved: the texture site is the one the
+/// proof arm leaves (its bytes are read by the trace instead), the two stream
+/// sites keep their reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GatherSite {
+    /// A sampled texture's own texels: the gate's `gathered_texture_source`, or
+    /// the trace that states a proved declaration.
+    Texture,
+    /// A vertex or index stream ([`stream_run_bytes`]).
+    Stream,
+    /// A stage buffer's bytes ([`stage_buffer_gate`]).
+    StageBuffer,
+}
+
+impl GatherSite {
+    /// This site's two counts, as `(copies, bytes)` route names.
+    fn routes(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Texture => (
+                "render_gather_copy_texture_n",
+                "render_gather_copy_texture_bytes",
+            ),
+            Self::Stream => (
+                "render_gather_copy_stream_n",
+                "render_gather_copy_stream_bytes",
+            ),
+            Self::StageBuffer => (
+                "render_gather_copy_stage_buffer_n",
+                "render_gather_copy_stage_buffer_bytes",
+            ),
+        }
+    }
 }
 
 /// The walk one gathered read is made of: `len` bytes from the source's own
@@ -7183,7 +7231,7 @@ fn stream_run_bytes(
     }
     let declared = source.total_len;
     let len = reach.map_or(declared, |reach| reach.min(declared));
-    let copy = stage_run_bytes(source, len)?;
+    let copy = stage_run_bytes(source, len, GatherSite::Stream)?;
     // The census' own reading of this arm: one route per bind that took it and
     // one byte total beside it, so a boot can say how much of the streams' own
     // traffic the CPU gather carries and what it costs per bind — beside the
@@ -11336,7 +11384,7 @@ fn stage_buffer_gate<'a>(
         // engine under the refusal's own sentence below, unchanged.
         if bytes.is_none() && windows.is_empty() {
             if let BufferContent::GuestRuns(source) = bind.content {
-                if let Some(copy) = stage_run_bytes(source, bind_bytes) {
+                if let Some(copy) = stage_run_bytes(source, bind_bytes, GatherSite::StageBuffer) {
                     // The census' own reading of this arm: one route per bind
                     // that took it, and one byte total beside it, so a boot can
                     // say how much of the class's traffic the CPU gather
@@ -16172,7 +16220,7 @@ impl GatheredTexels<'_> {
                 // replaced them. The two have to be read together: the proof
                 // population is the *walk's*, which is reached twice per record
                 // a chain handoff probes, and this one is the submissions'.
-                let read = stage_run_bytes(source, *span)?;
+                let read = stage_run_bytes(source, *span, GatherSite::Texture)?;
                 crate::runtime::drain::note_store_route("render_trace_texture_gather_n");
                 crate::runtime::drain::note_store_route_n(
                     "render_trace_texture_gather_bytes",

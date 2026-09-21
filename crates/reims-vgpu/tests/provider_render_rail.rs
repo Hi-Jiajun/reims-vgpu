@@ -33133,7 +33133,11 @@ fn one_modules_memo_lands_the_same_frame_and_translates_fewer_modules() {
 /// - the arm that is taken is named: the proof arm charges
 ///   `render_gate_walk_gather_proofs_n` once and the trait's own bytes, the read
 ///   arm charges neither — while `render_gate_walk_texture_tight_n` (the shape
-///   the two arms agree about) counts one on both.
+///   the two arms agree about) counts one on both;
+/// - and the *copy* is one on either arm: the read arm makes it at the gate, the
+///   proof arm at the trace that states the declaration, and an arm that made
+///   both (a proof that left the gate's own copy behind it) would read two
+///   (`render_gather_copy_texture_n`, charged inside `stage_run_bytes`).
 #[test]
 fn the_proved_gather_lands_the_same_frame_and_proves_the_read_once() {
     use reims_vgpu::backend::provider_compute::host_import_alignment;
@@ -33204,6 +33208,8 @@ fn the_proved_gather_lands_the_same_frame_and_proves_the_read_once() {
         let gathered_bytes = route_count("render_provider_out_of_class_texture_source_bytes");
         let proofs = route_count("render_gate_walk_gather_proofs_n");
         let proven_bytes = route_count("render_gate_walk_gather_proven_bytes");
+        let copies = route_count("render_gather_copy_texture_n");
+        let trace_reads = route_count("render_trace_texture_gather_n");
         let tight = route_count("render_gate_walk_texture_tight_n");
         let refusals = route_count("render_provider_out_of_class_texture_source");
         let submissions = provider_render::provider_submissions();
@@ -33214,6 +33220,8 @@ fn the_proved_gather_lands_the_same_frame_and_proves_the_read_once() {
             route_count("render_provider_out_of_class_texture_source_bytes") - gathered_bytes,
             route_count("render_gate_walk_gather_proofs_n") - proofs,
             route_count("render_gate_walk_gather_proven_bytes") - proven_bytes,
+            route_count("render_gather_copy_texture_n") - copies,
+            route_count("render_trace_texture_gather_n") - trace_reads,
             route_count("render_gate_walk_texture_tight_n") - tight,
             route_count("render_provider_out_of_class_texture_source") - refusals,
             provider_render::provider_submissions() - submissions,
@@ -33227,6 +33235,8 @@ fn the_proved_gather_lands_the_same_frame_and_proves_the_read_once() {
         read_bytes_n,
         read_proofs,
         _,
+        read_copies,
+        read_trace_reads,
         read_tight,
         read_refusals,
         read_subs,
@@ -33237,6 +33247,8 @@ fn the_proved_gather_lands_the_same_frame_and_proves_the_read_once() {
         proved_bytes_n,
         proved_proofs,
         proved_proven,
+        proved_copies,
+        proved_trace_reads,
         proved_tight,
         proved_refusals,
         proved_subs,
@@ -33286,6 +33298,19 @@ fn the_proved_gather_lands_the_same_frame_and_proves_the_read_once() {
     assert_eq!(
         proved_proven, extent,
         "the proof carries exactly the bytes the declaration states"
+    );
+    assert_eq!(
+        (read_copies, proved_copies),
+        (1, 1),
+        "one declaration's bytes are read once on either arm: the read arm copies at the gate, the \
+         proof arm at the trace -- an arm that copied at the gate *and* read at the trace would \
+         count two"
+    );
+    assert_eq!(
+        (read_trace_reads, proved_trace_reads),
+        (0, 1),
+        "and the trace is what reads them on the proof arm: the read arm's declaration carries the \
+         gate's own copy, so it reads nothing there"
     );
     assert_eq!(
         (read_refusals, proved_refusals),
