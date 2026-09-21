@@ -912,6 +912,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::backend::texture_payload_census::PayloadArm;
 use metal_api_core::provider::{
     half_to_f32, AcquirePolicy, AffineAccess, AllocationId, AllocationRecord, AttachmentFormat,
     AttachmentLandingView, BlendAttachment, BlendFactor, BlendFactorSlot, BlendOperation,
@@ -6279,6 +6280,29 @@ fn sampled_bind_arm(stated: &NarrowTextureSource<'_>) -> &'static str {
     }
 }
 
+/// The payload arm one admitted texture's declaration will be counted under
+/// (E-SW3, the statement economy's W4), in the census's own vocabulary.
+///
+/// One answer per source variant, so a variant added to the enum has to say
+/// which arm it is a spelling of rather than falling into a neighbour's
+/// counter. The fold's three carriers (`folded_window`/`folded_rows`/
+/// `folded_bytes`) are one arm here — what the census reads is the bytes the
+/// declaration states, and all three are the class gate's own widened copy —
+/// while the window arm itself is apart from them, because its bytes travel as
+/// a lease rather than as the trace's own copy.
+fn texture_payload_arm(source: &NarrowTextureSource<'_>) -> PayloadArm {
+    match source {
+        NarrowTextureSource::Bytes(_) => PayloadArm::Trace,
+        NarrowTextureSource::Frame(_) => PayloadArm::Frame,
+        NarrowTextureSource::Gathered(_) => PayloadArm::Gathered,
+        NarrowTextureSource::Depadded { .. } => PayloadArm::Depadded,
+        NarrowTextureSource::Folded { .. } => PayloadArm::Folded,
+        NarrowTextureSource::Window { .. } => PayloadArm::Window,
+        NarrowTextureSource::Produced { .. } => PayloadArm::Produced,
+        NarrowTextureSource::EntrySnapshot => PayloadArm::Snapshot,
+    }
+}
+
 #[cfg(test)]
 mod sampled_bind_read_tests {
     use super::{
@@ -10303,6 +10327,17 @@ fn note_wire_render_textures(trace: &ComputeTrace) {
             // provider's `0x00 0x08` capability bit; what this arm states is the
             // declaration the wire now carries.
             Some(TextureSource::PassEntrySnapshot) => "pass_entry_snapshot".to_owned(),
+            // The statement payload table's two arms (statement economy W4,
+            // task E-SW3): this diagnostic reads the trace the rail is about
+            // to state, so it prints whichever of the two the plan left there —
+            // the resolution that turns both into `owned_bytes` runs on the
+            // *decoded* trace, which is the other side of the seam.
+            Some(TextureSource::OwnedInSlot { slot, bytes }) => {
+                format!("owned_in_slot={slot}:{}", bytes.len())
+            }
+            Some(TextureSource::SlottedBytes { slot, length, .. }) => {
+                format!("slotted_bytes={slot}:{length}")
+            }
             None => "view=absent".to_owned(),
         };
         crate::observe::line(format!(
@@ -11597,6 +11632,16 @@ fn production_bytes(pass: &NarrowPass<'_>, descriptor: &mut RenderPassDescriptor
             continue;
         };
         let bytes = provider_owner::window_bytes(owner_window(*binding, *window)).ok()?;
+        // E-SW3: this is the one site outside the declaring walk that states a
+        // sampled texture's bytes as the trace's own copy — a window arm
+        // restated by a trace that re-runs a recorded production, read out of
+        // the registration a second time. Charged under its own arm, so the
+        // census can say how much of the payload is a re-read rather than a
+        // gather.
+        crate::backend::texture_payload_census::note_declared(
+            crate::backend::texture_payload_census::PayloadArm::Restate,
+            Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+        );
         descriptor.textures[index].source = TextureSource::OwnedBytes(bytes);
     }
     Some(())
@@ -19831,6 +19876,17 @@ fn assemble_narrow_record(
         // agree by construction). The view number still advances for a
         // produced texture, so the numbering `input_allocations` derives stays
         // in lockstep with the views stated here.
+        // E-SW3: the census's own reading of this declaration, charged where
+        // the arm and the payload it states are both in hand — the origin
+        // split of the statement's texture payload. Off, one relaxed load; on,
+        // a count and the bytes, and no byte of the declaration changes.
+        crate::backend::texture_payload_census::note_declared(
+            texture_payload_arm(&texture.source),
+            texture
+                .source
+                .owned_bytes(texture_copies, texture.index)
+                .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+        );
         let (view_id, allocation_id, source) = match &texture.source {
             // R24's frame is the same arm one step further in: the bytes are
             // the caller's copy of the target image, declared for this view
@@ -21294,7 +21350,7 @@ fn finish_narrow_records(
     // states and the completion reads the records where they lie — and the cut's
     // arm splits each record into the half the walk takes by value and the half
     // the completion reads, with nothing copied between them.
-    let (trace, answers) = if trace_pass_owned_enabled() {
+    let (mut trace, answers) = if trace_pass_owned_enabled() {
         let (walk_records, answers) = split_narrow_records(records);
         (
             narrow_trace_owned(provider, walk_records),
@@ -21306,6 +21362,25 @@ fn finish_narrow_records(
     };
     debug_assert_eq!(answers.len(), leases.len());
     debug_assert!(!answers.is_empty());
+    // E-SW3: one reading per statement, taken on the trace this rail is about
+    // to state — what its texture payload is made of (the arms the declaring
+    // walk charged) and how much of that payload repeats bytes the same
+    // statement, or an earlier one, already carried. The walk reads; it writes
+    // nothing, in either switch state.
+    crate::backend::texture_payload_census::note_statement(&trace);
+    // E-SW3: the payload table's own plan for this statement, taken on the
+    // statements that will cross the wire — a trace whose records state no
+    // lease at all keeps the in-process path, and there is no wire to take
+    // bytes off on it, so its declarations are left exactly as they were. The
+    // plan rewrites the trace's byte-carrying declarations (naming what the
+    // ledger already holds, filing what it does not) and owes the ledger those
+    // filings once the provider's reader has resolved the frame below.
+    let crosses_the_wire = !leases.iter().all(Option::is_none);
+    let mut planned = if crosses_the_wire {
+        crate::backend::statement_payload::plan(&mut trace)
+    } else {
+        crate::backend::statement_payload::PlannedStatement::default()
+    };
     // R9j/R9q: a pass that declares a stage buffer — or, since R9q, carries a
     // vertex stream through the owner's window — crosses the owner→provider
     // wire before anything is admitted. The frame is the payload (every
@@ -21373,9 +21448,26 @@ fn finish_narrow_records(
             provider_wire::carried_submission(&frame)
         };
         match carried {
-            Ok((trace, resources)) => {
+            Ok((mut trace, resources)) => {
                 note_wire_stage_buffers(&trace);
                 note_wire_render_textures(&trace);
+                // E-SW3: the frame's own payload-table arms, resolved where a
+                // provider's reader resolves what the frame carried — one call
+                // on the decoded trace, before anything of it is admitted. The
+                // two ends hold the same table only after this returns: a
+                // refusal here leaves the provider's table exactly as it was
+                // and drops this statement's plan with it (the `planned`
+                // binding below is not committed), which is why the ledger is
+                // charged after the call rather than before it.
+                if planned.any() {
+                    if let Err(error) = provider.resolve_statement_payloads(&mut trace) {
+                        abort_narrow_leases(&mut leases, provider);
+                        return Err(ProviderRenderDecline::TraceAdmission {
+                            detail: provider_error_detail(&error),
+                        });
+                    }
+                    planned.commit();
+                }
                 (trace, resources)
             }
             Err(decline) => {

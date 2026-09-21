@@ -147,6 +147,23 @@ pub mod provider_wire;
 #[cfg(feature = "provider-compute")]
 pub mod provider_owner;
 
+/// The sampled-texture statement payload census (task E-SW3, W4 of the
+/// statement economy): what one statement's texture payload is made of, by the
+/// arm that stated each declaration, and how much of that payload is a repeat
+/// of bytes the same statement — or an earlier one — already carried.
+///
+/// Present wherever a rail can state a texture, because it reads the trace
+/// both rails state, and default off (`REIMS_VGPU_TEXTURE_PAYLOAD_CENSUS`): off,
+/// every entry point is one relaxed load and no frame's bytes change either way.
+#[cfg(any(feature = "provider-render", feature = "provider-compute"))]
+pub mod texture_payload_census;
+
+/// The owner's half of the statement payload table (statement economy W4, task
+/// E-SW3): what one statement files in the provider's payload table and what it
+/// names instead of carrying, default off.
+#[cfg(any(feature = "provider-render", feature = "provider-compute"))]
+pub mod statement_payload;
+
 /// The encoder one rail holds open across a compute segment — the one type
 /// besides [`SelectedBackend`] whose shape is neutral and whose contents are a
 /// rail's.

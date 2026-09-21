@@ -1407,12 +1407,23 @@ fn the_texture_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
     assert_eq!(view.metal_binding, declaration.metal_binding);
     assert_eq!(view.format, declaration.format);
     match &view.source {
-        metal_api_core::provider::TextureSource::OwnedBytes(bytes) => assert_eq!(
+        // The three spellings the wire has for these texels since the statement
+        // payload table (E-SW3): the shipped one carries them, the table's
+        // declaration arm carries them *and* files them under a slot, and its
+        // reference arm names what this same frame's earlier submission filed —
+        // which is the same 64 bytes. What this test is about is that the texels
+        // are stated by the wire view, so it holds in all three.
+        metal_api_core::provider::TextureSource::OwnedBytes(bytes)
+        | metal_api_core::provider::TextureSource::OwnedInSlot { bytes, .. } => assert_eq!(
             bytes.len(),
             64,
             "the staged texels crossed the wire in the view"
         ),
-        other => panic!("the reviewed texture source is owned bytes: {other:?}"),
+        metal_api_core::provider::TextureSource::SlottedBytes { length, .. } => assert_eq!(
+            *length, 64,
+            "the view names the staged texels this frame already carried"
+        ),
+        other => panic!("the reviewed texture source is the staged texels: {other:?}"),
     }
 
     // The capability answer, read the way the class gate reads it: out of the
