@@ -7822,6 +7822,151 @@ fn the_trace_walk_hands_the_provider_the_same_frame_whether_it_copies_or_takes_t
     );
 }
 
+/// W2-A (RAIL): the two zero-fill declarations' own cut, read on the wire that
+/// carried the submission and on the frame the provider landed.
+///
+/// One scenario — the reviewed narrow draw, whose declaring pass states the
+/// attachment's own view and every in-flight production — is run **twice in
+/// this one process**: once with those declarations carrying their zeros (the
+/// arm every round before this cut ran) and once with them stating the
+/// contract's zero-fill arm (`REIMS_VGPU_ZERO_FILL_DECL=on`, forced through
+/// [`provider_render::set_zero_fill_decl_arm`] because a switch read through a
+/// `OnceLock` cannot be put back and the two arms have to be two statements of
+/// *one* scenario). Four readings have to hold at once, and each one can fail
+/// on its own:
+///
+/// * the same views are declared in both arms, and every view whose arm states
+///   the zero fill stands in the other arm for a payload that is all zeros of
+///   exactly that length — the arm is not a licence to state content;
+/// * the owner→provider frame is shorter by exactly the bytes the declarations
+///   stand for, so those bytes really did leave the statement;
+/// * the statement's own section account reads the same **declared** bytes and
+///   that many fewer payload bytes (`metal_api_ipc::statement`), which is the
+///   mechanism reading a census round is judged on;
+/// * the frame the provider lands is byte-identical, so the arm meant the same
+///   content rather than merely travelling smaller.
+#[test]
+fn the_zero_fill_declaration_arm_ships_the_same_frame_without_the_bytes() {
+    let _guard = engine_test_session();
+    let stages = reviewed_stages();
+    let req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+
+    let run = |arm: bool| {
+        provider_render::set_zero_fill_decl_arm(Some(arm));
+        provider_wire::capture_submission_frames(true);
+        let deliveries = provider_render::provider_submissions();
+        metal_api_ipc::statement::set_enabled(true);
+        let _ = metal_api_ipc::statement::take();
+        let frame = match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &req,
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+            other => panic!("the reviewed narrow shape is in class: {other:?}"),
+        };
+        let account = metal_api_ipc::statement::take();
+        metal_api_ipc::statement::set_enabled(false);
+        let frames = provider_wire::captured_submission_frames();
+        provider_wire::capture_submission_frames(false);
+        assert!(
+            provider_render::provider_submissions() > deliveries,
+            "the shape reached the canonical provider instead of the engine"
+        );
+        (frames, frame, account)
+    };
+    let (payload_frames, payload, payload_account) = run(false);
+    let (arm_frames, arm, arm_account) = run(true);
+    provider_render::set_zero_fill_decl_arm(None);
+
+    assert_eq!(
+        payload_frames.len(),
+        1,
+        "one scenario, one submission scope, one owner→provider frame"
+    );
+    assert_eq!(
+        arm_frames.len(),
+        1,
+        "and the increment arm states the same one — a trace that crossed the wire twice, or not \
+         at all, would not be the shape this cut leaves alone"
+    );
+    assert_eq!(
+        arm, payload,
+        "the frame the two declarations land is the same frame, texel for texel"
+    );
+
+    // The two statements declare the same views; where one states the arm, the
+    // other states the payload that arm stands for, and nowhere else do they
+    // differ.
+    let declarations = |trace: &metal_api_core::provider::ComputeTrace| {
+        trace
+            .serial_resources()
+            .expect("the trace's own serial pool")
+            .into_iter()
+            .map(|resource| (resource.view().view_id, resource.view().source.clone()))
+            .collect::<Vec<_>>()
+    };
+    let (arm_trace, _) = provider_wire::carried_submission(&arm_frames[0])
+        .expect("the provider's own decoder reads the arm's frame");
+    let (payload_trace, _) = provider_wire::carried_submission(&payload_frames[0])
+        .expect("and the payload arm's frame");
+    let arm_declarations = declarations(&arm_trace);
+    let payload_declarations = declarations(&payload_trace);
+    assert_eq!(
+        arm_declarations.len(),
+        payload_declarations.len(),
+        "the same pool, declared once per view in both arms"
+    );
+    let mut declared = 0_u64;
+    let mut arms = 0_u64;
+    for ((arm_view, arm_source), (payload_view, payload_source)) in arm_declarations
+        .iter()
+        .zip(payload_declarations.iter())
+    {
+        assert_eq!(arm_view, payload_view, "the same view in both arms");
+        match (arm_source, payload_source) {
+            (BufferSource::ZeroFill { length }, BufferSource::OwnedBytes(bytes)) => {
+                assert!(
+                    bytes.iter().all(|byte| *byte == 0),
+                    "the arm stands for a zero fill and nothing else"
+                );
+                assert_eq!(
+                    u64::try_from(bytes.len()).expect("payload length"),
+                    *length,
+                    "the arm's length is the payload's own"
+                );
+                declared += *length;
+                arms += 1;
+            }
+            (left, right) => assert_eq!(
+                left, right,
+                "every declaration the cut does not re-encode is the same value in both arms"
+            ),
+        }
+    }
+    assert!(
+        arms > 0,
+        "the record's own declarations take the arm when it is asked for"
+    );
+    assert_eq!(
+        u64::try_from(payload_frames[0].len() - arm_frames[0].len()).expect("frame length"),
+        declared,
+        "the arm's frame is the payload's minus exactly the bytes its declarations stand for"
+    );
+    assert_eq!(
+        payload_account.view_payload_bytes - arm_account.view_payload_bytes,
+        declared,
+        "and the statement's own section account reads those bytes leaving the payload"
+    );
+    assert_eq!(
+        arm_account.view_declared_bytes, payload_account.view_declared_bytes,
+        "the declared bytes do not move: only the payload that stated them does"
+    );
+    assert_eq!(
+        arm_account.frames, payload_account.frames,
+        "one statement each: the arm re-encodes a declaration, it does not drop a submission"
+    );
+}
+
 /// E-TX14 (RAIL-A): the same tail, the same window, and a device that delivers
 /// the kept frame through a landing-only entry instead of publishing it.
 ///
@@ -20554,6 +20699,7 @@ fn a_stage_buffer_gather_scattered_over_two_registered_stretches_leaves_without_
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
         BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
     };
     eprintln!(
         "wire stage-buffer view: stage={:?} offset={} length={} source={source}",
@@ -20816,6 +20962,7 @@ fn an_unaligned_stage_buffer_window_is_copied_into_the_owner_staged_arm() {
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
         BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
     };
     eprintln!(
         "wire stage-buffer view: stage={:?} offset={} length={} source={source}",
@@ -21371,6 +21518,7 @@ fn a_gather_whose_runs_state_no_window_is_gathered_into_the_staged_arm() {
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
         BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
     };
     eprintln!(
         "wire stage-buffer view: stage={:?} offset={} length={} source={source}",
@@ -21914,6 +22062,7 @@ fn a_vertex_stream_shared_by_two_attributes_reads_its_guest_window_without_a_cop
             BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
             BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
             BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
         };
         eprintln!(
             "wire vertex view: binding={} offset={} length={} source={source}",
@@ -22196,6 +22345,7 @@ fn an_index_stream_in_a_registered_window_leaves_without_a_copy() {
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
         BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
     };
     eprintln!(
         "wire index view: binding={} offset={} length={} source={source}",
@@ -22836,6 +22986,7 @@ fn an_unaligned_index_stream_window_is_copied_into_the_owner_staged_arm() {
         BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
         BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
         BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
     };
     eprintln!(
         "wire index view: offset={} length={} source={source}",
@@ -23449,6 +23600,7 @@ fn an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm() {
             BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
             BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
             BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
+        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
         })
         .collect();
     eprintln!("wire vertex views: {arms:?}");
@@ -24730,6 +24882,9 @@ fn the_declaration_crosses_the_wire_and_the_provider_reads_it_back() {
         }
         metal_api_core::provider::BufferSource::GuestRuns(runs) => {
             format!("guest_runs={}", runs.len())
+        }
+        metal_api_core::provider::BufferSource::ZeroFill { length } => {
+            format!("zero_fill={length}")
         }
     };
     eprintln!(
