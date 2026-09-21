@@ -1401,6 +1401,59 @@ pub const CAPTURE_PROBE: &str = "REIMS_VGPU_CAPTURE_PROBE";
 /// with the same bytes lent instead of materialized); the control words put the
 /// pre-cut path — the `to_vec` statement — back.
 pub const SEAM_FRAME_BORROW: &str = "REIMS_VGPU_SEAM_FRAME_BORROW";
+
+/// **Default off.** `on` gives every resident render target a **content
+/// version** and meters the seam's two whole-frame reads against it: the
+/// `(identity, allocation, view, version)` each read answers from, the bytes it
+/// moved, and how many of the reads re-asked for a version the seam had already
+/// read.
+///
+/// # Why the registry has to change before the reads can be judged
+///
+/// The sixth round's production profile (`guest import off`, 300 s) leaves two
+/// bars standing at **27.4 ms/frame — 7.0 % of the host's 393.7 ms frame**, and
+/// both are synchronous stops rather than µs of throughput:
+/// `seam_frame_chain_us_mean` **15 007** (the record's own attachment, read out
+/// of the registry for R23's byte arm) and `seam_sample_frames_us_mean`
+/// **12 383** (R24's reads of the targets a record samples, 413 over 439
+/// frames).
+///
+/// The repair the report points at is the G1-A family — a window/lease, or a
+/// memo keyed by `(identity, generation)` — and the second of those is only
+/// worth building if the same target is read twice at one version. **That
+/// question cannot be asked of today's registry**: `content_epoch` is a
+/// mapping-level stamp that any draw clears, `generation` is part of the
+/// identity *key* rather than a version of its pixels, and `ResidentAccess`
+/// states what last touched an image, not which pixels a second read would
+/// find. A memo keyed on the identity alone would serve a frame the guest has
+/// already painted over.
+///
+/// So this switch adds the one field the question needs — a monotonic content
+/// serial, bumped on every recorded write into a resident — and reports what
+/// each read found. Nothing it reports is a decision: the reads still happen,
+/// the bytes still travel, and off is today's device exactly.
+///
+/// # What it reports, and where
+///
+/// Eleven `store_routes` counters per seam (`seam_read_chain_*`,
+/// `seam_read_sample_*`), read as a rate per frame against the frame profile's
+/// own `frames`: the attempts, the reads that returned a frame, the reads that
+/// declined, the bytes, how many attempts found a resident and what versions it
+/// carried (`_witness_n`, `_serial_n`, `_epoch_n`), how many repeated the
+/// previous read's identity and key generation (`_same_n`, `_memo_n`), and — the
+/// number the memo's whole case rests on — how many re-asked for a version the
+/// seam had already read (`_hit_n`, with `_hit_bytes` for the bytes that
+/// decision would have deleted).
+///
+/// # What it costs
+///
+/// Off is one relaxed load per **read attempt** and nothing else: no serial is
+/// minted, no field is written, no counter moves, and the registry read it
+/// prices is the one this device already made. On, each read attempt adds one
+/// engine-lock acquisition for the witness and a relaxed-add per counter, and
+/// each recorded write into a resident adds one relaxed add — a cost paid on
+/// the publish path, never on the encoder's.
+pub const SEAM_READ_GENERATION: &str = "REIMS_VGPU_SEAM_READ_GENERATION";
 }
 
 counts! {

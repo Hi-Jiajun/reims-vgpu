@@ -3422,6 +3422,11 @@ fn each_seam_bar_is_charged_only_its_own_region() {
             "seam_sample_frames_us_mean",
             11_000,
         ),
+        (
+            FrameSpan::SeamSampleRead,
+            "seam_sample_read_us_mean",
+            12_000,
+        ),
     ];
     let c = FrameProfileCensus::with_report_ms(15);
     assert!(c.note_present(1_000_000, 1_000, false).is_none());

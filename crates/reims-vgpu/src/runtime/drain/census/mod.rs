@@ -804,11 +804,32 @@ pub(crate) enum FrameSpan {
     /// meters are read side by side: equal byte counts mean the same frame was
     /// reproduced twice between the seam and the wire.
     AttachDeclare = 52,
+    /// The registry read inside [`Self::SeamSampleFrames`] — R24's
+    /// `read_target_four_byte_color`, one call per sampled GPU target the
+    /// caller hands a frame for, carved out of its own parent.
+    ///
+    /// # Why the parent was not enough
+    ///
+    /// The sixth round's production profile reads `seam_sample_frames_us_mean`
+    /// **12 383 µs/frame** against 413 handed-over frames in 439 frames, and
+    /// the parent is not the read: it brackets the whole of
+    /// `sampled_target_frames`, whose loop asks `sampled_target_declared` for
+    /// every bind of every record (that call takes the production registry's
+    /// own lock) and takes a read for the few binds that survive it. Dividing
+    /// the parent by the read count would therefore price the loop as a read
+    /// and point the next cut at the wrong statement. This bar brackets the
+    /// read and nothing else; `seam_sample_frames_us_mean` minus it is the
+    /// loop, and that split is what the round is read on.
+    ///
+    /// Unlike the eleven others, it carries no counter of its own: the read
+    /// count is `seam_read_sample_n`, which is charged by the meter that the
+    /// same switch turns on.
+    SeamSampleRead = 53,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::AttachDeclare as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::SeamSampleRead as usize + 1;
 
 /// One byte source the owner mints for the attachment's own declaration, with
 /// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
@@ -1196,6 +1217,10 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "prov_trace_pipeline_clone_us_mean",
     // The attachment declaration's own byte source (W2's R-side half).
     "attach_declare_us_mean",
+    // R-SR2: the read inside `sampled_target_frames`, carved out of
+    // `seam_sample_frames_us_mean` so a round can divide the seam's µs by the
+    // reads it actually paid them for.
+    "seam_sample_read_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.
