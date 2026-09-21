@@ -26655,6 +26655,15 @@ fn texture_source_arm(source: &TextureSource) -> String {
         // E-TX15's pass-entry snapshot arm names no bytes of its own: the
         // provider reads the attachment as it stood when the pass opened.
         TextureSource::PassEntrySnapshot => "pass_entry_snapshot".to_owned(),
+        // The statement payload table's two arms (statement economy W4, task
+        // E-SW3): a declaration carries its bytes and the slot they are filed
+        // under, a reference names one and carries none.
+        TextureSource::OwnedInSlot { slot, bytes } => {
+            format!("owned_in_slot={slot}:{}", bytes.len())
+        }
+        TextureSource::SlottedBytes { slot, length, .. } => {
+            format!("slotted_bytes={slot}:{length}")
+        }
     }
 }
 

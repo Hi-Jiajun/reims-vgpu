@@ -10490,6 +10490,18 @@ fn note_wire_render_textures(trace: &ComputeTrace) {
             // provider's `0x00 0x08` capability bit; what this arm states is the
             // declaration the wire now carries.
             Some(TextureSource::PassEntrySnapshot) => "pass_entry_snapshot".to_owned(),
+            // The statement payload table's two arms (E-SW3): a declaration
+            // either files its bytes into the provider's table or names the
+            // slot an earlier statement filed. The diagnostic prints the same
+            // shape the other byte-carrying arms do — how many bytes this
+            // declaration states — so a wire transcript reads the same whether
+            // the bytes travelled or were named.
+            Some(TextureSource::OwnedInSlot { bytes, .. }) => {
+                format!("owned_in_slot={}", bytes.len())
+            }
+            Some(TextureSource::SlottedBytes { length, .. }) => {
+                format!("slotted_bytes={length}")
+            }
             None => "view=absent".to_owned(),
         };
         crate::observe::line(format!(
