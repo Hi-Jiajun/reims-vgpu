@@ -1329,6 +1329,14 @@ fn gathered_texture_source<'a>(
     // G1-C's histogram of the arm's own lengths reads this number, and it is the
     // `span` the source declared unless the arm *is* this one.
     let carried = u64::try_from(padded.len()).unwrap_or(u64::MAX);
+    // R-GW1: which *shape* this arm read, read before the match below moves the
+    // rows. The three are the three answers the copy is a function of, and they
+    // are the population a cut is chosen against: the tight and folded shapes'
+    // bytes are what the declaration states, while the padded shape's `depad`
+    // reads the bytes to *answer* (the repack's own row arithmetic is the
+    // refusal below). Padded takes precedence for a bind that is both, because
+    // the repack is the read that cannot be moved.
+    let repacked = rows.is_some();
     let texels = match rows {
         // The repack's own shape check, the same one the window arm's copy
         // takes: the bytes on hand have to be the span the guest's stride and
@@ -1362,6 +1370,28 @@ fn gathered_texture_source<'a>(
     note_length(TEXTURE_SOURCE_LENGTHS.declared, span);
     note_length(TEXTURE_SOURCE_LENGTHS.copied, carried);
     note_texture_copy_identity(source, span);
+    // R-GW1: the shape the flag above read out of the request, counted here
+    // beside the bytes it carried, so the three populations are read as
+    // populations rather than as one arm's total.
+    let (shape_n, shape_bytes) = match (repacked, fold.is_some()) {
+        (true, _) => (
+            "render_gate_walk_texture_padded_n",
+            "render_gate_walk_texture_padded_bytes",
+        ),
+        (false, false) => (
+            "render_gate_walk_texture_tight_n",
+            "render_gate_walk_texture_tight_bytes",
+        ),
+        (false, true) => (
+            "render_gate_walk_texture_folded_n",
+            "render_gate_walk_texture_folded_bytes",
+        ),
+    };
+    crate::runtime::drain::note_store_route(shape_n);
+    crate::runtime::drain::note_store_route_n(
+        shape_bytes,
+        u64::try_from(texels.len()).unwrap_or(u64::MAX),
+    );
     Ok(match fold {
         Some(plan) => NarrowTextureSource::Gathered(fold_channel_plan(&plan, &texels)),
         None => NarrowTextureSource::Gathered(texels),
@@ -3915,7 +3945,20 @@ fn sampled_textures<'a>(
                             ),
                         ));
                     }
-                    match recorded_production(identity) {
+                    // R-GW1: the walk's one global lock, bracketed on its own.
+                    // The bar covers the lookup and nothing beside it — the
+                    // arms below weigh the production they got, and a shape
+                    // refusal's own `format!` is theirs, not this read's.
+                    let recorded = {
+                        let _registry = crate::runtime::drain::frame_span(
+                            crate::runtime::drain::FrameSpan::ProvGateWalkRegistry,
+                        );
+                        crate::runtime::drain::note_store_route(
+                            "render_gate_walk_registry_reads_n",
+                        );
+                        recorded_production(identity)
+                    };
+                    match recorded {
                         Some(production) => {
                             // The sampled declaration has to restate the stored
                             // surface's format and extent, exactly as the contract
@@ -10000,6 +10043,14 @@ fn highest_index(
     count: u32,
 ) -> Option<u64> {
     use crate::backend::vulkan::engine::IndexType;
+    // R-GW1: this decode is the one place in the walk that reads *bytes the
+    // guest wrote* rather than the request's own fields, so its cost scales with
+    // the draw's index count rather than with the walk's call count. Two counts:
+    // the population (every call that asked) and the work (the values the loop
+    // below would scan — charged beside the loop, so a buffer shorter than the
+    // draw's own count, which the caller refuses by name, is counted as the ask
+    // it was rather than as a scan that never happened).
+    crate::runtime::drain::note_store_route("render_gate_walk_index_scan_n");
     let width = match index_type {
         IndexType::U16 => 2,
         IndexType::U32 => 4,
@@ -10010,6 +10061,10 @@ fn highest_index(
         return None;
     }
     let mut highest = 0u64;
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_index_scanned_n",
+        u64::try_from(count).unwrap_or(u64::MAX),
+    );
     for chunk in bytes.chunks_exact(width).take(count) {
         let value = match index_type {
             IndexType::U16 => u64::from(u16::from_ne_bytes([chunk[0], chunk[1]])),
@@ -16632,6 +16687,46 @@ fn nonindexed_vertex_span(
     None
 }
 
+/// The walk's own denominator, and the two populations it is spent on
+/// (`R-GW1`).
+///
+/// One call per [`narrow_class`] entry, before any rule can return, so the count
+/// is the gate's whole population rather than the records that reached one arm.
+/// It is two counts and not one because the walk is reached **twice** for a
+/// record whose packet is handed over as a chain: once as the probe the record
+/// before it asks with (`render_class_probe`, `class_only == true`) and once as
+/// the submission itself, and only the second one's answer is used. A cut that
+/// prices the walk without that divisor cannot tell a walk that got cheaper
+/// from a walk that stopped being asked.
+#[inline]
+fn note_gate_walk_call(class_only: bool) {
+    crate::runtime::drain::note_store_route("render_gate_walk_n");
+    crate::runtime::drain::note_store_route(if class_only {
+        "render_gate_walk_probe_n"
+    } else {
+        "render_gate_walk_submit_n"
+    });
+}
+
+/// The run-list copy the walk's load arms and its landing view make (`R-GW1`).
+///
+/// One helper rather than four inline `to_vec` calls: the four sites are one
+/// mechanism (a `Vec` per record, sized by the window's own run count), and the
+/// reading a cut needs is that mechanism's total against the walk — which is
+/// what [`FrameSpan::ProvGateWalkCopies`] and the two counts beside it are.
+///
+/// Nothing about the answer moves: this is `runs.to_vec()` behind a name.
+fn copy_run_list(runs: &[StageBufferWindow]) -> Vec<StageBufferWindow> {
+    let _copy =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkCopies);
+    crate::runtime::drain::note_store_route("render_gate_walk_run_copies_n");
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_run_copied_n",
+        u64::try_from(runs.len()).unwrap_or(u64::MAX),
+    );
+    runs.to_vec()
+}
+
 /// Whether one request is the narrow class, and the facts the trace is built
 /// from when it is.
 ///
@@ -16747,6 +16842,13 @@ fn narrow_class<'a>(
     // module the provider cannot translate from reaching the registration.
     render_half_capabilities: bool,
 ) -> Result<NarrowPass<'a>, OutOfClass> {
+    // R-GW1: the walk's own denominator and its first region. The count is
+    // charged before any rule can return, so it is the gate's whole population;
+    // the bar below covers everything up to the load election, which is where
+    // the second region opens.
+    note_gate_walk_call(class_only);
+    let _walk_head =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkHead);
     // R42: whether this request's own target is a mapper-ref-texture **surface**
     // rather than a render-chain or GVA identity. The surface's identity carries
     // the mapping's generation, which the guest may advance between two records
@@ -16956,6 +17058,11 @@ fn narrow_class<'a>(
     // ordered window list (R32, E-TX6), or the guest's byte-exact clear. What
     // is left — a record whose previous contents are the attachment's own guest
     // backing — keeps the engine by name.
+    // R-GW1: the head region closes here and the load election's opens. The
+    // flags below are the arms' own bookkeeping and belong to the election.
+    drop(_walk_head);
+    let _walk_load =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkLoad);
     let mut carried_chain_middle = false;
     // R32: the two seed doors, counted where the bytes are chosen so the census
     // reads one positive number per arm rather than only the bucket that moved.
@@ -17095,7 +17202,7 @@ fn narrow_class<'a>(
             // elision's own currency test read.
             if let Some(AttachmentGuestWindow::Runs(runs)) = inputs.attachment_guest_window {
                 carried_attachment_guest_window = true;
-                NarrowLoad::GuestRuns(runs.to_vec())
+                NarrowLoad::GuestRuns(copy_run_list(runs))
             } else {
                 let (bytes, from_surface_resident) = match (
                     inputs.resident_source_bytes,
@@ -17199,7 +17306,7 @@ fn narrow_class<'a>(
             Some(AttachmentGuestWindow::Runs(runs)) => {
                 carried_attachment_guest_window = true;
                 carried_seed_guest_window = true;
-                NarrowLoad::GuestRuns(runs.to_vec())
+                NarrowLoad::GuestRuns(copy_run_list(runs))
             }
             Some(AttachmentGuestWindow::Refused(route)) => {
                 // The run-list facts answer under R32's own four names; the
@@ -17263,7 +17370,7 @@ fn narrow_class<'a>(
             })
         {
             carried_attachment_guest_window = true;
-            NarrowLoad::GuestRuns(runs.to_vec())
+            NarrowLoad::GuestRuns(copy_run_list(runs))
         } else
         // The mapper-ref-texture surface's seed: the request carries the
         // bytes themselves, as the ordered list of windows inside the surface's
@@ -17386,6 +17493,11 @@ fn narrow_class<'a>(
     // other identity does, and for a surface that is the whole of the relay's
     // population the census reads as `render_provider_out_of_class_relay_surface`
     // (3 257 refusals in census v42, 22 of one window's 47 refused probes).
+    // R-GW1: the load election closes here; the store election (the readback
+    // arms, the keep-frame promise, the landing view) is the next region.
+    drop(_walk_load);
+    let _walk_store =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkStore);
     let seed_is_guest_runs = matches!(load, NarrowLoad::GuestRuns(_));
     // R42c: keeping a frame is the moment the promise commits, so the keeper
     // re-states it against its own identity one last time. `chain_keeps_frame`
@@ -17662,7 +17774,7 @@ fn narrow_class<'a>(
             None
         };
         if let Some(runs) = landing_window {
-            landing = Some(runs.to_vec());
+            landing = Some(copy_run_list(runs));
             // E-TX14: the same window, delivered the other way round. The
             // caller states whether the device executes a landing-only entry
             // (`RenderRailInputs::kept_frame_landing`, read out of the same
@@ -17729,6 +17841,12 @@ fn narrow_class<'a>(
     // beside `resident_source_bytes`). A continuing record that would begin
     // from guest bytes of unknown provenance, or from nothing at all, keeps the
     // engine.
+    // R-GW1: the store election closes and the walk's own by-name ladder opens —
+    // this region and the raster half below it share one slot, because they are
+    // one mechanism at two positions.
+    drop(_walk_store);
+    let _walk_rules =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkRules);
     if req.continues_render_pass && !matches!(load, NarrowLoad::Resident(_) | NarrowLoad::Bytes(_))
     {
         return Err(OutOfClass::new(
@@ -17809,6 +17927,12 @@ fn narrow_class<'a>(
     // bytes as the trace's own, which is the only arm a *snapshot* admission can
     // evaluate an affine footprint over — and the same bytes the proof was
     // weighed against, so the two cannot be two readings of one window.
+    // R-GW1: the ladder's first half closes; the stage-buffer section is the
+    // next region.
+    drop(_walk_rules);
+    let _walk_stage_buffers = crate::runtime::drain::frame_span(
+        crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffers,
+    );
     let NarrowStageBuffers {
         buffers: stage_buffers,
         index_bytes: index_window_bytes,
@@ -17821,11 +17945,24 @@ fn narrow_class<'a>(
         stage_buffer_per_stage_ceiling,
         stage_buffer_binding_range,
     )?;
+    // The section's own denominator: one entry per stage buffer the statement
+    // carries, read off the statement the region just built rather than counted
+    // inside it, so a refused shape's partial count cannot be read as a walk
+    // that stated fewer buffers.
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_stage_buffers_n",
+        u64::try_from(stage_buffers.len()).unwrap_or(u64::MAX),
+    );
     // The sampled textures the fragment stage reads (v101, `research/docs/23`
     // §101): the class states the module's own declarations beside the draw's
     // binds — the canonical pass carries both, and the wire carries the pass's
     // texture list like any other view — and every shape the provider or the
     // module refuses keeps the engine under its own name ([`sampled_textures`]).
+    // R-GW1: the stage-buffer section closes; the sampled declarations are the
+    // next region.
+    drop(_walk_stage_buffers);
+    let _walk_sampling =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkSampling);
     let sampling = sampled_textures(
         inputs,
         req,
@@ -17851,6 +17988,17 @@ fn narrow_class<'a>(
         // section, which keeps the census's sentence for the wider list.
         render_texture_count_ceiling,
     )?;
+    // The region's own denominator: one entry per sampled texture the pass
+    // states.
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_textures_n",
+        u64::try_from(sampling.textures.len()).unwrap_or(u64::MAX),
+    );
+    // R-GW1: the sampled declarations close; the ladder's raster half opens,
+    // charged to the same slot as the half above the stage-buffer section.
+    drop(_walk_sampling);
+    let _walk_rules_raster =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkRules);
     if req.occlusion_query.is_some() {
         return Err(OutOfClass::new(
             "render_provider_out_of_class_visibility",
@@ -17950,6 +18098,11 @@ fn narrow_class<'a>(
     // contract reads as `0..vertices` — and what it owes instead of those doors
     // is the span proof [`nonindexed_vertex_span`] states, answered below
     // because it is a statement about the vertex streams.
+    // R-GW1: the raster half of the ladder closes; the two stream tables and
+    // their proofs are the next region.
+    drop(_walk_rules_raster);
+    let _walk_streams =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkStreams);
     let (draw_count, index_stream, index_highest) = match req.indexed.as_ref() {
         Some(index) => {
             if index.index_count == 0 {
@@ -18124,6 +18277,11 @@ fn narrow_class<'a>(
     let mut vertex_streams: Vec<NarrowVertexStream<'_>> =
         Vec::with_capacity(req.vertex_attributes.len());
     for (head, attribute) in req.vertex_attributes.iter().enumerate() {
+        // R-GW1: the record loop's own denominator — one per attribute the
+        // request's layout declares, charged where the loop body starts so a
+        // shape refused inside the body is still counted as the record the walk
+        // read.
+        crate::runtime::drain::note_store_route("render_gate_walk_vertex_attrs_n");
         if attribute.step_function != VertexStepFunction::PerVertex {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_vertex_step",
@@ -18363,6 +18521,11 @@ fn narrow_class<'a>(
     // absent on the non-indexed one, so the sum this gate compares with the
     // pool's own bound is the number of views the trace really declares —
     // [`NarrowPass::views`] is the same sum read back at completion time.
+    // R-GW1: the stream region closes; the tail (the pool budget and the pass
+    // the walk hands back) is the last region.
+    drop(_walk_streams);
+    let _walk_tail =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkTail);
     let views = 1
         + vertex_streams.len()
         + usize::from(index_stream.is_some())
