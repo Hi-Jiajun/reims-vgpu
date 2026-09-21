@@ -2531,6 +2531,13 @@ pub enum LandedFrameMergeMiss {
     /// No registry slot for the identity: there is no image to make current,
     /// and the ladder below reads the pages.
     NoResident,
+    /// The identity had no image and this call could not create the one the
+    /// landing would have become ([`crate::config::LANDING_RESIDENT`]): the
+    /// device context, the allocation, or the registration of the image failed.
+    /// Distinct from [`Self::NoResident`] because the arm that answered is
+    /// distinct — a boot where the creation was asked for and refused reads
+    /// differently from one where it was never asked.
+    Create,
     /// The slot exists but nothing has vouched for its pixels.
     NotReady,
     /// A multisampled image is not a frame a sampled bind reads.
@@ -2550,6 +2557,7 @@ impl LandedFrameMergeMiss {
     pub fn slug(self) -> &'static str {
         match self {
             Self::NoResident => "no_resident",
+            Self::Create => "create",
             Self::NotReady => "not_ready",
             Self::Multisample => "multisample",
             Self::Geometry => "geometry",
@@ -2569,8 +2577,18 @@ pub enum LandedFrameMerge {
     /// without bytes: a shared backing makes the landing's own write the
     /// image's content.
     Shared,
-    /// The frame was uploaded into the image.
+    /// The frame was uploaded into an image that already existed under this
+    /// identity.
     Copied { bytes: u64 },
+    /// The identity had **no image**, this call created one for this landing, and
+    /// the frame was uploaded into it ([`crate::config::LANDING_RESIDENT`]).
+    ///
+    /// Named apart from [`Self::Copied`] because the two are two populations and
+    /// not two spellings of one: a copy adds a frame to an image the surface
+    /// already had, while this arm is the difference between the three
+    /// identity-keyed readers resolving this surface and resolving nothing at
+    /// all. The two are disjoint; a reader that wants both adds them.
+    Materialized { bytes: u64 },
     /// Nothing was merged; the caller keeps its refusal.
     Missed(LandedFrameMergeMiss),
 }
@@ -2595,6 +2613,23 @@ enum LandedMergePlan {
     Upload { swap_rb: bool, bytes: u64 },
 }
 
+/// Which side of "has anything vouched for this image's pixels" a merge is on.
+///
+/// A named pair rather than a `bool` because the two are two different states
+/// of the world and not a flag: an image that already existed has to have had
+/// its pixels vouched for before a landing may become them, while an image this
+/// call created a line ago, from this frame's own identity and for this frame,
+/// has nothing vouched for it *because this merge is what will* — the upload is
+/// the voucher and the readiness bit is published only after that submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandedMergeVouch {
+    /// The image was already registered under this identity before this merge.
+    AlreadyThere,
+    /// The image is one this merge just created for this very frame
+    /// ([`crate::config::LANDING_RESIDENT`]).
+    ThisCall,
+}
+
 /// Whether the plan a landing merges under is a shared backing, an upload, or a
 /// refusal — decided without a device, so the fail-closed arms are unit-testable.
 ///
@@ -2603,11 +2638,19 @@ enum LandedMergePlan {
 /// its geometry is compared, and a shared backing is answered before the bytes
 /// are read, because a guest-imported image contains the landing by
 /// construction and needs none.
+///
+/// `vouch` is the one question that is asked differently on the two arms: an
+/// image this call created is not unvouched because nothing wrote it, but
+/// because the write that makes it this surface's content is the one below.
+/// Every other check is asked of both arms, in this one place, so a frame that
+/// is no shape to be merged is refused by the same name whether the image was
+/// already there or was created for it.
 fn landed_merge_plan(
     target: LandedMergeTarget,
     frame: &LandedFrame<'_>,
+    vouch: LandedMergeVouch,
 ) -> Result<LandedMergePlan, LandedFrameMergeMiss> {
-    if !target.content_ready {
+    if !target.content_ready && vouch == LandedMergeVouch::AlreadyThere {
         return Err(LandedFrameMergeMiss::NotReady);
     }
     if target.sample_count != 1 {
@@ -2698,6 +2741,41 @@ pub fn merge_landed_frame_into_resident(
         ref counters,
         ..
     } = &mut *guard;
+    // E-LR1: the landing's own identity may have **no image at all** under it.
+    // That is not an accident of this merge but the shape of the channel on the
+    // posture where the provider carries the workload: the frame lands in the
+    // owner's registered window and nothing ever renders into an engine image,
+    // so the three readers that ask for this surface by identity — the window
+    // publish, the present capture and the published-frame reader — find no slot
+    // and fall back to the CPU path on every frame
+    // ([`crate::config::LANDING_RESIDENT`] carries the readings and the exact
+    // scope of what this arm does and does not change).
+    let mut materialized = false;
+    if pools.registry_get(identity).is_none() {
+        if !landing_resident_enabled() {
+            return LandedFrameMerge::Missed(LandedFrameMergeMiss::NoResident);
+        }
+        // The plan is asked **before** anything is created, so a landing this
+        // merge is going to refuse does not leave an image behind: a resident
+        // nothing ever writes is one the present decision resolves and then
+        // refuses under a *different* name (`content_not_ready` for a surface
+        // whose frame is missing), which is a worse reading than the refusal it
+        // replaced — and one allocation per refused landing. The answer that
+        // governs the upload is asked again below, off the slot this call
+        // actually created; this one is a gate.
+        if let Err(miss) = landed_merge_plan(
+            landing_target_this_call(identity),
+            &frame,
+            LandedMergeVouch::ThisCall,
+        ) {
+            return LandedFrameMerge::Missed(miss);
+        }
+        if let Err(miss) = unsafe { materialize_landing_resident(owner, pools, counters, identity) }
+        {
+            return LandedFrameMerge::Missed(miss);
+        }
+        materialized = true;
+    }
     let Some(slot) = pools.registry_get(identity) else {
         return LandedFrameMerge::Missed(LandedFrameMergeMiss::NoResident);
     };
@@ -2710,7 +2788,12 @@ pub fn merge_landed_frame_into_resident(
         bgra: slot.scanout_order(),
         four_byte_color: landable_resident_format(slot.format.declared()),
     };
-    let plan = match landed_merge_plan(target, &frame) {
+    let vouch = if materialized {
+        LandedMergeVouch::ThisCall
+    } else {
+        LandedMergeVouch::AlreadyThere
+    };
+    let plan = match landed_merge_plan(target, &frame, vouch) {
         Ok(plan) => plan,
         Err(miss) => return LandedFrameMerge::Missed(miss),
     };
@@ -2864,12 +2947,166 @@ pub fn merge_landed_frame_into_resident(
     // under the same engine lock, so no draw can bind the image in between.
     pools.registry_note_access(identity, next);
     pools.registry_clear_sampled_content_replaced(identity);
+    if materialized {
+        // The image was born unvouched for — that is `register_resident`'s birth
+        // state — and *this* submission is what vouches for it, so the readiness
+        // bit is published here, after the copy is recorded and submitted and
+        // under the same lock that created the slot, so no reader can resolve
+        // this identity in between. Deliberately not through
+        // `registry_mark_ready_with_access`, which also marks the pixels as this
+        // device's only copy: this frame also lives in the guest's own pages and
+        // in the host cache, and a slot carrying that flag is skipped by both
+        // reclaim paths at any age — one unreclaimable image per landed surface,
+        // for the life of the device.
+        pools.registry_mark_landing_ready(identity);
+    }
     // A merge is a recorded write into a resident's image — `TransferWrite` —
     // and it publishes no other way, so it moves the content version the same
     // way the two `registry_mark_ready*` arms do. See
     // `ResourcePools::note_resident_written`.
     pools.note_resident_written(identity);
-    LandedFrameMerge::Copied { bytes }
+    if materialized {
+        LandedFrameMerge::Materialized { bytes }
+    } else {
+        LandedFrameMerge::Copied { bytes }
+    }
+}
+
+/// `0` unread, `1` off, `2` on: the state of [`crate::config::LANDING_RESIDENT`]
+/// once it has been read, or an override a test stated.
+static LANDING_RESIDENT_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const LANDING_RESIDENT_UNREAD: u8 = 0;
+const LANDING_RESIDENT_OFF: u8 = 1;
+const LANDING_RESIDENT_ON: u8 = 2;
+
+/// Whether a landing that finds no image under its own identity materializes one
+/// ([`crate::config::LANDING_RESIDENT`]).
+///
+/// Cached because its asker is the landing merge, and `config::switch` parses the
+/// environment and allocates a string per call — a price the off state must not
+/// pay on a per-frame path. Off is therefore one relaxed load and a branch, and
+/// the environment is read at most once per process; that read-once is also why
+/// [`override_landing_resident`] exists rather than a test setting the variable.
+fn landing_resident_enabled() -> bool {
+    match LANDING_RESIDENT_ARM.load(Ordering::Relaxed) {
+        LANDING_RESIDENT_OFF => false,
+        LANDING_RESIDENT_ON => true,
+        _ => {
+            let on = matches!(
+                crate::config::switch(crate::config::LANDING_RESIDENT),
+                crate::config::Switch::On
+            );
+            LANDING_RESIDENT_ARM.store(
+                if on {
+                    LANDING_RESIDENT_ON
+                } else {
+                    LANDING_RESIDENT_OFF
+                },
+                Ordering::Relaxed,
+            );
+            on
+        }
+    }
+}
+
+/// A test's own answer for the landing-resident arm, restored when it drops.
+///
+/// The mirror of `provider_render`'s capability overrides, for the same reason:
+/// this changes a *decision* rather than an observation, so a test that unwound
+/// through a failed assertion must not leave the next shape in the same binary
+/// answering from an environment that is not its own — and the environment is
+/// read once and cached, which is what makes an override necessary rather than
+/// convenient.
+pub struct LandingResidentOverride {
+    previous: u8,
+}
+
+impl Drop for LandingResidentOverride {
+    fn drop(&mut self) {
+        LANDING_RESIDENT_ARM.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+/// Ask the landing-resident arm as `on` until the returned guard drops, or as
+/// the environment answers for `None`.
+pub fn override_landing_resident(on: Option<bool>) -> LandingResidentOverride {
+    let answer = match on {
+        None => LANDING_RESIDENT_UNREAD,
+        Some(false) => LANDING_RESIDENT_OFF,
+        Some(true) => LANDING_RESIDENT_ON,
+    };
+    LandingResidentOverride {
+        previous: LANDING_RESIDENT_ARM.swap(answer, Ordering::Relaxed),
+    }
+}
+
+/// What the image a landing materializes will be, read off the identity alone.
+///
+/// The plan is asked before the image exists, so this states the three facts
+/// `registry_ensure_attachment` is called with below — the key's own geometry and
+/// generation, one sample, the identity's declared format — plus the two the
+/// birth state fixes: a device-local image, and a slot nothing has vouched for.
+/// Deriving it from the same arguments the creation is called with is what keeps
+/// this from being a second guess about the slot; a creation arm that changed one
+/// of them would have to change this beside it.
+fn landing_target_this_call(identity: &TargetIdentity) -> LandedMergeTarget {
+    let format = identity.resident_format();
+    LandedMergeTarget {
+        width: identity.width(),
+        height: identity.height(),
+        sample_count: 1,
+        content_ready: false,
+        guest_imported: false,
+        bgra: crate::backend::vulkan::translate::pixel::has_bgra_order(format),
+        four_byte_color: landable_resident_format(format),
+    }
+}
+
+/// Create the image a landing's identity was missing, so that the three readers
+/// that ask for this surface by identity resolve the frame the landing wrote into
+/// the owner's window ([`crate::config::LANDING_RESIDENT`]).
+///
+/// The creation is `registry_ensure_attachment`'s: the same image/memory/view
+/// discipline every other resident is born under, reusing the free-target pool
+/// for the same geometry and format, and deliberately no framebuffer and no
+/// render pass — a landing is not a pass, and nothing here will be attached to
+/// one. The slot it registers is born unvouched for, which is exactly the state
+/// the caller's upload resolves; the caller publishes the readiness bit only
+/// after that submission exists.
+///
+/// Every failure is [`LandedFrameMergeMiss::Create`] and nothing else: the
+/// landing's own account (the guest's pages, the host cache) is not this call's
+/// to touch, and a merge that could not create the image is the refusal the
+/// ladder had before this arm existed.
+unsafe fn materialize_landing_resident(
+    owner: &mut ContextOwner,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    identity: &TargetIdentity,
+) -> Result<(), LandedFrameMergeMiss> {
+    let ctx = match owner.ensure(counters) {
+        Ok(ctx) => ctx,
+        Err(_) => return Err(LandedFrameMergeMiss::Create),
+    };
+    if unsafe { pools.ensure_init(ctx, counters) }.is_err() {
+        return Err(LandedFrameMergeMiss::Create);
+    }
+    let created = unsafe {
+        pools.registry_ensure_attachment(
+            ctx,
+            identity.clone(),
+            identity.width(),
+            identity.height(),
+            1,
+            identity.generation(),
+            identity.resident_format(),
+            counters,
+        )
+    };
+    match created {
+        Ok(_) => Ok(()),
+        Err(_) => Err(LandedFrameMergeMiss::Create),
+    }
 }
 
 #[cfg(test)]
@@ -2937,7 +3174,11 @@ mod landed_frame_merge_tests {
             ..target()
         };
         assert_eq!(
-            landed_merge_plan(shared, &frame(&[], LandedFrameOrder::Bgra8)),
+            landed_merge_plan(
+                shared,
+                &frame(&[], LandedFrameOrder::Bgra8),
+                LandedMergeVouch::AlreadyThere
+            ),
             Ok(LandedMergePlan::Shared)
         );
     }
@@ -2951,7 +3192,11 @@ mod landed_frame_merge_tests {
             ..target()
         };
         assert_eq!(
-            landed_merge_plan(unready, &frame(&[0u8; 32], LandedFrameOrder::Bgra8)),
+            landed_merge_plan(
+                unready,
+                &frame(&[0u8; 32], LandedFrameOrder::Bgra8),
+                LandedMergeVouch::AlreadyThere
+            ),
             Err(LandedFrameMergeMiss::NotReady)
         );
         let multisample = LandedMergeTarget {
@@ -2959,7 +3204,11 @@ mod landed_frame_merge_tests {
             ..target()
         };
         assert_eq!(
-            landed_merge_plan(multisample, &frame(&[0u8; 32], LandedFrameOrder::Bgra8)),
+            landed_merge_plan(
+                multisample,
+                &frame(&[0u8; 32], LandedFrameOrder::Bgra8),
+                LandedMergeVouch::AlreadyThere
+            ),
             Err(LandedFrameMergeMiss::Multisample)
         );
     }
@@ -2975,7 +3224,7 @@ mod landed_frame_merge_tests {
             ..frame(&bytes, LandedFrameOrder::Bgra8)
         };
         assert_eq!(
-            landed_merge_plan(target(), &short),
+            landed_merge_plan(target(), &short, LandedMergeVouch::AlreadyThere),
             Err(LandedFrameMergeMiss::Geometry)
         );
         let tall = LandedFrame {
@@ -2983,7 +3232,7 @@ mod landed_frame_merge_tests {
             ..frame(&bytes, LandedFrameOrder::Bgra8)
         };
         assert_eq!(
-            landed_merge_plan(target(), &tall),
+            landed_merge_plan(target(), &tall, LandedMergeVouch::AlreadyThere),
             Err(LandedFrameMergeMiss::Geometry)
         );
     }
@@ -2994,7 +3243,11 @@ mod landed_frame_merge_tests {
     #[test]
     fn the_landing_order_against_the_images_own_decides_the_swap() {
         let bytes = [0u8; 32];
-        let upload = |order| match landed_merge_plan(target(), &frame(&bytes, order)) {
+        let upload = |order| match landed_merge_plan(
+            target(),
+            &frame(&bytes, order),
+            LandedMergeVouch::AlreadyThere,
+        ) {
             Ok(plan) => plan,
             Err(miss) => panic!("{miss:?}"),
         };
@@ -3024,7 +3277,11 @@ mod landed_frame_merge_tests {
             ..target()
         };
         assert_eq!(
-            landed_merge_plan(narrowed, &frame(&[0u8; 32], LandedFrameOrder::Bgra8)),
+            landed_merge_plan(
+                narrowed,
+                &frame(&[0u8; 32], LandedFrameOrder::Bgra8),
+                LandedMergeVouch::AlreadyThere
+            ),
             Err(LandedFrameMergeMiss::Format)
         );
     }
@@ -3035,11 +3292,19 @@ mod landed_frame_merge_tests {
     #[test]
     fn bytes_shorter_than_the_landing_are_refused() {
         assert_eq!(
-            landed_merge_plan(target(), &frame(&[0u8; 31], LandedFrameOrder::Bgra8)),
+            landed_merge_plan(
+                target(),
+                &frame(&[0u8; 31], LandedFrameOrder::Bgra8),
+                LandedMergeVouch::AlreadyThere
+            ),
             Err(LandedFrameMergeMiss::FrameBytes)
         );
         assert_eq!(
-            landed_merge_plan(target(), &frame(&[], LandedFrameOrder::Bgra8)),
+            landed_merge_plan(
+                target(),
+                &frame(&[], LandedFrameOrder::Bgra8),
+                LandedMergeVouch::AlreadyThere
+            ),
             Err(LandedFrameMergeMiss::FrameBytes)
         );
     }
@@ -3050,6 +3315,7 @@ mod landed_frame_merge_tests {
     fn every_miss_names_itself() {
         let names = [
             LandedFrameMergeMiss::NoResident,
+            LandedFrameMergeMiss::Create,
             LandedFrameMergeMiss::NotReady,
             LandedFrameMergeMiss::Multisample,
             LandedFrameMergeMiss::Geometry,
@@ -3063,6 +3329,123 @@ mod landed_frame_merge_tests {
                 assert_ne!(miss.slug(), other.slug(), "two misses share a slug");
             }
         }
+    }
+
+    /// The one question the two arms answer differently, and the four they must
+    /// not: an image this call just created has nothing vouched for it *because
+    /// this merge is what will*, so the readiness arm is the arm that has to
+    /// change — while every shape that is no frame to merge is refused by the
+    /// same name on both arms, which is what keeps one plan answering for both.
+    #[test]
+    fn a_target_this_call_materialized_is_vouched_for_but_no_other_way() {
+        let fresh = LandedMergeTarget {
+            content_ready: false,
+            ..target()
+        };
+        let bytes = [0u8; 32];
+        assert_eq!(
+            landed_merge_plan(
+                fresh,
+                &frame(&bytes, LandedFrameOrder::Bgra8),
+                LandedMergeVouch::AlreadyThere
+            ),
+            Err(LandedFrameMergeMiss::NotReady),
+            "an image that already existed has to have been vouched for"
+        );
+        assert_eq!(
+            landed_merge_plan(
+                fresh,
+                &frame(&bytes, LandedFrameOrder::Bgra8),
+                LandedMergeVouch::ThisCall
+            ),
+            Ok(LandedMergePlan::Upload {
+                swap_rb: false,
+                bytes: 32
+            }),
+            "the upload this call is about to record is the voucher"
+        );
+
+        // The refusals that are about the *frame* do not move with the arm, and
+        // neither does the shared-backing arm: a creation that ever handed back
+        // a guest-backed image would already hold the landing.
+        let short = frame(&[0u8; 31], LandedFrameOrder::Bgra8);
+        let wrong_geometry = LandedFrame {
+            width: 3,
+            ..frame(&bytes, LandedFrameOrder::Bgra8)
+        };
+        let narrowed = LandedMergeTarget {
+            four_byte_color: false,
+            ..fresh
+        };
+        for (target, frame, expected) in [
+            (fresh, &short, LandedFrameMergeMiss::FrameBytes),
+            (fresh, &wrong_geometry, LandedFrameMergeMiss::Geometry),
+            (
+                narrowed,
+                &frame(&bytes, LandedFrameOrder::Bgra8),
+                LandedFrameMergeMiss::Format,
+            ),
+        ] {
+            assert_eq!(
+                landed_merge_plan(target, frame, LandedMergeVouch::ThisCall),
+                Err(expected),
+                "a frame that is no shape to merge is refused by the same name on both arms"
+            );
+        }
+        let shared = LandedMergeTarget {
+            guest_imported: true,
+            ..fresh
+        };
+        assert_eq!(
+            landed_merge_plan(
+                shared,
+                &frame(&[], LandedFrameOrder::Bgra8),
+                LandedMergeVouch::ThisCall
+            ),
+            Ok(LandedMergePlan::Shared),
+            "a guest-backed image holds the landing whether or not this call made it"
+        );
+    }
+
+    /// What the creation arm is asked about before it allocates has to be the
+    /// image the creation then gives back, or the gate would be judging a
+    /// different surface than the upload writes. The three fields the identity
+    /// does not carry are the three the birth state fixes, and they are read off
+    /// the same arguments `registry_ensure_attachment` is called with.
+    #[test]
+    fn the_target_the_gate_judges_is_the_one_the_creation_registers() {
+        use crate::backend::vulkan::translate::pixel::{has_bgra_order, SCANOUT_FORMAT};
+
+        let scanout = TargetIdentity::Surface {
+            id: 990_401,
+            width: 64,
+            height: 32,
+            generation: 7,
+            format: SCANOUT_FORMAT,
+        };
+        let stated = landing_target_this_call(&scanout);
+        assert_eq!((stated.width, stated.height), (64, 32));
+        assert_eq!(stated.sample_count, 1, "the creation is single-sampled");
+        assert!(
+            !stated.content_ready,
+            "the slot is born unvouched for; `LandedMergeVouch::ThisCall` is what says so"
+        );
+        assert!(!stated.guest_imported, "the creation arm is device-local");
+        assert_eq!(stated.bgra, has_bgra_order(SCANOUT_FORMAT));
+        assert!(stated.four_byte_color, "scanout order is four-byte colour");
+
+        // And a declaration that is not: it is not a shape a landing frame can be
+        // written into, so the gate refuses it before anything is allocated.
+        let wide = TargetIdentity::Surface {
+            id: scanout.namespaced_id().1 as u32,
+            width: scanout.width(),
+            height: scanout.height(),
+            generation: scanout.generation(),
+            format: ash::vk::Format::R16G16B16A16_SFLOAT,
+        };
+        let wide_target = landing_target_this_call(&wide);
+        assert!(!wide_target.four_byte_color);
+        assert!(!wide_target.bgra);
     }
 }
 

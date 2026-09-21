@@ -1670,6 +1670,51 @@ pub const GATE_PROVE_GATHER: &str = "REIMS_VGPU_GATE_PROVE_GATHER";
 /// election (its window derivation, its counters and its `Vec`) from every
 /// record that reads its table's own source.
 pub const ONE_ELECTION_PER_SOURCE: &str = "REIMS_VGPU_GATE_ONE_ELECTION_PER_SOURCE";
+
+/// **A switch, not the default.** Whether a provider landing that arrives with
+/// no image under its own identity materializes one, so the three readers that
+/// ask for that surface by identity — the window publish, the present capture
+/// and the published-frame reader — find the frame the landing just put in the
+/// owner's window instead of "nothing names this surface".
+///
+/// # Why it exists
+///
+/// The landing channel (`StoreOp::BorrowedLanding`, `TracePass::Landing`) writes
+/// the frame into the owner's registered window and never renders into an engine
+/// image. On the posture where the canonical provider carries the workload
+/// (`guest_import=on`), the engine therefore never creates a resident for those
+/// surfaces at all, and every publish on them is refused by the one condition
+/// that is not a property of a slot: there is no slot. Two arms of the dp1 round
+/// read that state directly — `winpub_no_resident=295` against
+/// `host_window_cadence … direct_frac=0.00` in 168/168 windows, and a registry
+/// report of `exact=absent surfaces=0` on every refusal — while the same binary
+/// in the production posture (`guest_import=off`) publishes from a resident
+/// 1.00 of the time, because there the engine itself draws into the image.
+///
+/// The cost of leaving it as it is, is not the CPU copy: it is that census — this
+/// project's main regression instrument — cannot see a regression on the present
+/// path, because in the posture that instrument is run in, the present path it
+/// would have to exercise is never taken.
+///
+/// # What it does not do
+///
+/// It does not loosen a single present criterion: the decision that refuses a
+/// resident stays exactly what it was (content ready, scanout order, geometry),
+/// a key that does not match is still never answered with another slot's image,
+/// and the capture still has no guest-page fallback. What it changes is that the
+/// identity the landing already landed *for* stops being empty — the frame that
+/// is in the guest's pages is written into an image under the same key and the
+/// readiness bit is published only once that write is submitted.
+///
+/// # What it costs
+///
+/// Off is one `OnceLock` load per landing merge and nothing else: the empty
+/// identity keeps the refusal (`no_resident`) it has today, no image is created,
+/// and no counter moves. On adds one image creation and one whole-extent upload
+/// per landed surface identity; the created resident is deliberately not marked
+/// as this device's only copy of its pixels (they also live in the guest's pages
+/// and the host cache), so the existing idle reclaim can take it back.
+pub const LANDING_RESIDENT: &str = "REIMS_VGPU_LANDING_RESIDENT";
 }
 
 counts! {

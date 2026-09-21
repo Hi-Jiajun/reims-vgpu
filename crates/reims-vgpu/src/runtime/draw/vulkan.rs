@@ -15102,10 +15102,26 @@ fn merge_provider_landing_into_resident(
             crate::runtime::drain::note_store_route_n("resident_image_merged_bytes", bytes);
             ("resident_image_merged_copied", bytes)
         }
+        // E-LR1: the identity had no image and this merge created one for the
+        // landing, so the frame is what the three identity-keyed readers — the
+        // window publish, the present capture and the published-frame reader —
+        // now resolve this surface to. Counted apart from `Copied` rather than
+        // folded into `resident_image_merged`, because the change the two arms
+        // make is not the same one: a copy adds a frame to an image the surface
+        // already had, this arm is the difference between having a resident at
+        // all and having none. The pair is disjoint, and a reader that wants the
+        // union sums them.
+        LandedFrameMerge::Materialized { bytes } => {
+            // The count is the outcome name below, charged once by this
+            // function's own tail; here only the bytes it wrote travel.
+            crate::runtime::drain::note_store_route_n("resident_image_merge_created_bytes", bytes);
+            ("resident_image_merge_created", bytes)
+        }
         LandedFrameMerge::Missed(miss) => {
             crate::runtime::drain::note_store_route("resident_image_merge_missed");
             let route = match miss {
                 LandedFrameMergeMiss::NoResident => "resident_image_merge_missed_no_resident",
+                LandedFrameMergeMiss::Create => "resident_image_merge_missed_create",
                 LandedFrameMergeMiss::NotReady => "resident_image_merge_missed_not_ready",
                 LandedFrameMergeMiss::Multisample => "resident_image_merge_missed_multisample",
                 LandedFrameMergeMiss::Geometry => "resident_image_merge_missed_geometry",
@@ -16474,6 +16490,9 @@ mod vulkan_split_tests {
         use crate::backend::vulkan::engine::TargetIdentity;
         use crate::runtime::drain::store_route_count;
 
+        // The premise, stated rather than inherited from the environment: this
+        // case is about the arm that refuses an identity with no image under it.
+        let _off = crate::backend::vulkan::engine::override_landing_resident(Some(false));
         let identity = TargetIdentity::Surface {
             id: 990_303,
             width: 8,
@@ -16495,6 +16514,58 @@ mod vulkan_split_tests {
         assert_eq!(
             store_route_count("resident_image_merge_missed_no_resident") - absent,
             1
+        );
+    }
+
+    /// The other side of the same accounting (E-LR1): with the materializing arm
+    /// on, a landing that found no image under its identity counts **its own**
+    /// pair — the creation and the bytes that went into it — and charges nothing
+    /// on the missing-target name it replaced. That pair is what the census reads
+    /// to tell "this surface now has a resident" from "nothing names this
+    /// surface", and the two are disjoint by construction: one arm created an
+    /// image, the other did not.
+    ///
+    /// A host with no usable Vulkan device cannot create anything, and the arm
+    /// answers that by its own name (`missed_create`) rather than by counting a
+    /// merge that did not happen — so this case is skipped there, the way the
+    /// engine's own device-backed cases are skipped.
+    #[test]
+    fn a_materialized_merge_is_counted_by_its_own_name() {
+        use crate::backend::vulkan::engine::{self, TargetIdentity};
+        use crate::runtime::drain::store_route_count;
+
+        let identity = TargetIdentity::Surface {
+            id: 990_304,
+            width: 8,
+            height: 4,
+            generation: 1,
+            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        };
+        let bytes = vec![0x2bu8; 8 * 4 * 4];
+        let _on = engine::override_landing_resident(Some(true));
+        let created = store_route_count("resident_image_merge_created");
+        let created_bytes = store_route_count("resident_image_merge_created_bytes");
+        let absent = store_route_count("resident_image_merge_missed_no_resident");
+        let cannot_create = store_route_count("resident_image_merge_missed_create");
+        merge_provider_landing_into_resident(7, &identity, 8, 4, &bytes, true, "test");
+        if store_route_count("resident_image_merge_missed_create") > cannot_create {
+            eprintln!("skipping: this host has no Vulkan device to materialize a resident on");
+            return;
+        }
+        assert_eq!(
+            store_route_count("resident_image_merge_created") - created,
+            1,
+            "an identity that had no image and got one is counted as created"
+        );
+        assert_eq!(
+            store_route_count("resident_image_merge_created_bytes") - created_bytes,
+            8 * 4 * 4,
+            "and the bytes are the frame the landing put in the owner's window"
+        );
+        assert_eq!(
+            store_route_count("resident_image_merge_missed_no_resident") - absent,
+            0,
+            "the miss name this arm replaces must not be charged beside it"
         );
     }
 
@@ -16601,6 +16672,126 @@ mod vulkan_split_tests {
             store_route_count(REPLACED) - replaced_before,
             1,
             "the landing must state the sampling side's own copy as replaced"
+        );
+    }
+
+    /// E-LR1's two arms, driven where a landing's account is written: the same
+    /// completion, the same bytes, and exactly one difference — whether the
+    /// identity the landing landed under gets an image of its own.
+    ///
+    /// The frame the seam publishes is compared byte for byte, because that is
+    /// what the arm may not move: an image materialized behind a landing is a
+    /// second copy of a frame the owner's pages already hold, never a second
+    /// opinion about it. And the pair of counters says which arm answered — the
+    /// control arm charges the missing target, the increment arm charges the
+    /// creation, and neither charges the other's name.
+    ///
+    /// This lives here rather than on the provider rail because the seam's store
+    /// route is what calls the merge: the provider rail's cases drive
+    /// `submit_render` and never reach it (they read the *provider's* landing
+    /// routes instead), so a rail case would assert the switch on a path the
+    /// switch does not touch.
+    #[test]
+    fn the_two_landing_resident_arms_publish_the_same_frame() {
+        use crate::runtime::drain::store_route_count;
+
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        // An id no other case in this binary draws into: the engine's registry is
+        // process-global, and an identity that already had an image would take
+        // the *copy* arm on both of these.
+        let mapping = 0x7d15_0201;
+        assert!(state.set_mapping_geom(mapping, 8, 4, 0x1e));
+        let colors = vec![ColorRtRequest {
+            mapping_id: mapping,
+            width: 8,
+            height: 4,
+            format: crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            // A store action that publishes the frame: `DontCare` is the one
+            // store action the merge's caller asks about by name.
+            store_action: crate::protocol::pass_action::MTL_STORE_ACTION_STORE,
+            ..Default::default()
+        }];
+        let request = DrawEncodeRequest {
+            task_id: 1,
+            pipeline_ref: 1,
+            // The store route asks the *request* for the identity it lands
+            // under (`mapper_ref_texture_store_identity` reads `req.colors`), so
+            // the attachment has to be stated there as well as in the slice the
+            // store is driven with.
+            colors: colors.clone(),
+            ..Default::default()
+        };
+        // Per-texel bytes rather than one colour: a merge that wrote the right
+        // frame in the wrong order cannot pass the comparison below.
+        let bytes: Vec<u8> = (0..8u32 * 4 * 4).map(|byte| (byte % 251) as u8).collect();
+        // The premise, asserted rather than assumed: this completion is one the
+        // seam lands a frame for, which is what makes it the store route the
+        // merge is called from — and the identity it lands under is the key the
+        // present side asks its three questions with.
+        let identity = mapper_ref_texture_store_identity(&state, &request, true)
+            .expect("the landing's own identity resolves for this record");
+        assert!(
+            !crate::backend::vulkan::engine::resident_presentable(&identity, 8, 4),
+            "nothing is under this identity before either arm runs"
+        );
+
+        let mut arm = |on: bool| {
+            let hold = crate::backend::vulkan::engine::override_landing_resident(Some(on));
+            let created = store_route_count("resident_image_merge_created");
+            let created_bytes = store_route_count("resident_image_merge_created_bytes");
+            let absent = store_route_count("resident_image_merge_missed_no_resident");
+            let merged = store_route_count("resident_image_merged");
+            let status = borrowed_landing_store(
+                &mut state,
+                &mut host,
+                &request,
+                &colors,
+                &bytes,
+                true,
+                crate::backend::provider_render::WindowLanding::OwnView,
+            );
+            assert!(matches!(status, EncodeStatus::Ok));
+            let published = crate::runtime::surface_cache::get(&state, mapping, 8, 4)
+                .expect("the landing publishes the frame into the host cache")
+                .to_vec();
+            let delta = (
+                store_route_count("resident_image_merge_created") - created,
+                store_route_count("resident_image_merge_created_bytes") - created_bytes,
+                store_route_count("resident_image_merge_missed_no_resident") - absent,
+                store_route_count("resident_image_merged") - merged,
+            );
+            drop(hold);
+            (published, delta)
+        };
+
+        let (control, control_delta) = arm(false);
+        let (increment, increment_delta) = arm(true);
+        assert!(
+            crate::backend::vulkan::engine::resident_presentable(&identity, 8, 4),
+            "the increment arm's image is under the identity the store landed on, \
+             which is the key every present-side reader asks with"
+        );
+
+        assert_eq!(
+            control, bytes,
+            "the control arm publishes the landing's own frame"
+        );
+        assert_eq!(
+            control, increment,
+            "and the increment arm publishes the same frame, byte for byte"
+        );
+        assert_eq!(
+            control_delta,
+            (0, 0, 1, 0),
+            "the control arm creates nothing, copies into nothing, and counts the \
+             identity it could not resolve"
+        );
+        assert_eq!(
+            increment_delta,
+            (1, bytes.len() as u64, 0, 0),
+            "the increment arm creates the image, writes the whole frame into it, \
+             and charges nothing on the name it replaced"
         );
     }
 

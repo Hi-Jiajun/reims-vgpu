@@ -2166,6 +2166,34 @@ impl ResourcePools {
         self.note_resident_written(identity);
     }
 
+    /// Publish the readiness of a resident a landing **materialized**: the image
+    /// is this surface's content because the upload that just rode this
+    /// submission wrote this frame into it.
+    ///
+    /// # Why it is this method and not the ready arm one screen up
+    ///
+    /// [`Self::registry_mark_ready_with_access`] ends on
+    /// `set_sole_copy(identity, !guest_backed)`, and the image a landing creates
+    /// is device-local — so that rule would say these pixels exist **nowhere
+    /// else**, and both reclaim paths skip a slot carrying that, at any
+    /// population and at any age. They do exist elsewhere: the landing wrote the
+    /// guest's own pages, and the host cache holds a copy of the same frame. A
+    /// resident materialized behind a landing is therefore reclaimable, and
+    /// saying otherwise would leak one image per landed surface for the life of
+    /// the device.
+    ///
+    /// The rest of the publication is the merge's own tail, which runs for every
+    /// arm: it records the transfer's access, clears the sampling-side refusal
+    /// the landing recorded, and moves the content version
+    /// ([`Self::note_resident_written`]). `content_epoch` needs nothing here — the
+    /// birth state leaves it `None` and no mapping-level stamp has vouched for
+    /// these pixels — and this one field is what the birth state left unanswered.
+    pub(crate) fn registry_mark_landing_ready(&mut self, identity: &TargetIdentity) {
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.content_ready = true;
+        }
+    }
+
     /// Tag a resident's pixels with the next content version
     /// ([`ResidentTargetSlot::content_serial`]).
     ///
@@ -4866,6 +4894,59 @@ pub(super) mod pin_count_tests {
         // rather than inventing a subtraction.
         assert!(!pools.registry_note_content_copied_out(&surf(1)));
         check(&pools, "a copy-out for an absent identity");
+    }
+
+    /// A resident a landing materialized is never the only copy of its pixels.
+    ///
+    /// [`ResourcePools::registry_mark_landing_ready`] exists rather than a call
+    /// to [`ResourcePools::registry_mark_ready_with_access`] for one line of the
+    /// latter: `set_sole_copy(identity, !guest_backed)`. The image a landing
+    /// creates is device-local, so that rule would say its pixels exist nowhere
+    /// else — and both reclaim paths skip such a slot at any population and any
+    /// age. They do exist elsewhere: the landing wrote the guest's own pages and
+    /// the host cache holds a copy of the same frame, so the resident has to stay
+    /// reclaimable. The contrast below is asserted both ways, because the whole
+    /// value of this arm's own method is what it does *not* set.
+    #[test]
+    fn a_landing_materialized_resident_is_never_the_only_copy_of_its_pixels() {
+        let mut pools = ResourcePools::new();
+        pools.register_resident(
+            &surf(1),
+            new_resident(vk::Framebuffer::null(), vk::RenderPass::null()),
+        );
+        assert!(
+            !pools
+                .registry
+                .get(&surf(1))
+                .expect("just registered")
+                .content_ready,
+            "the arm's birth state is an image nothing has vouched for"
+        );
+
+        pools.registry_mark_landing_ready(&surf(1));
+        assert!(
+            pools
+                .registry
+                .get(&surf(1))
+                .expect("still registered")
+                .content_ready,
+            "the upload the merge recorded is what vouches for these pixels"
+        );
+        assert_eq!(
+            pools.registry_sole_copy,
+            NonPinnedTotals::default(),
+            "a frame the landing also wrote into the guest's pages and the host cache \
+             is not this image's alone, so a reclaim cannot lose guest work"
+        );
+
+        // The draw arm's rule, on the same slot, would have said the opposite —
+        // which is why this arm has its own method rather than a call to that one.
+        pools.registry_mark_ready(&surf(1));
+        assert_eq!(
+            pools.registry_sole_copy.count, 1,
+            "the ready arm marks a device-local image as the only copy of its pixels, \
+             and both reclaim paths skip such a slot forever"
+        );
     }
 
     /// The sole-copy high-water rises on the mark that grows the population, not

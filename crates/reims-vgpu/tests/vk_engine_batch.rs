@@ -573,6 +573,142 @@ fn a_landing_with_no_image_under_it_is_refused_without_a_copy() {
     );
 }
 
+/// E-LR1's arm: a landing that finds no image under its own identity
+/// **materializes** one, and the readers that ask for this surface by identity
+/// then resolve the frame the landing wrote — while the arm that was there before
+/// keeps its refusal, and the identity stays empty.
+///
+/// The readers are asserted in the order a boot asks them: the publish's own
+/// transaction ([`engine::prepare_window_resident_present`], where the window
+/// decides whether a resident may carry this present instead of a host-memory
+/// copy), the census's split ([`engine::resident_presentable`], the same rule
+/// asked one layer out), the capture's own source
+/// ([`engine::read_resident_bgra`], what the console reads when it takes the CPU
+/// path) and the sampling ladder's read ([`engine::read_target`]). An image that
+/// was created and never written would pass the first two and fail the last two,
+/// which is exactly the state this arm must never leave behind.
+#[test]
+fn a_landing_materializes_the_identity_it_landed_under() {
+    use reims_vgpu::backend::vulkan::engine::{
+        LandedFrame, LandedFrameMerge, LandedFrameMergeMiss, LandedFrameOrder,
+    };
+
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_203,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let frame: Vec<u8> = (0..(W as usize) * (H as usize))
+        .flat_map(|i| {
+            let t = (i % 251) as u8;
+            [t, t.wrapping_add(1), t.wrapping_add(2), 0xff]
+        })
+        .collect();
+    let landing = || LandedFrame {
+        width: W,
+        height: H,
+        order: LandedFrameOrder::Bgra8,
+        bytes: &frame,
+    };
+
+    // The arm before this one: the identity has no image, so the merge keeps the
+    // refusal every ladder rung below it already had.
+    {
+        let _off = engine::override_landing_resident(Some(false));
+        assert_eq!(
+            engine::merge_landed_frame_into_resident(&identity, landing()),
+            LandedFrameMerge::Missed(LandedFrameMergeMiss::NoResident),
+            "with the arm off an empty identity is exactly what it was"
+        );
+        assert!(
+            !engine::resident_presentable(&identity, W, H),
+            "and nothing may present from an image that does not exist"
+        );
+    }
+
+    // A device is what this arm needs, so the file's own skip rule applies. The
+    // probe draws into an identity of its own: the surface under test has to
+    // reach the merge without an engine image under it.
+    let probe = TargetIdentity::Surface {
+        id: 990_204,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    match engine::execute_draw_request(
+        engine_device(),
+        &batch_req(
+            &vert,
+            &frag,
+            &probe,
+            false,
+            ScissorResource {
+                x: 0,
+                y: 0,
+                width: W,
+                height: H,
+            },
+        ),
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("probe draw: {msg}");
+        }
+    }
+
+    let _on = engine::override_landing_resident(Some(true));
+    match engine::merge_landed_frame_into_resident(&identity, landing()) {
+        LandedFrameMerge::Materialized { bytes } => assert_eq!(
+            bytes,
+            u64::from(W) * u64::from(H) * 4,
+            "the whole landing frame is what went into the created image"
+        ),
+        other => panic!("a landing with no image under it must materialize one: {other:?}"),
+    }
+
+    let decision = engine::prepare_window_resident_present(&identity, W, H);
+    assert!(
+        decision.is_ok(),
+        "the publish must accept the resident the landing materialized: {:?}",
+        decision.err()
+    );
+    assert!(
+        engine::resident_presentable(&identity, W, H),
+        "the census's split asks the same rule and must answer the same way"
+    );
+
+    let need = (W as usize) * (H as usize) * 4;
+    let bgra = engine::read_resident_bgra(&identity, need)
+        .unwrap_or_else(|_| panic!("the capture reads the image the landing materialized"));
+    assert_eq!(
+        bgra, frame,
+        "and what it reads is the landing's own frame, byte for byte"
+    );
+    let px = engine::read_target(&identity)
+        .expect("read_target after the materialize")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
+    for texel in [0usize, (W * H / 2) as usize, (W * H - 1) as usize] {
+        let i = texel * 4;
+        assert_eq!(
+            [px[i], px[i + 1], px[i + 2], px[i + 3]],
+            [frame[i + 2], frame[i + 1], frame[i], frame[i + 3]],
+            "texel {texel} of the image the ladder serves"
+        );
+    }
+    engine::test_quiesce_ring();
+}
+
 const W: u32 = 64;
 const H: u32 = 64;
 
