@@ -42,6 +42,58 @@ pub struct WindowSurface {
     pub height: u32,
 }
 
+/// Where a published frame came from, as the presenter has to read it.
+///
+/// The window's direct-present ratio is the reading every report about the host
+/// window argues from, and it has two denominators that are not the same
+/// question. Frames published by the *present path* are frames a resident could
+/// have carried, so a present that takes them off the CPU is a present the
+/// engine lost. Frames pushed by the pre-boundary **early-console pump** are
+/// read out of the BAR1/EFI framebuffer, which is not a mapping and never has a
+/// resident, so counting them against the same ratio reports a throughput cliff
+/// on every boot whose window is working exactly as designed — and that is not
+/// hypothetical: a driven boot's first 26 sampling windows read
+/// `direct_frac=0.00` at 28-29 presents a second for precisely this reason,
+/// against 167 later windows at `1.00`.
+///
+/// Only the writer knows which it was, so the class travels with the frame.
+/// Nothing downstream can recover it: both cases arrive as a `Frame` with no
+/// resident and bytes in `bgra`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOrigin {
+    /// The present path published it with a rail resident behind it.
+    Resident,
+    /// The present path published it and no resident carried it. `decline` is
+    /// the route the publish's resident decision refused by, and `None` means
+    /// no decision was reached at all (no window attached to consume it).
+    PresentPath { decline: Option<&'static str> },
+    /// The pre-boundary early-console pump pushed it from the BAR1/EFI
+    /// framebuffer. Never resident-carried, by construction.
+    EarlyConsole,
+}
+
+impl FrameOrigin {
+    /// Which of the three class counters this frame belongs to, as
+    /// `host_window_cadence` prints them.
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::PresentPath { .. } => "cpu",
+            Self::EarlyConsole => "early",
+        }
+    }
+
+    /// The resident decision's route for a frame the present path published
+    /// without a resident, or `None` for the two origins that reached no
+    /// decision.
+    pub fn decline(self) -> Option<&'static str> {
+        match self {
+            Self::PresentPath { decline } => decline,
+            Self::Resident | Self::EarlyConsole => None,
+        }
+    }
+}
+
 /// A published frame's CPU bytes, offered to a rail's presenter.
 ///
 /// The presenter prefers a [`WindowResident`] and reads these only when no
@@ -59,6 +111,10 @@ pub struct WindowCpuFrame<'a> {
     /// (resize, self-heal) re-blits without re-copying a framebuffer that has
     /// not changed.
     pub seq: u64,
+    /// Who published these bytes, which is what separates a present the engine
+    /// lost a resident for from one that could never have had one. See
+    /// [`FrameOrigin`].
+    pub origin: FrameOrigin,
 }
 
 impl WindowCpuFrame<'_> {
@@ -262,6 +318,7 @@ mod tests {
             width: 8,
             height: 4,
             seq: 1,
+            origin: FrameOrigin::EarlyConsole,
         }));
         // Slop is fine — the copy reads exactly what the geometry names.
         assert!(WindowCpuFrame::complete(&WindowCpuFrame {
@@ -269,6 +326,7 @@ mod tests {
             width: 8,
             height: 3,
             seq: 1,
+            origin: FrameOrigin::EarlyConsole,
         }));
         assert!(
             !WindowCpuFrame::complete(&WindowCpuFrame {
@@ -276,6 +334,7 @@ mod tests {
                 width: 8,
                 height: 4,
                 seq: 1,
+                origin: FrameOrigin::EarlyConsole,
             }),
             "one byte short is still a torn last row"
         );
@@ -285,6 +344,7 @@ mod tests {
                 width: 8,
                 height: 4,
                 seq: 1,
+                origin: FrameOrigin::EarlyConsole,
             }),
             "the elided-readback publish carries no bytes at all"
         );
@@ -294,6 +354,7 @@ mod tests {
                 width: 0,
                 height: 4,
                 seq: 1,
+                origin: FrameOrigin::EarlyConsole,
             }),
             "a zero dimension names no pixels and blits nothing"
         );

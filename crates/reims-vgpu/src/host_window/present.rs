@@ -224,6 +224,12 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// Who published this frame. Travels with it because the presenter cannot
+    /// recover it: a frame the early-console pump pushed and a frame the present
+    /// path published with no resident are the same two fields otherwise, and
+    /// the first can never have a resident at all. See
+    /// [`crate::backend::window::FrameOrigin`].
+    pub origin: crate::backend::window::FrameOrigin,
     /// The rail's own handle to a GPU-resident frame, when one carries this
     /// present. Opaque here: it is produced by `Backend::window_resident` on
     /// the drain worker and handed back to `Backend::window_present` on this
@@ -320,6 +326,7 @@ fn window_cpu_frame(frame: &Frame) -> crate::backend::window::WindowCpuFrame<'_>
         width: frame.width,
         height: frame.height,
         seq: frame.seq,
+        origin: frame.origin,
     }
 }
 

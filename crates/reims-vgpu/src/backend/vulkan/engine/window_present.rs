@@ -17,6 +17,7 @@ use super::pools::ResourcePools;
 use super::types::{DrawError, PresentRect, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::translate;
+use crate::backend::window::FrameOrigin;
 
 /// Host-window present transactions submitted to the queue and not yet retired.
 ///
@@ -425,6 +426,10 @@ pub(crate) struct PendingWindowPresent {
     wait: super::queue_owner::PendingPresent,
     acquire_suboptimal: bool,
     direct: bool,
+    /// The origin class of the frame this present carried, which is what
+    /// separates a present the engine lost a resident for from one that could
+    /// never have had one. See [`FrameOrigin`].
+    origin: Option<FrameOrigin>,
     width: u32,
     height: u32,
     swapchain_images: usize,
@@ -434,6 +439,7 @@ pub(crate) struct FinishedWindowPresent {
     result: Result<bool, vk::Result>,
     acquire_suboptimal: bool,
     direct: bool,
+    origin: Option<FrameOrigin>,
     width: u32,
     height: u32,
     swapchain_images: usize,
@@ -448,6 +454,7 @@ impl PendingWindowPresent {
             result: self.wait.wait(),
             acquire_suboptimal: self.acquire_suboptimal,
             direct: self.direct,
+            origin: self.origin,
             width: self.width,
             height: self.height,
             swapchain_images: self.swapchain_images,
@@ -526,6 +533,20 @@ pub(crate) struct WindowPresenter {
     cadence_presents: u64,
     cadence_direct: u64,
     cadence_busy: u64,
+    /// Where this window's presented frames came from, and the routes the
+    /// present path's resident decisions were refused at.
+    ///
+    /// `direct_frac` alone cannot be read: it is one ratio over two questions
+    /// with different answers — a frame the early-console pump pushed can never
+    /// have a resident, so a boot whose window is working exactly as designed
+    /// reports 0.00 for the whole of firmware boot, and a frame the present path
+    /// published without a resident is the engine losing a present it could have
+    /// carried. The two are the same `presents` and the same `direct=0`.
+    ///
+    /// The window count and the boot count are both carried, because one window
+    /// says what is happening now and the total says whether it is steady state.
+    cadence_origin: PresentTally,
+    boot_origin: PresentTally,
     /// Distinct frame sequences offered in the window, and the last one seen.
     ///
     /// `presents` alone cannot separate "the device published 20 frames this
@@ -810,6 +831,8 @@ impl WindowPresenter {
             cadence_presents: 0,
             cadence_direct: 0,
             cadence_busy: 0,
+            cadence_origin: PresentTally::default(),
+            boot_origin: PresentTally::default(),
             cadence_offered: 0,
             cadence_last_offered: None,
             cadence_busy_fence: 0,
@@ -1083,7 +1106,7 @@ impl WindowPresenter {
         }
         if !self.retire(ctx)? {
             self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
-            self.note_cadence(false, false);
+            self.note_cadence(false, false, None);
             return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
         }
         if self.swapchain == vk::SwapchainKHR::null() || self.recreate_pending {
@@ -1095,7 +1118,7 @@ impl WindowPresenter {
             // this one says there is no window to pace against.
             if !self.recreate_swapchain(ctx)? {
                 self.cadence_busy_no_area = self.cadence_busy_no_area.saturating_add(1);
-                self.note_cadence(false, false);
+                self.note_cadence(false, false, None);
                 return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
         }
@@ -1113,14 +1136,14 @@ impl WindowPresenter {
             Ok((index, suboptimal)) => (index, suboptimal),
             Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
-                self.note_cadence(false, false);
+                self.note_cadence(false, false, None);
                 return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;
                 self.recreate_reason = "acquire_out_of_date";
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
-                self.note_cadence(false, false);
+                self.note_cadence(false, false, None);
                 return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
             }
             Err(error) => {
@@ -1411,12 +1434,18 @@ impl WindowPresenter {
         }
 
         let direct = selected.is_some();
+        // The class the frame's own publisher stamped on it, which the cadence
+        // counts beside `direct`. They are two different questions and both
+        // need answering: `direct` is whether a resident carried this present,
+        // `origin` is whether one could have.
+        let origin = cpu.map(|frame| frame.origin);
         match submission {
             super::context::PresentSubmission::Complete(result) => {
                 self.finish_present(FinishedWindowPresent {
                     result,
                     acquire_suboptimal,
                     direct,
+                    origin,
                     width: self.extent.width,
                     height: self.extent.height,
                     swapchain_images: self.images.len(),
@@ -1427,6 +1456,7 @@ impl WindowPresenter {
                     wait,
                     acquire_suboptimal,
                     direct,
+                    origin,
                     width: self.extent.width,
                     height: self.extent.height,
                     swapchain_images: self.images.len(),
@@ -1464,7 +1494,7 @@ impl WindowPresenter {
                 } else {
                     self.suboptimal_streak = 0;
                 }
-                self.note_cadence(true, finished.direct);
+                self.note_cadence(true, finished.direct, finished.origin);
                 Ok(WindowPresentDispatch::Complete(
                     WindowPresentOutcome::Presented {
                         direct: finished.direct,
@@ -1478,7 +1508,7 @@ impl WindowPresenter {
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;
                 self.recreate_reason = "present_out_of_date";
-                self.note_cadence(false, false);
+                self.note_cadence(false, false, None);
                 Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy))
             }
             Err(error) => Err(DrawError::VkCall(VkCall::new(
@@ -1724,10 +1754,17 @@ impl WindowPresenter {
         self.slate_covered = false;
     }
 
-    fn note_cadence(&mut self, presented: bool, direct: bool) {
+    fn note_cadence(&mut self, presented: bool, direct: bool, origin: Option<FrameOrigin>) {
         if presented {
             self.cadence_presents = self.cadence_presents.saturating_add(1);
             self.cadence_direct = self.cadence_direct.saturating_add(u64::from(direct));
+            // A present with no frame class is one the window re-blitted without
+            // a new offer — a forced redraw after a resize or a self-heal — and
+            // it carries the frame it already had, whose class was counted when
+            // that frame arrived. Counting it again would double the window.
+            if let Some(origin) = origin {
+                self.cadence_origin.note_frames(origin);
+            }
         } else {
             self.cadence_busy = self.cadence_busy.saturating_add(1);
         }
@@ -1735,6 +1772,9 @@ impl WindowPresenter {
         if elapsed.as_millis() < 1_000 {
             return;
         }
+        // Folded in before the line is built, so the total and the window it
+        // contains are read from one value.
+        self.boot_origin = self.boot_origin.saturating_add(&self.cadence_origin);
         crate::observe::off(window_cadence_line(
             elapsed.as_millis() as u64,
             self.cadence_presents,
@@ -1746,6 +1786,8 @@ impl WindowPresenter {
                 no_area: self.cadence_busy_no_area,
             },
             self.cadence_offered,
+            self.cadence_origin,
+            self.boot_origin,
         ));
         self.cadence_started = Instant::now();
         self.cadence_presents = 0;
@@ -1755,6 +1797,7 @@ impl WindowPresenter {
         self.cadence_busy_fence = 0;
         self.cadence_busy_acquire = 0;
         self.cadence_busy_no_area = 0;
+        self.cadence_origin = PresentTally::default();
     }
 
     /// Give every entry's graveyard claim back after the caller has waited the
@@ -1852,21 +1895,145 @@ struct CadenceBusy {
     no_area: u64,
 }
 
+/// Every word a publish can put on a frame it did not carry with a resident, in
+/// the order the cadence line prints them.
+///
+/// Taken from the registry that owns the vocabulary rather than written out
+/// again: `resident_present_decision` returns these names, the device reports
+/// them on the drain's route channel, and this line counts the frames by them.
+/// A second spelling would leave one refusal counted on one channel and
+/// invisible on the other, which is two readings of one present.
+const DECLINE_ROUTES: [&str; 5] = super::pools::PRESENT_DECLINE_ROUTES;
+
+/// Presents by the origin of the frame they carried, and the routes the frames
+/// the present path published were refused at.
+///
+/// One value rather than two fields because they are one reading: the three
+/// origin classes *are* the denominator `direct_frac` never had, and the decline
+/// counts are what says which refusals that denominator is made of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PresentTally {
+    /// The present path published it and a resident carried it.
+    resident: u64,
+    /// The present path published it and none did.
+    cpu: u64,
+    /// The pre-boundary early-console pump pushed it. Never resident-capable.
+    early: u64,
+    /// The refused routes, indexed by [`DECLINE_ROUTES`].
+    declined: [u64; DECLINE_ROUTES.len()],
+    /// The present path published it and **no resident decision was reached** — a
+    /// caller that handed the window a frame without asking the registry.
+    /// `publish_window_frame` always reaches one, so on a real boot this must be
+    /// zero; it is kept apart from the unknown-route bucket below because a
+    /// non-zero count here is a publish path that skipped the question rather
+    /// than a word this list has not heard of.
+    no_decision: u64,
+    /// A refuse route this list does not know: a new class added at the publish
+    /// and not here. Counted apart so it is visible on the line rather than
+    /// dropped into one of them.
+    declined_unnamed: u64,
+}
+
+impl PresentTally {
+    fn note_frames(&mut self, origin: FrameOrigin) {
+        match origin {
+            FrameOrigin::Resident => self.resident = self.resident.saturating_add(1),
+            FrameOrigin::PresentPath { decline } => {
+                self.cpu = self.cpu.saturating_add(1);
+                match decline
+                    .and_then(|route| DECLINE_ROUTES.iter().position(|held| *held == route))
+                {
+                    Some(index) => self.declined[index] = self.declined[index].saturating_add(1),
+                    None if decline.is_none() => {
+                        self.no_decision = self.no_decision.saturating_add(1);
+                    }
+                    None => self.declined_unnamed = self.declined_unnamed.saturating_add(1),
+                }
+            }
+            FrameOrigin::EarlyConsole => self.early = self.early.saturating_add(1),
+        }
+    }
+
+    fn saturating_add(&self, other: &Self) -> Self {
+        let mut sum = *self;
+        sum.resident = sum.resident.saturating_add(other.resident);
+        sum.cpu = sum.cpu.saturating_add(other.cpu);
+        sum.early = sum.early.saturating_add(other.early);
+        for (slot, extra) in sum.declined.iter_mut().zip(other.declined) {
+            *slot = slot.saturating_add(extra);
+        }
+        sum.no_decision = sum.no_decision.saturating_add(other.no_decision);
+        sum.declined_unnamed = sum.declined_unnamed.saturating_add(other.declined_unnamed);
+        sum
+    }
+
+    /// `{resident:N,cpu:N,early:N}` — the three classes, named.
+    fn origins(self) -> String {
+        format!(
+            "{{resident:{},cpu:{},early:{}}}",
+            self.resident, self.cpu, self.early
+        )
+    }
+
+    /// `{<route>:N,…}` — every refusal route printed, zeros included, because a
+    /// zero here is a reading and not an absence.
+    fn declines(self) -> String {
+        let mut out = String::from("{");
+        for (index, route) in DECLINE_ROUTES.iter().enumerate() {
+            if index != 0 {
+                out.push(',');
+            }
+            // The published slug without its `winpub_` prefix, which every field
+            // on this line is already about: the window's own publish.
+            out.push_str(route.strip_prefix("winpub_").unwrap_or(route));
+            out.push(':');
+            out.push_str(&self.declined[index].to_string());
+        }
+        if self.no_decision != 0 {
+            out.push_str(&format!(",no_decision:{}", self.no_decision));
+        }
+        if self.declined_unnamed != 0 {
+            out.push_str(&format!(",unnamed:{}", self.declined_unnamed));
+        }
+        out.push('}');
+        out
+    }
+}
+
 fn window_cadence_line(
     window_ms: u64,
     presents: u64,
     direct: u64,
     busy: CadenceBusy,
     offered: u64,
+    origin: PresentTally,
+    boot: PresentTally,
 ) -> String {
     let hz = presents as f64 * 1_000.0 / window_ms.max(1) as f64;
     let direct_fraction = direct as f64 / presents.max(1) as f64;
     let offered_hz = offered as f64 * 1_000.0 / window_ms.max(1) as f64;
+    // The resident ratio over the frames a resident could have carried, which is
+    // the ratio `direct_frac` was always meant to be. `presents` includes the
+    // early-console pump's frames, and those can never be direct, so on the boot
+    // phase the two disagree by construction: 0.00 and 0.00 with nothing else on
+    // the line said the window was losing every present, and `origins` is what
+    // says it was showing firmware output instead.
+    let resident_capable = origin.resident + origin.cpu;
+    let direct_fraction_present_path = origin.resident as f64 / resident_capable.max(1) as f64;
     format!(
         "host_window_cadence window_ms={window_ms} presents={presents} direct={direct} \
          busy={} busy_fence={} busy_acquire={} busy_no_area={} offered={offered} \
-         present_hz={hz:.1} offered_hz={offered_hz:.1} direct_frac={direct_fraction:.2}",
-        busy.total, busy.fence, busy.acquire, busy.no_area
+         present_hz={hz:.1} offered_hz={offered_hz:.1} direct_frac={direct_fraction:.2} \
+         origins={} declines={} direct_frac_of_present_path={direct_fraction_present_path:.2} \
+         boot_origins={} boot_declines={}",
+        busy.total,
+        busy.fence,
+        busy.acquire,
+        busy.no_area,
+        origin.origins(),
+        origin.declines(),
+        boot.origins(),
+        boot.declines(),
     )
 }
 
@@ -1999,6 +2166,8 @@ mod tests {
                 no_area: 1,
             },
             240,
+            tally(&[(FrameOrigin::Resident, 119), (FrameOrigin::EarlyConsole, 1)]),
+            PresentTally::default(),
         );
         assert!(line.contains("presents=120"), "{line}");
         assert!(line.contains("direct=119"), "{line}");
@@ -2010,6 +2179,15 @@ mod tests {
         assert!(line.contains("busy_no_area=1"), "{line}");
         assert!(line.contains("present_hz=120.0"), "{line}");
         assert!(line.contains("direct_frac=0.99"), "{line}");
+        assert!(
+            line.contains("origins={resident:119,cpu:0,early:1}"),
+            "{line}"
+        );
+        // One early frame cannot be direct, so the ratio over the frames a
+        // resident could have carried is 1.00 where `direct_frac` is 0.99. The
+        // pair is the reading: a line carrying only the first says a healthy
+        // window lost a present.
+        assert!(line.contains("direct_frac_of_present_path=1.00"), "{line}");
     }
 
     /// `offered` is the denominator `presents` needs. A window that presents 20
@@ -2030,10 +2208,118 @@ mod tests {
                 no_area: 0,
             },
             109,
+            tally(&[(FrameOrigin::Resident, 20)]),
+            PresentTally::default(),
         );
         assert!(line.contains("offered=109"), "{line}");
         assert!(line.contains("offered_hz=109.0"), "{line}");
         assert!(line.contains("present_hz=20.0"), "{line}");
+    }
+
+    /// Build a tally from `(origin, count)` pairs, so a test names the classes it
+    /// means rather than the struct's field order.
+    fn tally(frames: &[(FrameOrigin, u64)]) -> PresentTally {
+        let mut tally = PresentTally::default();
+        for (origin, count) in frames {
+            for _ in 0..*count {
+                tally.note_frames(*origin);
+            }
+        }
+        tally
+    }
+
+    /// A frame the present path published with no resident is a lost present,
+    /// and it must land in `cpu` under the route it was refused by — not in
+    /// `early`, which can never be direct, and not in `unnamed`, which is the
+    /// bucket a class this list has not heard of falls into.
+    #[test]
+    fn the_tally_separates_the_three_origins_and_names_every_refusal() {
+        let tally = tally(&[
+            (FrameOrigin::Resident, 3),
+            (FrameOrigin::PresentPath { decline: None }, 1),
+            (
+                FrameOrigin::PresentPath {
+                    decline: Some("winpub_no_resident"),
+                },
+                5,
+            ),
+            (
+                FrameOrigin::PresentPath {
+                    decline: Some("winpub_geometry"),
+                },
+                2,
+            ),
+            (
+                FrameOrigin::PresentPath {
+                    decline: Some("winpub_window_not_attached"),
+                },
+                4,
+            ),
+            (FrameOrigin::EarlyConsole, 7),
+        ]);
+        assert_eq!(tally.resident, 3);
+        // Every present-path frame lands in `cpu`, including the one that
+        // reached no decision at all.
+        assert_eq!(tally.cpu, 12);
+        assert_eq!(tally.early, 7);
+        assert_eq!(
+            tally.origins(),
+            "{resident:3,cpu:12,early:7}",
+            "the three classes must be printed by name"
+        );
+        // Every word is printed, zeros included: a zero is a reading — and
+        // `not_attached` is its own column rather than folded into the
+        // missing-target class, which it is not: nothing was asked.
+        assert_eq!(
+            tally.declines(),
+            "{no_resident:5,content_not_ready:0,scanout_order:0,geometry:2,\
+             window_not_attached:4,no_decision:1}"
+        );
+        // A word this list does not know is counted apart rather than folded
+        // into one of the classes it names.
+        let mut unknown = PresentTally::default();
+        unknown.note_frames(FrameOrigin::PresentPath {
+            decline: Some("winpub_something_new"),
+        });
+        assert_eq!(unknown.cpu, 1);
+        assert_eq!(unknown.declined_unnamed, 1);
+        assert_eq!(
+            unknown.no_decision, 0,
+            "an unknown word is not a skipped question"
+        );
+        assert!(
+            unknown.declines().contains("unnamed:1"),
+            "{}",
+            unknown.declines()
+        );
+    }
+
+    /// The words this line counts are the words the publisher writes.
+    ///
+    /// The publish reports each refusal on the drain's route channel under one
+    /// of these names and hands the same name to the frame; a line that spelled
+    /// one differently would report that refusal as `unnamed` here while the
+    /// channel counted it, which is two readings of one present.
+    #[test]
+    fn the_decline_classes_are_the_publishers_routes() {
+        use crate::backend::window::FrameOrigin;
+        let published = crate::backend::vulkan::engine::pools::PRESENT_DECLINE_ROUTES;
+        assert_eq!(
+            DECLINE_ROUTES, published,
+            "the cadence and the publish must name the same words"
+        );
+        // And each one is reachable from an origin, which the enumeration above
+        // relies on.
+        for route in DECLINE_ROUTES {
+            assert!(
+                FrameOrigin::PresentPath {
+                    decline: Some(route)
+                }
+                .decline()
+                .is_some(),
+                "{route} must survive the frame"
+            );
+        }
     }
 
     /// Every reason has a distinct, `slate_`-prefixed slug.

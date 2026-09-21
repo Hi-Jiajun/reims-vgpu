@@ -1857,6 +1857,54 @@ pub(crate) enum ResidentPresentDecline {
     Geometry,
 }
 
+impl ResidentPresentDecline {
+    /// Every decline, in the order the window's cadence line prints them.
+    pub(crate) const ALL: [Self; 3] = [Self::ContentNotReady, Self::ScanoutOrder, Self::Geometry];
+
+    /// The slug this refusal reaches the drain's route channel under.
+    ///
+    /// One spelling, three readers: the publish's decision returns it, the
+    /// device reports it, and the window counts presents by it. A second
+    /// spelling anywhere is a refusal counted on one channel and invisible on
+    /// the other.
+    pub(crate) const fn route(self) -> &'static str {
+        match self {
+            Self::ContentNotReady => "winpub_content_not_ready",
+            Self::ScanoutOrder => "winpub_scanout_order",
+            Self::Geometry => "winpub_geometry",
+        }
+    }
+}
+
+/// A publish that found no resident at all: the key did not resolve.
+///
+/// Named apart from [`ResidentPresentDecline`] because it is not a property of a
+/// slot — there is no slot — and it is the class every refused publish on this
+/// device lands in, which is why it is listed first.
+pub(crate) const PRESENT_DECLINE_NO_RESIDENT: &str = "winpub_no_resident";
+
+/// The window is not consuming the capture, so no resident decision was reached
+/// at all and the frame is CPU-only for that reason.
+///
+/// Not a refusal — nothing was refused — but it is one of the words a publish
+/// puts on a frame it did not carry with a resident, which is the question the
+/// window's cadence counts. Folding it into the missing-target class would say
+/// the registry was asked and said no, which is the opposite of what happened.
+pub(crate) const PRESENT_DECLINE_WINDOW_NOT_ATTACHED: &str = "winpub_window_not_attached";
+
+/// Every word a window publish can put on a frame it did not carry with a
+/// resident, in the order the window's cadence line prints them.
+///
+/// The three declines are read off their own vocabulary rather than written out
+/// again, so this list cannot drift from what the decision returns.
+pub(crate) const PRESENT_DECLINE_ROUTES: [&str; 5] = [
+    PRESENT_DECLINE_NO_RESIDENT,
+    ResidentPresentDecline::ALL[0].route(),
+    ResidentPresentDecline::ALL[1].route(),
+    ResidentPresentDecline::ALL[2].route(),
+    PRESENT_DECLINE_WINDOW_NOT_ATTACHED,
+];
+
 pub(crate) fn slot_present_decline(
     slot: &ResidentTargetSlot,
     width: u32,
