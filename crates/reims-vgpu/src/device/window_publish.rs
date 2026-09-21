@@ -18,6 +18,11 @@
 #[cfg(feature = "host-window")]
 use super::*;
 
+/// The class this publish hands the frame slot, so the window's cadence can
+/// count presents by origin rather than by one ratio that mixes two questions.
+#[cfg(feature = "host-window")]
+use crate::backend::window::FrameOrigin;
+
 /// Link to a running host-owned presentation window ([[host-window]]).
 ///
 /// Held on the device so the drain can publish finished frames into `frames`
@@ -327,9 +332,23 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // the whole framebuffer through host memory on every frame and the
     // difference between the two is the window's frame rate. Silence here is
     // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
+    // The same route also rides the frame into the window's own cadence, which
+    // is where the ratio is read.
+    // The route the resident decision refused by, or the not-attached word for
+    // a window that is not consuming a capture. Both arms below either set it
+    // or return, so it carries no default that a reader could mistake for an
+    // answer.
+    let decline: Option<&'static str>;
     match (backend.window_attached(), resident) {
         (true, Ok(resident)) => {
-            let published = window_write_frame(link, width, height, Vec::new(), Some(resident));
+            let published = window_write_frame(
+                link,
+                width,
+                height,
+                Vec::new(),
+                Some(resident),
+                FrameOrigin::Resident,
+            );
             crate::runtime::census::present_proxy::host_window_publish::note(published);
             if published {
                 link.last = key;
@@ -337,8 +356,21 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
             }
             return;
         }
-        (true, Err(route)) => crate::runtime::drain::note_store_route(route),
-        (false, _) => crate::runtime::drain::note_store_route("winpub_window_not_attached"),
+        // Two arms, and the difference between them is the reading: a route is
+        // this present path asking for a resident and being refused, while
+        // `window_not_attached` is the same path with nothing to publish into.
+        // Both land on the CPU source below, and only the first is the engine
+        // losing a present it could have carried.
+        (true, Err(route)) => {
+            decline = Some(route);
+            crate::runtime::drain::note_store_route(route);
+        }
+        (false, _) => {
+            decline = Some(crate::backend::vulkan::engine::PRESENT_DECLINE_WINDOW_NOT_ATTACHED);
+            crate::runtime::drain::note_store_route(
+                crate::backend::vulkan::engine::PRESENT_DECLINE_WINDOW_NOT_ATTACHED,
+            );
+        }
     }
     // No resident carries this present (firmware framebuffer, a mapping the
     // compositor cleared but never rendered into, the frames after a device
@@ -375,7 +407,14 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // so a later mismatch at the same geometry logs again.
     link.bgra_short_geom = None;
     let bgra = state.present.frame_bgra[..need].to_vec();
-    let published = window_write_frame(link, width, height, bgra, None);
+    let published = window_write_frame(
+        link,
+        width,
+        height,
+        bgra,
+        None,
+        FrameOrigin::PresentPath { decline },
+    );
     crate::runtime::census::present_proxy::host_window_publish::note(published);
     if published {
         link.last = key;
@@ -399,6 +438,7 @@ fn window_write_frame(
     height: u32,
     bgra: Vec<u8>,
     resident: Option<crate::backend::window::WindowResident>,
+    origin: crate::backend::window::FrameOrigin,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
     let frame = std::sync::Arc::new(crate::host_window::present::Frame {
@@ -406,6 +446,7 @@ fn window_write_frame(
         width,
         height,
         bgra,
+        origin,
         resident,
     });
     let stored = match link.frames.lock() {
@@ -566,7 +607,14 @@ pub(crate) fn publish_window_early_frame<
     slot.early_last_ns.store(now_ns, Ordering::Relaxed);
     // Early boot frames come from the BAR1 GOP framebuffer, not a resident
     // target, so there is no resident source to hand over.
-    window_write_frame(link, w, h, buf, None);
+    //
+    // And they say so on the frame: this is the arm that made a boot read
+    // `direct_frac=0.00` for its first twenty-six sampling windows at 28-29
+    // presents a second. Nothing here can have a resident — BAR1 GOP RAM is not
+    // a mapping — so a reader counting these against the resident ratio is
+    // reading a cliff that does not exist, and the class travelling with the
+    // frame is what lets `host_window_cadence` show the two denominators apart.
+    window_write_frame(link, w, h, buf, None, FrameOrigin::EarlyConsole);
 }
 
 /// Copy the registered BAR1 early framebuffer into `dst` (tight BGRA8). Returns

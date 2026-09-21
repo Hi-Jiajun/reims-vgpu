@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 use reims_vgpu::backend::vulkan::engine::{
     window_present_attached, window_present_frame, window_present_resize,
 };
-use reims_vgpu::backend::window::{WindowCpuFrame, WindowPresentOutcome};
+use reims_vgpu::backend::window::{FrameOrigin, WindowCpuFrame, WindowPresentOutcome};
 use reims_vgpu::host_window::present::{spawn, FrameSlot, WindowConfig, WindowMode, WindowWaker};
 
 const W: u32 = 640;
@@ -140,6 +140,7 @@ fn main() {
                 width: W,
                 height: H,
                 seq,
+                origin: FrameOrigin::PresentPath { decline: None },
             };
             match window_present_frame(None, Some(frame)) {
                 Ok(WindowPresentOutcome::Presented { .. }) => {

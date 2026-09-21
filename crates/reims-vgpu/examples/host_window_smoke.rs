@@ -102,6 +102,7 @@ fn gradient(w: u32, h: u32, t: u32) -> Frame {
         width: w,
         height: h,
         bgra,
+        origin: reims_vgpu::backend::window::FrameOrigin::PresentPath { decline: None },
         resident: None,
     }
 }

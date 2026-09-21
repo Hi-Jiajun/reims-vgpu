@@ -26,6 +26,24 @@
 //! the four states [`crate::config::CAPTURE_PROBE`]'s doc lists, because each
 //! has a different repair.
 //!
+//! # The other half of the pipeline, on the same switch
+//!
+//! The capture is one of two places that ask the registry for a resident, and
+//! they ask the *same* four questions: the capture wants an image to hand the
+//! console, the window **publish** wants one to hand the host window. The
+//! publish's answers are [`PresentRefusal`], reported here rather than beside
+//! the window because the reading that matters is the two halves together — a
+//! boot whose captures are served and whose publishes are refused is a
+//! different defect from one where neither finds a resident.
+//!
+//! Until this existed the publish's four answers reached the drain's route
+//! channel as one word per class and stopped there: `winpub_no_resident` is
+//! what a boot at `direct_frac=0.00` reported for its whole run, and that one
+//! name covers both "nothing names this surface" and "the registry holds it
+//! under another key" — the two states this probe's own doc says have different
+//! repairs. [`PresentCounts::key_*`] separates them, on the same principle as
+//! [`CaptureRefusal::KeyGeneration`] does one layer down.
+//!
 //! # Cost, and the shape of the output
 //!
 //! Off: [`enabled`] is one `OnceLock` load and nothing below runs — no counter
@@ -49,6 +67,59 @@ use super::CaptureRefusal;
 /// that the summary line still carries the counts; only the registry dump is
 /// dropped, which is the expensive half.
 pub const MAX_DETAILS: usize = 8;
+
+/// Distinct present-publish signatures that get a detail line in one boot.
+///
+/// A budget of its own rather than a share of [`MAX_DETAILS`], so the two halves
+/// cannot spend each other's: a boot whose captures miss six ways would
+/// otherwise leave two lines for the publishes, which is where the question
+/// that made this probe necessary is asked.
+pub const PRESENT_MAX_DETAILS: usize = 8;
+
+/// Why a window publish could not hand the host window a resident.
+///
+/// The publish's own four states, in the same order and with the same repairs
+/// as [`CaptureRefusal`]'s first four: the answers
+/// [`crate::backend::vulkan::engine::pools::slot_present_decline`] can give.
+/// They used to collapse into one `bool` at the publish and reach the drain as
+/// one more route, which is why a boot reading `direct_frac=0.00` in every
+/// window named no cause at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentRefusal {
+    /// No resident under the key the publish asked under. Which of the two
+    /// states that is — nothing names the surface, or it is registered under a
+    /// different key — is the divergence counted beside this one.
+    NoResident,
+    /// The image is registered and nothing has vouched for its pixels yet.
+    ContentNotReady,
+    /// The image's texels are not in the byte order the scanout blit reads.
+    ScanoutOrder,
+    /// The registered image is not at the extent being presented.
+    Geometry,
+}
+
+impl PresentRefusal {
+    /// The word this refusal contributes to `present_refused=`.
+    ///
+    /// Deliberately the same four words the capture side uses for the same four
+    /// states, so one reader can put the two halves side by side.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NoResident => "no_resident",
+            Self::ContentNotReady => "content_not_ready",
+            Self::ScanoutOrder => "scanout_order",
+            Self::Geometry => "geometry",
+        }
+    }
+
+    /// Every refusal, in the order the probe's summary line prints them.
+    pub const ALL: [PresentRefusal; 4] = [
+        Self::NoResident,
+        Self::ContentNotReady,
+        Self::ScanoutOrder,
+        Self::Geometry,
+    ];
+}
 
 /// Which source served a capture attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +194,47 @@ static COUNTS: Counts = Counts {
 
 /// Signatures that already have a detail line, and how often each has failed.
 static DETAILED: Mutex<Vec<((&'static str, String), u64)>> = Mutex::new(Vec::new());
+
+/// One boot's window-publish counts, on the same switch and reported on the
+/// same summary line as the capture's.
+///
+/// The class counters are not the whole reading and are not meant to be: the
+/// publish's returned slug already reaches `store_routes` as `winpub_<class>`
+/// with the probe off. What only this can report is the **key** the refusal
+/// happened under — the divergence behind `no_resident`, which is the class
+/// every refused publish on this device has landed in.
+struct PresentCounts {
+    refusals: AtomicU64,
+    classes: [AtomicU64; PresentRefusal::ALL.len()],
+    /// Nothing in the registry names this surface at all.
+    key_absent: AtomicU64,
+    /// The surface is there and the key moved (the guest re-mapped it).
+    key_generation: AtomicU64,
+    /// The surface is there at another extent.
+    key_geometry: AtomicU64,
+    /// The surface and the extent agree and some other field differs.
+    key_other: AtomicU64,
+    /// The id is registered in another namespace, so it is not this object.
+    key_namespace: AtomicU64,
+}
+
+static PRESENT_COUNTS: PresentCounts = PresentCounts {
+    refusals: AtomicU64::new(0),
+    classes: [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    key_absent: AtomicU64::new(0),
+    key_generation: AtomicU64::new(0),
+    key_geometry: AtomicU64::new(0),
+    key_other: AtomicU64::new(0),
+    key_namespace: AtomicU64::new(0),
+};
+
+/// Signatures that already have a present-publish detail line.
+static PRESENT_DETAILED: Mutex<Vec<((&'static str, String), u64)>> = Mutex::new(Vec::new());
 
 /// Whether this process observes the capture's steps.
 ///
@@ -212,6 +324,88 @@ pub fn note_step(refusal: CaptureRefusal, signature: &str, detail: impl FnOnce()
     ));
 }
 
+/// Count a presented frame's refusal, with the registry key it happened under
+/// and, for a new signature, the registry's own answer.
+///
+/// `key` is what `ResourcePools::registry_key_divergence` says about the key
+/// that just missed — how the closest held key differs, and the generation it
+/// was held under — and is `None` for a refusal whose key *was* present, where
+/// there is no divergence to report and counting one would put every
+/// `content_not_ready` into `present_key_*`. It is the parameter this function
+/// exists for: the class alone cannot separate a missing target from a key
+/// fault, and those are the two states the switch's own doc says have different
+/// repairs.
+///
+/// `signature` identifies the failure for deduplication and `detail` builds the
+/// line, so a repeated refusal pays neither the registry report nor the
+/// formatting. Bounded by [`PRESENT_MAX_DETAILS`], and the summary still carries
+/// the counts past that.
+pub fn note_present_refusal(
+    refusal: PresentRefusal,
+    key: Option<(
+        crate::backend::vulkan::engine::TargetKeyDivergence,
+        Option<u64>,
+    )>,
+    signature: &str,
+    detail: impl FnOnce() -> String,
+) {
+    if !enabled() {
+        return;
+    }
+    let counts = &PRESENT_COUNTS;
+    let total = counts.refusals.fetch_add(1, Ordering::Relaxed) + 1;
+    let slot = PresentRefusal::ALL
+        .iter()
+        .position(|held| *held == refusal)
+        .expect("every present refusal has a slot the vocabulary derives");
+    counts.classes[slot].fetch_add(1, Ordering::Relaxed);
+    let (key_word, held) = match key {
+        None => ("not_asked".to_owned(), "n/a".to_owned()),
+        Some((divergence, held)) => {
+            use crate::backend::vulkan::engine::TargetKeyDivergence as How;
+            let counter = match divergence {
+                How::Absent => &counts.key_absent,
+                How::Generation => &counts.key_generation,
+                How::Geometry => &counts.key_geometry,
+                How::Other => &counts.key_other,
+                How::Namespace => &counts.key_namespace,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            (
+                divergence.label().to_owned(),
+                held.map(|generation| generation.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+            )
+        }
+    };
+    let Ok(mut detailed) = PRESENT_DETAILED.lock() else {
+        return;
+    };
+    // The class is part of the key: one surface refused for two different
+    // reasons is two findings, and a key that dropped the class would report
+    // the second as a repeat of the first.
+    let signature_key = (refusal.slug(), signature.to_owned());
+    if let Some((_, count)) = detailed.iter_mut().find(|(held, _)| *held == signature_key) {
+        *count += 1;
+        return;
+    }
+    if detailed.len() >= PRESENT_MAX_DETAILS {
+        return;
+    }
+    detailed.push((signature_key, 1));
+    drop(detailed);
+    crate::observe::off(format!(
+        "capture_probe present_refused={} key={key_word} held_generation={held} {signature} {}",
+        refusal.slug(),
+        detail()
+    ));
+    // Power-of-two spacing, the same rule the capture side uses: the ratio is
+    // readable from the first refusal onward and a hot present cannot flood.
+    if total.is_power_of_two() {
+        crate::observe::off(summary_line(COUNTS.attempts.load(Ordering::Relaxed)));
+    }
+}
+
 /// The summary, with every class printed — a zero here is a reading rather than
 /// an absence, which is the whole reason the probe has its own line.
 fn summary_line(attempts: u64) -> String {
@@ -239,6 +433,40 @@ fn summary_line(attempts: u64) -> String {
             " refused_{}={}",
             refusal.slug(),
             counts.steps[step_index(refusal)].load(Ordering::Relaxed)
+        ));
+    }
+    // The publish half, on the same line and under its own prefix. `attempts`
+    // above is the capture's, so the two denominators cannot be confused: the
+    // presents that reached a publish are `present_refused_total` plus whatever
+    // was served, and this line is read beside `host_window_cadence`, which
+    // carries the served half.
+    let presents = &PRESENT_COUNTS;
+    out.push_str(&format!(
+        " present_refused_total={} present_signatures={}",
+        presents.refusals.load(Ordering::Relaxed),
+        PRESENT_DETAILED.lock().map(|held| held.len()).unwrap_or(0),
+    ));
+    for refusal in PresentRefusal::ALL {
+        let slot = PresentRefusal::ALL
+            .iter()
+            .position(|held| *held == refusal)
+            .expect("every present refusal has a slot the vocabulary derives");
+        out.push_str(&format!(
+            " present_refused_{}={}",
+            refusal.slug(),
+            presents.classes[slot].load(Ordering::Relaxed)
+        ));
+    }
+    for (label, counter) in [
+        ("absent", &presents.key_absent),
+        ("generation", &presents.key_generation),
+        ("geometry", &presents.key_geometry),
+        ("other", &presents.key_other),
+        ("namespace", &presents.key_namespace),
+    ] {
+        out.push_str(&format!(
+            " present_key_{label}={}",
+            counter.load(Ordering::Relaxed)
         ));
     }
     out

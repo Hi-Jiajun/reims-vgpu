@@ -46,6 +46,11 @@ pub use pools::sampled_working_set::census as sampled_working_set_census;
 /// Reference interval used only to keep reuse-distance census bands stable.
 /// Residency policy does not read it.
 pub(crate) use pools::IDLE_MAINTENANCE_START_MS;
+// The one word of the publish's vocabulary that is written *above* this module:
+// `device::window_publish` names the not-attached case, and a private `pools`
+// path would make it spell that word a second time. The other four are only
+// ever produced here, so they stay where the decline vocabulary lives.
+pub(crate) use pools::PRESENT_DECLINE_WINDOW_NOT_ATTACHED;
 pub mod gather_phase;
 pub mod gpu_span;
 pub mod reason;
@@ -94,6 +99,11 @@ use parking_lot::Mutex;
 use pools::ResourcePools;
 use std::sync::atomic::{AtomicU64, Ordering};
 use types::ComputeError;
+
+// The publish's refusal classes, named by the probe's shared vocabulary so a
+// reader can put the window's refusals beside the capture's. See
+// [`note_present_refusal`].
+use crate::runtime::scanout::capture_probe::PresentRefusal;
 
 /// The colour aspect of a single-mip, single-layer image — the shape of every
 /// image this engine creates.
@@ -2096,6 +2106,14 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
 /// takes the same engine lock `read_resident_bgra` takes and is called only on a
 /// refusal, so a boot that is not probing this pays nothing and a boot that is
 /// pays one lock and one bounded walk per distinct failure.
+///
+/// # It takes the lock, so callers under it must use the method instead
+///
+/// The lock is not reentrant. A caller that already holds it wants
+/// [`ResourcePools::capture_probe_report`], which is this same report on the
+/// registry in hand and takes nothing. The publish's own refusal census is such
+/// a caller, and it hung a whole arm of the dp1 round before it was changed to
+/// the method — see [`note_present_refusal`], whose doc carries the reading.
 pub fn capture_probe_report(identity: &TargetIdentity) -> String {
     lock_engine().pools.capture_probe_report(identity)
 }
@@ -2109,6 +2127,10 @@ pub fn capture_probe_report(identity: &TargetIdentity) -> String {
 /// them separately could publish one identity and record another, and the
 /// recording is what the one removal path recognises in order to invalidate the
 /// window's source.
+///
+/// Every refusal is also accounted for [`crate::config::CAPTURE_PROBE`], which
+/// is off in every measured arm — see [`note_present_refusal`] for what that
+/// adds and why the class alone was not a reading.
 fn resident_present_decision(
     pools: &mut ResourcePools,
     identity: &TargetIdentity,
@@ -2117,15 +2139,21 @@ fn resident_present_decision(
 ) -> Result<WindowPresentResolution, &'static str> {
     let Some(slot) = pools.registry_get(identity) else {
         pools.note_window_published(None);
-        return Err("winpub_no_resident");
+        note_present_refusal(pools, identity, PresentRefusal::NoResident);
+        return Err(pools::PRESENT_DECLINE_NO_RESIDENT);
     };
     if let Some(decline) = pools::slot_present_decline(slot, width, height) {
         pools.note_window_published(None);
-        return Err(match decline {
-            pools::ResidentPresentDecline::ContentNotReady => "winpub_content_not_ready",
-            pools::ResidentPresentDecline::ScanoutOrder => "winpub_scanout_order",
-            pools::ResidentPresentDecline::Geometry => "winpub_geometry",
-        });
+        let refusal = match decline {
+            pools::ResidentPresentDecline::ContentNotReady => PresentRefusal::ContentNotReady,
+            pools::ResidentPresentDecline::ScanoutOrder => PresentRefusal::ScanoutOrder,
+            pools::ResidentPresentDecline::Geometry => PresentRefusal::Geometry,
+        };
+        note_present_refusal(pools, identity, refusal);
+        // The slug the drain was already reporting, now read off the decline
+        // itself so the route, the class counted here and the window's own
+        // counters cannot name one refusal three ways.
+        return Err(decline.route());
     }
     // Taken from the slot this transaction just accepted, not re-read after the
     // recording below: the resolution and the decision must be of one slot, for
@@ -2142,6 +2170,68 @@ fn resident_present_decision(
         epoch: pools::window_source_epoch(),
         resolved,
     })
+}
+
+/// Account one window publish's refusal for
+/// [`crate::config::CAPTURE_PROBE`], and nothing at all when it is off.
+///
+/// The publish asks the registry the same four questions the present *capture*
+/// does one layer down — is there an image, has anything vouched for it, is its
+/// byte order the scanout's, is it at this extent — and until this call existed
+/// all four answers reached the drain's route channel as one word each and
+/// stopped there. A boot that presented every frame off the CPU path reported
+/// `winpub_no_resident` for its whole run, and that one word covers both
+/// "nothing names this surface" and "the registry holds it under another key",
+/// which have entirely different repairs. `ResourcePools::registry_key_divergence`
+/// already separates them for the capture; this is the same question asked
+/// where the window's refusals are decided, under the lock the publish already
+/// holds.
+///
+/// Off is today's device exactly: one `OnceLock` load, no clock read and no
+/// allocation on the refusal path.
+///
+/// # Why the registry report comes off `pools` and not the free function
+///
+/// This runs **inside the engine lock**: `prepare_window_resident_present` takes
+/// it and calls the decision, which calls this. [`capture_probe_report`] — the
+/// free function of the same name — takes that lock again, and the lock is not
+/// reentrant, so calling it here hangs the drain thread with the engine lock
+/// held and the window never presents again. It did: arm `dp1b` of this round
+/// froze at the first product present, 33 cadence windows in, with
+/// `host_window_publish` and `winpub_no_resident` both at zero because the probe
+/// hung *before* the refusal reached the drain's route channel. The method on
+/// `ResourcePools` is the same report without the lock, which is the only form
+/// reachable from here.
+fn note_present_refusal(pools: &ResourcePools, identity: &TargetIdentity, refusal: PresentRefusal) {
+    if !crate::runtime::scanout::capture_probe::enabled() {
+        return;
+    }
+    // Only the missing-target class has a key that diverged. The other three
+    // are refusals *of* a key that resolved, so asking for a divergence there
+    // would file every one of them under a near miss they are not.
+    let key = match refusal {
+        PresentRefusal::NoResident => Some(pools.registry_key_divergence(identity)),
+        PresentRefusal::ContentNotReady
+        | PresentRefusal::ScanoutOrder
+        | PresentRefusal::Geometry => None,
+    };
+    let signature = format!(
+        "mid={} {}x{} map_gen={}",
+        identity.namespaced_id().1,
+        identity.width(),
+        identity.height(),
+        identity.generation(),
+    );
+    crate::runtime::scanout::capture_probe::note_present_refusal(refusal, key, &signature, || {
+        // Built only for a signature nobody has seen: the registry walk the
+        // report makes is the expensive half, and it is what turns the word
+        // `no_resident` into the state the miss happened in. `pools` and not
+        // `capture_probe_report`: see this function's own note on the lock.
+        format!(
+            "{signature} identity={identity:?} slot: {}",
+            pools.capture_probe_report(identity)
+        )
+    });
 }
 
 /// A window publish's two outputs: when it happened, and what it resolved to.

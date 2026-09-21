@@ -3416,6 +3416,56 @@ pub(super) mod pin_count_tests {
         assert_eq!(publication.epoch, super::window_source_epoch());
     }
 
+    /// The route list the window's cadence counts presents by is the list this
+    /// decision returns.
+    ///
+    /// Three readers, one spelling: the decision returns these names, the device
+    /// reports them on the drain's route channel, and `host_window_cadence`
+    /// counts frames by them. The three declines are read off their own
+    /// vocabulary, so the only way this list can drift is the missing-target
+    /// word — which is why it is asserted against the decision rather than
+    /// against itself.
+    #[test]
+    fn the_publish_route_list_is_the_one_the_decision_returns() {
+        let mut pools = ResourcePools::new();
+        assert_eq!(
+            super::PRESENT_DECLINE_ROUTES[0],
+            super::super::super::resident_present_decision(&mut pools, &surface(67), 16, 16)
+                .err()
+                .expect("an unregistered surface refuses"),
+            "the missing-target route must be the one an absent key returns"
+        );
+        for (index, decline) in super::ResidentPresentDecline::ALL.into_iter().enumerate() {
+            assert_eq!(
+                super::PRESENT_DECLINE_ROUTES[index + 1],
+                decline.route(),
+                "{decline:?} is listed at {index} and named differently"
+            );
+            assert!(
+                super::PRESENT_DECLINE_ROUTES[index + 1].starts_with("winpub_"),
+                "{decline:?} reaches the drain's route channel unprefixed"
+            );
+        }
+        // The fifth word is the one the publish puts on a frame it never asked
+        // the registry about. It is not a refusal and must not be filed as the
+        // missing-target class: it says the question was skipped, not answered.
+        assert_eq!(
+            super::PRESENT_DECLINE_ROUTES[4],
+            super::PRESENT_DECLINE_WINDOW_NOT_ATTACHED
+        );
+        assert_ne!(
+            super::PRESENT_DECLINE_WINDOW_NOT_ATTACHED,
+            super::PRESENT_DECLINE_NO_RESIDENT,
+            "a publish that asked nothing is not a publish that was refused"
+        );
+        // Every word distinct: two refusals sharing one is a present the
+        // window's cadence cannot count.
+        let mut seen: Vec<&str> = super::PRESENT_DECLINE_ROUTES.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), super::PRESENT_DECLINE_ROUTES.len());
+    }
+
     /// A declined publish records nothing, so a resident the window cannot take
     /// does not join the set whose removal moves the epoch.
     #[test]
