@@ -158,6 +158,12 @@ pub mod provider_owner;
 #[cfg(any(feature = "provider-render", feature = "provider-compute"))]
 pub mod texture_payload_census;
 
+/// The owner's half of the statement payload table (statement economy W4, task
+/// E-SW3): what one statement files in the provider's payload table and what it
+/// names instead of carrying, default off.
+#[cfg(any(feature = "provider-render", feature = "provider-compute"))]
+pub mod statement_payload;
+
 /// The encoder one rail holds open across a compute segment — the one type
 /// besides [`SelectedBackend`] whose shape is neutral and whose contents are a
 /// rail's.

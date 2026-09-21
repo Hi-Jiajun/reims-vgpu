@@ -26655,6 +26655,15 @@ fn texture_source_arm(source: &TextureSource) -> String {
         // E-TX15's pass-entry snapshot arm names no bytes of its own: the
         // provider reads the attachment as it stood when the pass opened.
         TextureSource::PassEntrySnapshot => "pass_entry_snapshot".to_owned(),
+        // The statement payload table's two arms (statement economy W4, task
+        // E-SW3): a declaration carries its bytes and the slot they are filed
+        // under, a reference names one and carries none.
+        TextureSource::OwnedInSlot { slot, bytes } => {
+            format!("owned_in_slot={slot}:{}", bytes.len())
+        }
+        TextureSource::SlottedBytes { slot, length, .. } => {
+            format!("slotted_bytes={slot}:{length}")
+        }
     }
 }
 
@@ -26688,6 +26697,204 @@ fn wire_textures_of_one_submission(
         })
         .unwrap_or_else(|| panic!("{label}: the submission's frame decodes as a sampled pass"));
     (decoded.0, decoded.1, frame_bytes)
+}
+
+/// E-SW3 (the statement economy's W4): the statement payload table's own claim,
+/// read off the wire.
+///
+/// The census this increment starts from measured the sampled textures' payload
+/// at 608 KB per crossing statement — and measured that 98% of the bytes a boot
+/// delivers are a re-send of bytes an earlier statement already carried. The
+/// arm that takes them off the wire is this one: a statement *files* its payload
+/// in the provider's table (`OwnedInSlot`) and a later one *names* it
+/// (`SlottedBytes`, slot, length, digest).
+///
+/// Three readings, all on the frame rather than on a counter a neighbour could
+/// have moved: the shape every round before this one used carries the payload
+/// and lands the engine's frame; the filing statement carries it too and lands
+/// the same frame; and the naming statement carries none of it — its frame is
+/// shorter by the payload — and lands that same frame again. The provider's
+/// table is what makes the third submission whole, so the claim is about two
+/// statements and not one.
+#[test]
+fn a_statement_names_the_payload_an_earlier_one_filed() {
+    use reims_vgpu::backend::provider_compute::device_epoch;
+    use reims_vgpu::backend::statement_payload::set_statement_payload_table_for_test;
+    use reims_vgpu::runtime::guest_ram::GuestRamImport;
+
+    let _guard = engine_test_session();
+    let alignment = reims_vgpu::backend::provider_compute::host_import_alignment()
+        .expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The reviewed full-screen triangle's own three `float2` positions, in the
+    // owner's mapping: the vertex bind is a live guest stream, and that lease is
+    // what makes this trace cross the owner→provider wire at all. The *texture*
+    // is the request's own copy, which is the payload this increment takes off
+    // the wire.
+    owner.as_mut_slice()[..24].copy_from_slice(&f32x2(&[(-1.0, -3.0), (-1.0, 1.0), (3.0, 1.0)]));
+    let import = std::sync::Arc::new(
+        GuestRamImport::new_host_allocation(owner.pointer as usize, 2 * page as u64, alignment)
+            .expect("a page-aligned synthetic host allocation"),
+    );
+    let anchor = import
+        .slice(0, page as u64)
+        .expect("the first granule is inside the import");
+    let guest = GuestRef::new(std::sync::Arc::clone(&import), anchor)
+        .expect("the slice came from this import");
+    let import_id = import.id().get();
+    let registered = RegisteredWindow {
+        import: import.id(),
+        base: owner.pointer as u64,
+        length: page as u64,
+        epoch: 1,
+    };
+    let content = BufferContent::GuestRuns(engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            owner.pointer as usize,
+            2 * page as u64,
+            0,
+            24,
+        )
+        .expect("the bind's own bytes are inside the mapping")]),
+        source_offset: 0,
+        total_len: 24,
+        row_length_texels: 0,
+        pages: Some(std::sync::Arc::new(vec![GuestWindowRun {
+            window_offset: 0,
+            guest,
+            window: Some(registered),
+        }])),
+        direct_image: None,
+    });
+    let stages = sampled_stages();
+    let request = || {
+        let mut request = sampled_request(&stages, sampled_texels(8, 4), (8, 4));
+        request.vertex_attributes[0].content = content.clone();
+        request
+    };
+    // The engine's own frame: the reference every provider submission below has
+    // to land, because the cut is about the bytes the wire carries and never
+    // about the bytes the device sees.
+    let engine = engine_pixels("E-SW3 payload table", &stages, request())
+        .expect("the engine draws this shape");
+    provider_owner::register(Region {
+        import: import_id,
+        epoch: device_epoch().expect("the rail's provider epoch"),
+        host_pointer: owner.pointer as usize,
+        length: 2 * page as u64,
+        page_size: alignment,
+        gpa_base: Some(0x42_0000),
+    })
+    .expect("a page-aligned registration is a legal provider region");
+
+    // 1. The shipped shape: no plan, the payload travels, the frame lands.
+    set_statement_payload_table_for_test(Some(false));
+    let (_, plain_views, plain_pixels) = wire_textures_of_one_submission("E-SW3 plain", || {
+        provider_pixels("E-SW3 plain", &stages, &request())
+    });
+    assert_eq!(
+        plain_views.len(),
+        1,
+        "the frame carries the pass's own view"
+    );
+    let TextureSource::OwnedBytes(plain_bytes) = &plain_views[0].source else {
+        panic!(
+            "off, the payload travels: {:?}",
+            texture_source_arm(&plain_views[0].source)
+        );
+    };
+    let payload = plain_bytes.len();
+    assert!(payload > 0, "the fixture's texture has a payload");
+    assert_frames_equal(
+        "the payload travels and the frame lands",
+        &plain_pixels,
+        &engine,
+    );
+
+    // 2. The first statement with the table on *files* the payload.
+    set_statement_payload_table_for_test(Some(true));
+    let (declared_views, declared_pixels, declared_frame) =
+        wire_frame_of_one_submission("E-SW3 declare", || {
+            provider_pixels("E-SW3 declare", &stages, &request())
+        });
+    assert!(
+        matches!(declared_views[0].source, TextureSource::OwnedInSlot { .. }),
+        "the first statement files its payload: {:?}",
+        texture_source_arm(&declared_views[0].source)
+    );
+    assert_frames_equal(
+        "the filing statement lands the same frame",
+        &declared_pixels,
+        &engine,
+    );
+
+    // 3. The next statement *names* it: the same frame again, and the frame
+    //    that carried it is shorter by the payload it no longer carries.
+    let (named_views, named_pixels, named_frame) =
+        wire_frame_of_one_submission("E-SW3 reference", || {
+            provider_pixels("E-SW3 reference", &stages, &request())
+        });
+    let TextureSource::SlottedBytes { length, .. } = named_views[0].source else {
+        panic!(
+            "the second statement names what the first filed: {:?}",
+            texture_source_arm(&named_views[0].source)
+        );
+    };
+    assert_eq!(
+        usize::try_from(length).expect("the payload fits usize"),
+        payload,
+        "the reference names the payload's own length"
+    );
+    assert_frames_equal(
+        "the naming statement lands the same frame",
+        &named_pixels,
+        &engine,
+    );
+    // The two arms' own fields, so the arithmetic below is the wire's and not a
+    // magic number: the declaration arm writes a tag, a slot, a blob length and
+    // the payload, and the reference arm writes a tag, a slot, a length and a
+    // digest. The difference is therefore the payload minus the sixteen bytes a
+    // digest costs the reference and the declaration does not write.
+    const REFERENCE_ARM_FIELDS: usize = 8 + 16;
+    const DECLARATION_ARM_FIELDS: usize = 8;
+    assert!(
+        payload > REFERENCE_ARM_FIELDS - DECLARATION_ARM_FIELDS,
+        "the fixture's payload has to be wider than the reference arm's own fields"
+    );
+    let saving = payload - (REFERENCE_ARM_FIELDS - DECLARATION_ARM_FIELDS);
+    assert_eq!(
+        named_frame,
+        declared_frame - saving,
+        "the naming statement's frame is shorter by the payload it names, less the \
+         reference arm's own length and digest (declared {declared_frame} vs named \
+         {named_frame}, payload {payload}, saving {saving})"
+    );
+    set_statement_payload_table_for_test(None);
+}
+
+/// One submission's *decoded* frame, its length, and the frame the provider
+/// published: [`wire_textures_of_one_submission`] plus the two readings this
+/// test needs beside the views (the frame's own size, which is what the cut is
+/// about, and the pixels, which are what it must not change).
+fn wire_frame_of_one_submission(
+    label: &str,
+    submit: impl FnOnce() -> Vec<u8>,
+) -> (Vec<TextureView>, Vec<u8>, usize) {
+    provider_wire::capture_submission_frames(true);
+    let pixels = submit();
+    let frames = provider_wire::captured_submission_frames();
+    provider_wire::capture_submission_frames(false);
+    let (views, frame_len) = frames
+        .iter()
+        .filter_map(|frame| {
+            let (trace, _) = provider_wire::carried_submission(frame).ok()?;
+            let pass = trace.passes.iter().find_map(TracePass::as_render)?;
+            (!pass.textures.is_empty()).then(|| (pass.textures.clone(), frame.len()))
+        })
+        .next()
+        .unwrap_or_else(|| panic!("{label}: the submission's frame decodes as a sampled pass"));
+    (views, pixels, frame_len)
 }
 
 // ---------------------------------------------------------------------------

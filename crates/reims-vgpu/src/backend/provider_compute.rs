@@ -1571,7 +1571,7 @@ fn submit_narrow(
         });
     }
 
-    let trace = ComputeTrace {
+    let mut trace = ComputeTrace {
         schema_version: PROVIDER_SCHEMA_VERSION,
         device_epoch: provider.device_epoch(),
         operation_id: OperationId::new(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)),
@@ -1604,6 +1604,14 @@ fn submit_narrow(
     // discovered when the owner and the provider are two processes. A trace
     // whose table declares no texture keeps the exact path (and bytes) it had
     // before the texture half existed.
+    // E-SW3: the payload table's own plan for this statement, taken on the
+    // statements that cross the wire (a trace whose table declares no texture
+    // keeps the in-process path, and there is no wire to take bytes off on it).
+    let mut planned = if textures.is_empty() {
+        crate::backend::statement_payload::PlannedStatement::default()
+    } else {
+        crate::backend::statement_payload::plan(&mut trace)
+    };
     let (trace, resources) = if textures.is_empty() {
         (trace, resources)
     } else {
@@ -1634,7 +1642,23 @@ fn submit_narrow(
             provider_wire::carried_submission(&frame)
         };
         match carried {
-            Ok(pair) => pair,
+            Ok((mut trace, resources)) => {
+                // E-SW3: the frame's own payload-table arms, resolved where a
+                // provider's reader resolves what the frame carried. The plan
+                // is committed only once that resolution returned, so a refusal
+                // leaves both ends holding what they held.
+                if planned.any() {
+                    if let Err(error) = provider.resolve_statement_payloads(&mut trace) {
+                        leases.abort(provider);
+                        return Err(ProviderComputeDecline::ComputeTextureWire {
+                            step: "statement_payload_resolve",
+                            detail: provider_error_detail(&error),
+                        });
+                    }
+                    planned.commit();
+                }
+                (trace, resources)
+            }
             Err(decline) => {
                 leases.abort(provider);
                 return Err(ProviderComputeDecline::ComputeTextureWire {

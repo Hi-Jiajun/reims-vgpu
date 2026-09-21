@@ -35,7 +35,7 @@
 //! rail was about to state and the counters land in the census's own
 //! `store_routes` window beside the routes the arms already charge.
 
-use metal_api_core::provider::{ComputeTrace, TextureSource, TextureView, TracePass};
+use metal_api_core::provider::{ComputeTrace, TextureSource, TextureView};
 
 /// The arm one sampled texture's payload was stated by, as the declaring walk
 /// knows it.
@@ -228,6 +228,24 @@ pub(crate) fn note_statement(trace: &ComputeTrace) {
             TextureSource::PassEntrySnapshot => {
                 crate::runtime::drain::note_store_route("tex_payload_wire_snapshot_n");
             }
+            // The statement payload table's two arms (statement economy W4): a
+            // declaration still carries its payload, so it is counted with the
+            // owned arm; a reference carries none, so it is the one wire arm
+            // whose bytes are *named* — the cut's own reading, charged apart so
+            // the census can say what the wire did not carry.
+            TextureSource::OwnedInSlot { bytes, .. } => {
+                let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                carried = carried.saturating_add(length);
+                crate::runtime::drain::note_store_route("tex_payload_wire_owned_n");
+                crate::runtime::drain::note_store_route_n("tex_payload_wire_owned_bytes", length);
+            }
+            TextureSource::SlottedBytes { length, .. } => {
+                crate::runtime::drain::note_store_route("tex_payload_wire_slotted_n");
+                crate::runtime::drain::note_store_route_n(
+                    "tex_payload_wire_slotted_bytes",
+                    *length,
+                );
+            }
         }
         ordinal = ordinal.saturating_add(1);
     }
@@ -249,21 +267,9 @@ pub(crate) fn note_statement(trace: &ComputeTrace) {
 /// carries — is written where the pass states it), which is what makes the
 /// ordinal both ends of the wire count agree on.
 pub(crate) fn textures_of(trace: &ComputeTrace) -> Vec<&TextureView> {
-    let mut textures = Vec::new();
-    for pass in &trace.passes {
-        match pass {
-            TracePass::Compute(pass) => textures.extend(pass.textures.iter()),
-            TracePass::Render(pass) => textures.extend(pass.textures.iter()),
-            TracePass::RenderDraws(list) => {
-                textures.extend(list.head.textures.iter());
-                for draw in &list.tail {
-                    textures.extend(draw.textures.iter());
-                }
-            }
-            TracePass::Landing(_) => {}
-        }
-    }
-    textures
+    // The contract's own walk, so this reading and the two ends that rewrite
+    // the same declarations cannot disagree about what "wire order" is.
+    trace.texture_declarations()
 }
 
 /// The digest and length one payload is filed under.

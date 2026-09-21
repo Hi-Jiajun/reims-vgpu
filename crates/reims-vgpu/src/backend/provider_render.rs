@@ -9910,6 +9910,17 @@ fn note_wire_render_textures(trace: &ComputeTrace) {
             // provider's `0x00 0x08` capability bit; what this arm states is the
             // declaration the wire now carries.
             Some(TextureSource::PassEntrySnapshot) => "pass_entry_snapshot".to_owned(),
+            // The statement payload table's two arms (statement economy W4,
+            // task E-SW3): this diagnostic reads the trace the rail is about
+            // to state, so it prints whichever of the two the plan left there —
+            // the resolution that turns both into `owned_bytes` runs on the
+            // *decoded* trace, which is the other side of the seam.
+            Some(TextureSource::OwnedInSlot { slot, bytes }) => {
+                format!("owned_in_slot={slot}:{}", bytes.len())
+            }
+            Some(TextureSource::SlottedBytes { slot, length, .. }) => {
+                format!("slotted_bytes={slot}:{length}")
+            }
             None => "view=absent".to_owned(),
         };
         crate::observe::line(format!(
@@ -20858,7 +20869,7 @@ fn finish_narrow_records(
     // states and the completion reads the records where they lie — and the cut's
     // arm splits each record into the half the walk takes by value and the half
     // the completion reads, with nothing copied between them.
-    let (trace, answers) = if trace_pass_owned_enabled() {
+    let (mut trace, answers) = if trace_pass_owned_enabled() {
         let (walk_records, answers) = split_narrow_records(records);
         (
             narrow_trace_owned(provider, walk_records),
@@ -20876,6 +20887,19 @@ fn finish_narrow_records(
     // statement, or an earlier one, already carried. The walk reads; it writes
     // nothing, in either switch state.
     crate::backend::texture_payload_census::note_statement(&trace);
+    // E-SW3: the payload table's own plan for this statement, taken on the
+    // statements that will cross the wire — a trace whose records state no
+    // lease at all keeps the in-process path, and there is no wire to take
+    // bytes off on it, so its declarations are left exactly as they were. The
+    // plan rewrites the trace's byte-carrying declarations (naming what the
+    // ledger already holds, filing what it does not) and owes the ledger those
+    // filings once the provider's reader has resolved the frame below.
+    let crosses_the_wire = !leases.iter().all(Option::is_none);
+    let mut planned = if crosses_the_wire {
+        crate::backend::statement_payload::plan(&mut trace)
+    } else {
+        crate::backend::statement_payload::PlannedStatement::default()
+    };
     // R9j/R9q: a pass that declares a stage buffer — or, since R9q, carries a
     // vertex stream through the owner's window — crosses the owner→provider
     // wire before anything is admitted. The frame is the payload (every
@@ -20943,9 +20967,26 @@ fn finish_narrow_records(
             provider_wire::carried_submission(&frame)
         };
         match carried {
-            Ok((trace, resources)) => {
+            Ok((mut trace, resources)) => {
                 note_wire_stage_buffers(&trace);
                 note_wire_render_textures(&trace);
+                // E-SW3: the frame's own payload-table arms, resolved where a
+                // provider's reader resolves what the frame carried — one call
+                // on the decoded trace, before anything of it is admitted. The
+                // two ends hold the same table only after this returns: a
+                // refusal here leaves the provider's table exactly as it was
+                // and drops this statement's plan with it (the `planned`
+                // binding below is not committed), which is why the ledger is
+                // charged after the call rather than before it.
+                if planned.any() {
+                    if let Err(error) = provider.resolve_statement_payloads(&mut trace) {
+                        abort_narrow_leases(&mut leases, provider);
+                        return Err(ProviderRenderDecline::TraceAdmission {
+                            detail: provider_error_detail(&error),
+                        });
+                    }
+                    planned.commit();
+                }
                 (trace, resources)
             }
             Err(decline) => {
