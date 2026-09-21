@@ -655,14 +655,18 @@ pub(crate) trait Backend: Copy {
     /// Fill `buf` from the mapping's GPU resident, without any guest-page
     /// scatter.
     ///
-    /// Returns whether the resident supplied the whole frame. On `true` `buf`
-    /// holds tight BGRA8; on `false` `buf` is untouched and the capture fails
+    /// `Ok` means the resident supplied the whole frame and `buf` holds tight
+    /// BGRA8. `Err` means it did not, `buf` is untouched, and the capture fails
     /// (keep-prior) — there is no guest-page path left for the caller to take.
+    /// The refusal is typed because the caller writes it into the always-on
+    /// `present_capture FAIL` line's `reason=`, and the four states it
+    /// distinguishes have four different repairs — see
+    /// [`crate::runtime::scanout::CaptureRefusal`].
     ///
-    /// A rail with no resident registry answers `false` for every present, so
-    /// its console holds its prior retain. That is a known gap in this pathway
-    /// rather than a rail-specific one, which is why it is spelled as this
-    /// method's default and not as a second capture vein.
+    /// A rail with no resident registry answers [`CaptureRefusal::NoRegistry`]
+    /// for every present, so its console holds its prior retain. That is a
+    /// known gap in this pathway rather than a rail-specific one, which is why
+    /// it is spelled as this method's default and not as a second capture vein.
     fn try_capture_from_resident(
         &self,
         _state: &mut DeviceState,
@@ -670,8 +674,8 @@ pub(crate) trait Backend: Copy {
         _mapping_id: u32,
         _width: u32,
         _height: u32,
-    ) -> bool {
-        false
+    ) -> Result<(), crate::runtime::scanout::CaptureRefusal> {
+        Err(crate::runtime::scanout::CaptureRefusal::NoRegistry)
     }
 
     /// The mapping's published frame, read out of whatever resident this rail
@@ -1795,7 +1799,7 @@ impl Backend for SelectedBackend {
         mapping_id: u32,
         width: u32,
         height: u32,
-    ) -> bool {
+    ) -> Result<(), crate::runtime::scanout::CaptureRefusal> {
         match self {
             #[cfg(feature = "backend-metal")]
             Self::Metal(b) => b.try_capture_from_resident(state, buf, mapping_id, width, height),

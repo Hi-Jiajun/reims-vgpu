@@ -2089,6 +2089,17 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
 
+/// Probe-only: what the registry holds for `identity`, in one line.
+///
+/// Reached from `runtime::scanout::vulkan`'s capture when
+/// [`crate::config::CAPTURE_PROBE`] is on and a readback has just missed. It
+/// takes the same engine lock `read_resident_bgra` takes and is called only on a
+/// refusal, so a boot that is not probing this pays nothing and a boot that is
+/// pays one lock and one bounded walk per distinct failure.
+pub fn capture_probe_report(identity: &TargetIdentity) -> String {
+    lock_engine().pools.capture_probe_report(identity)
+}
+
 /// Decide whether `identity` can carry a direct present, and on `Ok` record it
 /// as the resident the window is published against and return the stamp that
 /// records *when*.
@@ -3508,16 +3519,40 @@ pub fn supports_block_compressed_sampled() -> bool {
 /// narrowed a wide one to four bytes by then, so the exchange is always over
 /// RGBA8.
 ///
-/// Returns `None` for every *expected* absence — unknown identity, no ready
+/// Returns `Err` for every *expected* absence — unknown identity, no ready
 /// content, or a short/oversized readback — so the caller can fall back
 /// silently. These are speculative conditions on a normal boot (a cold mid has
 /// no resident yet), not failures worth a fail-log line.
-pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
+///
+/// The refusal is typed rather than `None` because the four causes have four
+/// repairs and the present capture's own census has to name the one that fired:
+/// see [`ResidentReadMiss`] and `runtime::scanout::capture_probe`. The type
+/// costs the shipping path nothing — the two callers match on it exactly as
+/// they matched on `Option` — and it is what keeps a second, drifting spelling
+/// of the same lookup out of the probe.
+pub fn read_resident_bgra(
+    identity: &TargetIdentity,
+    need: usize,
+) -> Result<Vec<u8>, ResidentReadMiss> {
+    // Read before the engine lock, not inside it: the probe's first call emits
+    // its own boot line, and the log sink must never be waited on while this
+    // lock is held.
+    let probing = crate::runtime::scanout::capture_probe::enabled();
     {
         let guard = lock_engine();
-        let slot = guard.pools.registry_get(identity)?;
+        let Some(slot) = guard.pools.registry_get(identity) else {
+            // The ladder is a linear scan of the registry, so it is taken only
+            // when something reads it. Nothing on the shipping path does: the
+            // capture turns this variant into one `false` and the console keeps
+            // its prior retain either way.
+            let divergence = probing.then(|| guard.pools.registry_key_divergence(identity));
+            return Err(ResidentReadMiss::UnknownIdentity { divergence });
+        };
         if !slot.content_ready {
-            return None;
+            return Err(ResidentReadMiss::NoReadyContent {
+                width: slot.width,
+                height: slot.height,
+            });
         }
     }
     let mut px = match read_target_inner(identity) {
@@ -3533,7 +3568,7 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
                     crate::observe::off(format!(
                         "present_capture reason=readback_texel_not_scanout texel={texel:?}"
                     ));
-                    return None;
+                    return Err(ResidentReadMiss::TexelNotScanout);
                 }
             }
         }
@@ -3543,14 +3578,48 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
                 emit = emit.field(key, value);
             }
             emit.off();
-            return None;
+            return Err(ResidentReadMiss::Readback);
         }
     };
     if px.len() < need {
-        return None;
+        return Err(ResidentReadMiss::Short { have: px.len() });
     }
     px.truncate(need);
-    Some(px)
+    Ok(px)
+}
+
+/// Why a resident-directed readback produced no frame.
+///
+/// One variant per repair, not per line of code: an identity nothing names, a
+/// registered image no writer has vouched for, an image whose texels are not
+/// what the console reads, and a readback that declined or came back short.
+pub enum ResidentReadMiss {
+    /// No registry slot under this exact key.
+    ///
+    /// `divergence` comes from
+    /// [`ResourcePools::registry_key_divergence`](crate::backend::vulkan::engine::pools::ResourcePools::registry_key_divergence)'s
+    /// ladder, so "nothing names this surface" and "it is there under another
+    /// generation" are two readings of one miss. It is `Some` only while
+    /// [`crate::config::CAPTURE_PROBE`] is on, because the ladder walks every
+    /// key in the registry and nothing else reads its answer.
+    UnknownIdentity {
+        divergence: Option<(TargetKeyDivergence, Option<u64>)>,
+    },
+    /// Registered, and no writer has vouched for its pixels yet.
+    NoReadyContent { width: u32, height: u32 },
+    /// Registered and ready, and the readback's texels are not a form this rail
+    /// can hand the console in scanout order.
+    ///
+    /// Note what this is *not*: a slot whose declared order differs from
+    /// scanout order is converted in place rather than refused — see this
+    /// function's own doc — so only a texel the exchange cannot be made over
+    /// reaches here.
+    TexelNotScanout,
+    /// Registered and ready, and the readback itself declined.
+    Readback,
+    /// Registered and ready, and the readback came back short of the frame the
+    /// caller sized.
+    Short { have: usize },
 }
 
 /// The six fallible Vulkan calls a whole-image readback makes, named per rail.
