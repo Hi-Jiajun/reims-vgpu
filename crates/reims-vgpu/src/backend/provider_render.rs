@@ -21447,11 +21447,7 @@ fn zero_fill_declaration_source(extent: u64) -> BufferSource {
     if zero_fill_decl_enabled() {
         BufferSource::zero_fill(extent)
     } else {
-        BufferSource::OwnedBytes(vec![
-            0u8;
-            usize::try_from(extent)
-                .unwrap_or(usize::MAX)
-        ])
+        BufferSource::OwnedBytes(vec![0u8; usize::try_from(extent).unwrap_or(usize::MAX)])
     }
 }
 

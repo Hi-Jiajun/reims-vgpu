@@ -7907,8 +7907,8 @@ fn the_zero_fill_declaration_arm_ships_the_same_frame_without_the_bytes() {
     };
     let (arm_trace, _) = provider_wire::carried_submission(&arm_frames[0])
         .expect("the provider's own decoder reads the arm's frame");
-    let (payload_trace, _) = provider_wire::carried_submission(&payload_frames[0])
-        .expect("and the payload arm's frame");
+    let (payload_trace, _) =
+        provider_wire::carried_submission(&payload_frames[0]).expect("and the payload arm's frame");
     let arm_declarations = declarations(&arm_trace);
     let payload_declarations = declarations(&payload_trace);
     assert_eq!(
@@ -7918,9 +7918,8 @@ fn the_zero_fill_declaration_arm_ships_the_same_frame_without_the_bytes() {
     );
     let mut declared = 0_u64;
     let mut arms = 0_u64;
-    for ((arm_view, arm_source), (payload_view, payload_source)) in arm_declarations
-        .iter()
-        .zip(payload_declarations.iter())
+    for ((arm_view, arm_source), (payload_view, payload_source)) in
+        arm_declarations.iter().zip(payload_declarations.iter())
     {
         assert_eq!(arm_view, payload_view, "the same view in both arms");
         match (arm_source, payload_source) {
@@ -22062,7 +22061,7 @@ fn a_vertex_stream_shared_by_two_attributes_reads_its_guest_window_without_a_cop
             BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
             BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
             BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
-        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
+            BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
         };
         eprintln!(
             "wire vertex view: binding={} offset={} length={} source={source}",
@@ -23600,7 +23599,7 @@ fn an_unaligned_vertex_stream_window_is_copied_into_the_owner_staged_arm() {
             BufferSource::StagedLease(lease) => format!("staged_lease({})", lease.get()),
             BufferSource::BorrowedNoCopy(lease) => format!("borrowed_no_copy({})", lease.get()),
             BufferSource::GuestRuns(runs) => format!("guest_runs({})", runs.len()),
-        BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
+            BufferSource::ZeroFill { length } => format!("zero_fill({length})"),
         })
         .collect();
     eprintln!("wire vertex views: {arms:?}");
