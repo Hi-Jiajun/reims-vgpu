@@ -1396,9 +1396,10 @@ pub const CAPTURE_PROBE: &str = "REIMS_VGPU_CAPTURE_PROBE";
 /// outlives the rail inputs built beside it and is never mutated through. The
 /// bytes the rail is handed are the same bytes the `to_vec` produced — the
 /// exchange is skipped by exactly the condition that decided it was not needed
-/// — so no decision, no frame byte and no guest-visible pixel changes. Off is
-/// today's device exactly: `unset` and an unrecognized value are `off`, and the
-/// call site is then the `to_vec` statement it always was.
+/// — so no decision, no frame byte and no guest-visible pixel changes.
+/// **On by default since 2026-09-21** (its A/B read 6 901.9 → 62.0 µs per frame
+/// with the same bytes lent instead of materialized); the control words put the
+/// pre-cut path — the `to_vec` statement — back.
 pub const SEAM_FRAME_BORROW: &str = "REIMS_VGPU_SEAM_FRAME_BORROW";
 }
 

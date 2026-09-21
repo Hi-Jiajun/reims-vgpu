@@ -14357,9 +14357,14 @@ fn seam_frame_borrow_enabled() -> bool {
         2 => return true,
         _ => {}
     }
-    matches!(
+    // Flipped on 2026-09-21 once its A/B had priced it: the seam's own material
+    // copy read 6 901.9 -> 62.0 -> 6 450.8 us per frame in the production pose
+    // (141.4 MB -> 0.4 MB -> 143.1 MB materialized), the same bytes being lent
+    // (`seam_frame_borrowed` 0 -> 17/frame, 138.7 MB/frame). Only the control
+    // words turn it off; unset is the borrowing arm.
+    !matches!(
         crate::config::switch(crate::config::SEAM_FRAME_BORROW),
-        crate::config::Switch::On
+        crate::config::Switch::Off
     )
 }
 
