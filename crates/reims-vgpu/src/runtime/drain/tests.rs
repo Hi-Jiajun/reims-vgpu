@@ -3299,6 +3299,89 @@ fn the_frame_span_line_divides_the_same_frames_the_profile_closes() {
     assert!(c.note_present(1_030_000, 1_020, false).is_none());
 }
 
+/// The statement's own sections are on the frame line, over the same frames
+/// and on the same edge the wire counters are.
+///
+/// `wire_bytes` says how big the owner→provider frames were; these fields say
+/// what they were made of. Both are differenced at the same present, so a
+/// reader can close the two identities the statement-economy change is read
+/// against — the six tiles are the payload, and the frame is that payload plus
+/// its nine-byte header — out of one window's line rather than out of two
+/// readings of the same frames.
+#[test]
+fn the_frame_span_line_carries_the_statement_sections_its_frames_were_read_from() {
+    use crate::runtime::drain::{FrameProfileCensus, StatementMeter};
+    let c = FrameProfileCensus::with_report_ms(15);
+    // One statement per present, each a 1 000-byte payload tiled exactly, and
+    // the frame the rail built around it (nine bytes of header).
+    let one_statement = |c: &FrameProfileCensus| {
+        c.note_wire_frame();
+        c.note_wire_bytes(1_009);
+        c.note_statement(StatementMeter::Total, 1, 1_000);
+        c.note_statement(StatementMeter::Tag, 1, 1);
+        c.note_statement(StatementMeter::TraceHeader, 1, 26);
+        c.note_statement(StatementMeter::PipelineTable, 1, 200);
+        c.note_statement(StatementMeter::PassTable, 1, 700);
+        c.note_statement(StatementMeter::ResourceTable, 1, 40);
+        c.note_statement(StatementMeter::Tail, 1, 33);
+        c.note_statement(StatementMeter::Views, 2, 96);
+        c.note_statement(StatementMeter::ViewPayload, 2, 64);
+        c.note_statement(StatementMeter::ViewDeclared, 2, 64);
+        c.note_statement(StatementMeter::Textures, 1, 64);
+        c.note_statement(StatementMeter::TexturePayload, 1, 0);
+    };
+    assert!(
+        c.note_present(1_000_000, 1_000, false).is_none(),
+        "the first present arms the frame"
+    );
+    one_statement(&c);
+    assert!(c.note_present(1_010_000, 1_005, false).is_none());
+    one_statement(&c);
+    let span = c
+        .note_present(1_020_000, 1_016, false)
+        .expect("a full window must report")
+        .span
+        .expect("a window with frames carries its split");
+
+    assert!(span.contains(" frames=2"), "{span}");
+    assert!(span.contains(" wire_bytes=1009"), "{span}");
+    assert!(span.contains(" stmt_total_n=1"), "{span}");
+    assert!(span.contains(" stmt_total_bytes=1000"), "{span}");
+    assert!(span.contains(" stmt_tag_bytes=1"), "{span}");
+    assert!(span.contains(" stmt_trace_bytes=26"), "{span}");
+    assert!(span.contains(" stmt_pipeline_bytes=200"), "{span}");
+    assert!(span.contains(" stmt_pass_bytes=700"), "{span}");
+    assert!(span.contains(" stmt_resources_bytes=40"), "{span}");
+    assert!(span.contains(" stmt_tail_bytes=33"), "{span}");
+    assert!(span.contains(" stmt_views_n=2"), "{span}");
+    assert!(span.contains(" stmt_view_payload_n=2"), "{span}");
+    assert!(span.contains(" stmt_view_payload_bytes=64"), "{span}");
+    assert!(span.contains(" stmt_textures_n=1"), "{span}");
+    assert!(span.contains(" stmt_texture_payload_bytes=0"), "{span}");
+    // The two identities, read off the line as a round reads them.
+    assert_eq!(
+        1 + 26 + 200 + 700 + 40 + 33,
+        1_000,
+        "the six tiles are the payload"
+    );
+    assert_eq!(1_000 + 9, 1_009, "the frame is the payload plus its header");
+
+    // The window resets with the line: a statement charged after it belongs to
+    // the next window rather than to this one. Ten bytes over that window's two
+    // frames is the mean five on its line, and the sections the last window
+    // carried are not inherited by it.
+    assert!(c.note_present(1_030_000, 1_020, false).is_none());
+    c.note_statement(StatementMeter::Total, 1, 10);
+    let next = c
+        .note_present(1_040_000, 1_040, false)
+        .expect("the next window fills too")
+        .span
+        .expect("a window with frames carries its split");
+    assert!(next.contains(" stmt_total_bytes=5"), "{next}");
+    assert!(next.contains(" stmt_total_n=0"), "{next}");
+    assert!(next.contains(" stmt_pass_bytes=0"), "{next}");
+}
+
 /// The seven seam bars divide the part of `Phase::Engine` neither rail claims.
 ///
 /// The reading this round exists for is `engine_us` minus `rail_provider` minus
