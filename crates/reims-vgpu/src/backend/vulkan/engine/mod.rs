@@ -2774,6 +2774,11 @@ pub fn merge_landed_frame_into_resident(
     // under the same engine lock, so no draw can bind the image in between.
     pools.registry_note_access(identity, next);
     pools.registry_clear_sampled_content_replaced(identity);
+    // A merge is a recorded write into a resident's image — `TransferWrite` —
+    // and it publishes no other way, so it moves the content version the same
+    // way the two `registry_mark_ready*` arms do. See
+    // `ResourcePools::note_resident_written`.
+    pools.note_resident_written(identity);
     LandedFrameMerge::Copied { bytes }
 }
 
@@ -3017,6 +3022,62 @@ pub fn resident_absent_after_reclaim(
 pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
     let guard = lock_engine();
     guard.pools.registry_get(identity)?.content_epoch
+}
+
+/// What identifies the **bytes** a registry read of `identity` answers with,
+/// rather than the name they were asked under.
+///
+/// Taken by the seam before a whole-frame read, for the one question a memo
+/// over those reads has to answer before it can serve a frame: *is this the
+/// same allocation, holding the same version of the same target?* See
+/// [`crate::config::SEAM_READ_GENERATION`] for the round that priced the reads
+/// and `ResidentTargetSlot::content_serial` for the version itself.
+///
+/// Whole frame reads are ~13 ms each in the production pose and there are two
+/// bars of them, so this is an engine-lock acquisition per read attempt rather
+/// than a per-draw cost; `None` is an identity the registry holds nothing
+/// under, which is also what the read itself is about to answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentReadWitness {
+    /// `TargetIdentity`'s own generation — the key's, not the content's. Read
+    /// beside the serial because a memo that finds the same allocation under a
+    /// moved key is looking at two targets, not one.
+    pub key_generation: u64,
+    /// The resident's image handle: the allocation the read will copy out of.
+    pub image: u64,
+    /// The view the registry holds over it. Part of the key because a slot can
+    /// re-declare its interpretation in place (`set_registry_format`), and the
+    /// view is what says which of those readings a consumer was promised.
+    pub view: u64,
+    /// The content version, or `None` when nothing maintains one — this boot
+    /// did not turn [`crate::config::SEAM_READ_GENERATION`] on, or the slot has
+    /// never been written since it was created.
+    pub content_serial: Option<u64>,
+    /// The mapping-level content stamp, the other version the registry holds.
+    /// Reported beside the serial because it is what a reader that cannot have
+    /// a serial would have to key on, and what that costs is the reason the
+    /// serial exists.
+    pub content_epoch: Option<u32>,
+    /// Whether the slot's contents are published — the same fact
+    /// [`read_target`] refuses on, reported here so a reading can tell a read
+    /// that will find nothing from one that will find a frame.
+    pub content_ready: bool,
+}
+
+/// [`ResidentReadWitness`] for one identity, or `None` when the registry holds
+/// nothing under it.
+pub fn resident_read_witness(identity: &TargetIdentity) -> Option<ResidentReadWitness> {
+    use ash::vk::Handle;
+    let guard = lock_engine();
+    let slot = guard.pools.registry_get(identity)?;
+    Some(ResidentReadWitness {
+        key_generation: identity.generation(),
+        image: slot.image.as_raw(),
+        view: slot.view.as_raw(),
+        content_serial: (slot.content_serial != 0).then_some(slot.content_serial),
+        content_epoch: slot.content_epoch,
+        content_ready: slot.content_ready,
+    })
 }
 
 /// What the registry says about an identity's content stamp, with the two ways

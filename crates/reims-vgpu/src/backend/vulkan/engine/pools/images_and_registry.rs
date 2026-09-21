@@ -8,6 +8,57 @@
 use super::*;
 use crate::backend::vulkan::engine::types::TargetKeyDivergence;
 
+/// The next value [`ResourcePools::note_resident_written`] hands out: the
+/// process-wide count of recorded writes into resident images.
+///
+/// Process-wide rather than per-pool because the number is a **tag**, not a
+/// measurement: two devices in one process share one space of tags, and the
+/// only property a reader uses is that a tag written into a slot never repeats
+/// for that slot. It starts at 1 on the first write, so `0` reads as "no write
+/// has ever been recorded here" — the state every slot is created in, and the
+/// state every boot that leaves the switch off keeps.
+static RESIDENT_CONTENT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether [`crate::config::SEAM_READ_GENERATION`] is on.
+///
+/// Cached because its readers are on the *publish* path — every colour, depth
+/// and merge write into a resident asks this — where `config::switch`'s
+/// environment lookup and two string allocations per call would be a price the
+/// off state must not pay. Off is therefore one relaxed load and a branch, and
+/// the environment is read at most once per process.
+fn resident_content_serial_enabled() -> bool {
+    match RESIDENT_CONTENT_SERIAL_ARM.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let on = matches!(
+        crate::config::switch(crate::config::SEAM_READ_GENERATION),
+        crate::config::Switch::On
+    );
+    RESIDENT_CONTENT_SERIAL_ARM.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+/// The test's own arm, so a scenario can be run on both sides of the switch in
+/// one process (`None` gives the environment back). The switch itself is read
+/// once and cached, which is what makes this necessary rather than convenient.
+#[cfg(test)]
+pub(crate) fn set_resident_content_serial_arm(arm: Option<bool>) {
+    RESIDENT_CONTENT_SERIAL_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// `0` unknown, `1` off, `2` on. See [`resident_content_serial_enabled`].
+static RESIDENT_CONTENT_SERIAL_ARM: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// Band observed intervals between sampled uses. This is a reuse-distance
 /// diagnostic only; no residency decision reads it.
 fn resident_resample_band(idle_ms: u64) -> &'static str {
@@ -1101,6 +1152,7 @@ impl ResourcePools {
                 generation: new.generation,
                 content_ready: guest_backed,
                 content_epoch: None,
+                content_serial: 0,
                 sampled_content_replaced: false,
                 access: if guest_backed {
                     ResidentAccess::GuestBacking
@@ -2111,6 +2163,42 @@ impl ResourcePools {
         }
         self.set_registry_access(identity, access);
         self.set_sole_copy(identity, !guest_backed);
+        self.note_resident_written(identity);
+    }
+
+    /// Tag a resident's pixels with the next content version
+    /// ([`ResidentTargetSlot::content_serial`]).
+    ///
+    /// # Which sites call it, and why exactly these
+    ///
+    /// A version is only a version if every way the pixels can change moves it,
+    /// so the call sites are the **publication** points of a recorded write
+    /// rather than the command-buffer recordings that precede them — the same
+    /// set the sole-copy audit beside [`ResidentTargetSlot::gpu_only_content`]
+    /// enumerates: [`Self::registry_mark_ready_with_access`] (the draw pass and
+    /// the two host/GPU seed copies that precede it, plus the MRT secondaries
+    /// through `registry_mark_ready_at`), [`Self::registry_mark_depth_ready`]
+    /// (the depth pass), and the guest-page merge in
+    /// `engine::merge_landed_frame_into_resident`, which publishes a
+    /// `TransferWrite` through `registry_note_access` rather than through either
+    /// mark-ready arm. [`Self::set_registry_format`] is the fourth, and it is
+    /// not a write at all: a re-declared format changes which **bytes a read
+    /// answers with** — the read reports the slot's declared format and narrows
+    /// by it — so a reader keyed on the version would otherwise serve a
+    /// differently-interpreted frame under an unchanged version.
+    ///
+    /// Deliberately *not* called by [`Self::registry_note_access`], which the
+    /// read paths also use: a read that moved the tracked layout has changed
+    /// nothing about the pixels, and tagging it would make every read its own
+    /// version.
+    pub(crate) fn note_resident_written(&mut self, identity: &TargetIdentity) {
+        if !resident_content_serial_enabled() {
+            return;
+        }
+        let serial = RESIDENT_CONTENT_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.content_serial = serial;
+        }
     }
 
     /// Mark a depth resident as holding rendered contents, after a pass that
@@ -2145,6 +2233,7 @@ impl ResourcePools {
             identity,
             ResidentAccess::ColorWrite(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
         );
+        self.note_resident_written(identity);
     }
 
     /// Whether this resident already holds rendered contents — the question a
@@ -2489,6 +2578,10 @@ impl ResourcePools {
             return;
         }
         slot.format = format;
+        // The interpretation a read of this resident answers with has moved, so
+        // the version that tags its pixels moves with it — see
+        // `note_resident_written`.
+        self.note_resident_written(identity);
         if self.window_published.contains(identity) {
             self.invalidate_window_sources();
         }
@@ -3115,6 +3208,7 @@ pub(super) mod pin_count_tests {
             generation: 1,
             content_ready,
             content_epoch: None,
+            content_serial: 0,
             sampled_content_replaced: false,
             // What `registry_mark_ready` actually records, read from the same
             // constant it reads, so this fixture cannot drift into describing a
@@ -3924,6 +4018,73 @@ pub(super) mod pin_count_tests {
             "a resident that is not content_ready holds undefined pixels"
         );
         assert_eq!(pools.registry.get(&id).unwrap().content_epoch, None);
+    }
+
+    /// The content version moves on the writes that move the pixels, on the
+    /// re-declaration that moves what a read *answers with*, and on nothing
+    /// else — and only while its switch is on.
+    ///
+    /// The reading it exists for is the seam's memo: a reader that keys on this
+    /// number may only be wrong if a way for the pixels to change is missing
+    /// from this list, so the test states the list rather than one member of it.
+    /// The negative half — a read that moved the tracked layout, which is what
+    /// `registry_note_access` mostly records — is the assertion that keeps a
+    /// version from moving on every read of the frame it is supposed to price.
+    #[test]
+    fn the_content_version_advances_on_a_write_and_only_then() {
+        super::set_resident_content_serial_arm(Some(true));
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(false));
+        let serial = |pools: &ResourcePools| pools.registry.get(&id).unwrap().content_serial;
+        assert_eq!(
+            serial(&pools),
+            0,
+            "a slot nothing has written carries no version, which is why `0` is not one"
+        );
+
+        pools.registry_mark_ready(&id);
+        let after_draw = serial(&pools);
+        assert!(after_draw > 0, "a draw into a resident is a version of it");
+
+        // A read that left the image in another layout changed no pixel.
+        pools.registry_note_access(&id, ResidentAccess::transfer_read(false));
+        assert_eq!(
+            serial(&pools),
+            after_draw,
+            "a read is not a version: tagging it would make every read its own"
+        );
+
+        pools.registry_mark_ready_at(&id, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let after_mrt = serial(&pools);
+        assert!(
+            after_mrt > after_draw,
+            "the MRT-secondary ready arm publishes a write like the primary one"
+        );
+
+        // An in-place re-declaration is not a write, and it does change which
+        // bytes a read of this resident answers with, so it must move the
+        // version a reader is keyed on.
+        pools.set_registry_format(
+            &id,
+            translate::pixel::ResidentFormat::of(vk::Format::R8G8B8A8_UNORM),
+        );
+        let after_format = serial(&pools);
+        assert!(
+            after_format > after_mrt,
+            "a re-declared format changes the bytes a read answers with"
+        );
+
+        // Off is the state every ordinary boot is in: the field stays where it
+        // was, and no write pays for a version nobody reads.
+        super::set_resident_content_serial_arm(Some(false));
+        pools.registry_mark_ready(&id);
+        assert_eq!(
+            serial(&pools),
+            after_format,
+            "with the switch off a write must not move the version"
+        );
+        super::set_resident_content_serial_arm(None);
     }
 
     /// Two deferred windows on one surface pin the SAME identity; the first

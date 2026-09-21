@@ -2265,6 +2265,31 @@ pub(crate) struct ResidentTargetSlot {
     /// epoch 0 ("nothing published since attach") is a legal *mapping* value
     /// and a bare `0 == 0` would match an image that was never stamped at all.
     pub content_epoch: Option<u32>,
+    /// Which version of this resident's pixels the image holds, as the
+    /// monotonically increasing number of recorded writes into **any** resident
+    /// at the instant of the last one into this slot.
+    ///
+    /// Kept only while [`crate::config::SEAM_READ_GENERATION`] is on, and `0`
+    /// otherwise. It exists because the seam's two whole-frame reads — R23's
+    /// chain read and R24's sampled-target reads — are 27.4 ms of a 393.7 ms
+    /// host frame in the production pose, and the only repair that deletes a
+    /// read rather than moving it is a memo keyed on the *content* rather than
+    /// on the name it was asked under. No other field of this slot is that key:
+    /// [`Self::content_epoch`] is a mapping-level stamp a draw clears,
+    /// [`Self::generation`] is part of the identity key, and [`Self::access`]
+    /// says what last touched the image rather than which pixels a second read
+    /// would find.
+    ///
+    /// It is a version of the *image*, not of the surface the mapping names: a
+    /// rail that publishes a frame into the guest's own pages without touching
+    /// this image leaves the serial alone, and that is exactly right for a
+    /// reader that is memoizing what a read of this image answers.
+    ///
+    /// A reader must key on the allocation beside it. A retired slot takes the
+    /// serial with it, and a recreated one starts from a fresh image handle:
+    /// `(identity, image, view, serial)` is the tuple that cannot repeat across
+    /// a recycle, where the serial alone could.
+    pub content_serial: u64,
     /// A frame this image does not hold replaced the surface's content.
     ///
     /// [`Self::content_epoch`] answers the **LOAD** elision's question — "do
@@ -4442,6 +4467,7 @@ mod resident_reuse_tests {
             generation,
             content_ready: false,
             content_epoch: None,
+            content_serial: 0,
             sampled_content_replaced: false,
             access: ResidentAccess::Untouched,
             format: translate::pixel::ResidentFormat::of(format),

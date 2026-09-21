@@ -11827,9 +11827,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // class a value it structurally cannot reach, and the readback just
             // paid for is bought for a reader that cannot ask. See
             // `config::SEAM_UNREAD_FRAMES` for the round that priced it.
-            let unread_frames = crate::config::switch(crate::config::SEAM_UNREAD_FRAMES)
-                == crate::config::Switch::On
-                && (req.chain_loads_resident || attachment_window_runs.is_some());
+            // **On by default since 2026-09-21**, once the R-SR2 round had
+            // priced it: with the meter beside it, 67 661 of 67 666 chain read
+            // attempts in one 300 s production round were for a frame the class
+            // cannot read, against a bar of 18 302 µs a frame on the encode half
+            // alone, and `render_provider_resident_source_bytes` stayed zero.
+            // Only the control words turn it off; unset is the skipping arm. See
+            // `config::SEAM_UNREAD_FRAMES`.
+            let unread_frames = !matches!(
+                crate::config::switch(crate::config::SEAM_UNREAD_FRAMES),
+                crate::config::Switch::Off
+            ) && (req.chain_loads_resident || attachment_window_runs.is_some());
             if unread_frames && chain_source_is_engine_resident {
                 crate::runtime::drain::note_store_route("render_provider_unread_frame_chain");
             }
@@ -11837,17 +11845,48 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             #[cfg(feature = "provider-render")]
             let resident_source_frame = if chain_source_is_engine_resident && !unread_frames {
                 match resources.target_identity.as_ref() {
-                    Some(identity) => match resident_chain_source_frame(&resources, identity) {
-                        Ok(frame) => Some(frame),
-                        // R34: the read declined, and the class is about to
-                        // refuse this record under `resident_source` — unless an
-                        // earlier gate answers first, which is why the route is
-                        // charged by the gate and not here.
-                        Err(miss) => {
-                            chain_source_miss = Some(miss);
-                            None
+                    Some(identity) => {
+                        // R-SR2: the read is metered **before** it is taken, so
+                        // the version it is keyed by cannot be newer than the
+                        // bytes it returns. Off is one relaxed load.
+                        //
+                        // The two conditions `REIMS_VGPU_SEAM_UNREAD_FRAMES`
+                        // narrows on are read here as well, but only as a
+                        // *reading*: this switch never decides whether to take
+                        // the read, so the share a skip would take is priced on
+                        // the same population the read already happened for.
+                        let class_cannot_read_frame =
+                            req.chain_loads_resident || attachment_window_runs.is_some();
+                        let ticket =
+                            note_seam_read_attempt(SeamReadSeam::Chain, identity, seam_charges);
+                        let read = resident_chain_source_frame(&resources, identity);
+                        match read {
+                            Ok(frame) => {
+                                let bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+                                note_seam_read_answer(SeamReadSeam::Chain, ticket, Some(bytes));
+                                note_seam_read_unreachable(
+                                    SeamReadSeam::Chain,
+                                    class_cannot_read_frame,
+                                    Some(bytes),
+                                );
+                                Some(frame)
+                            }
+                            // R34: the read declined, and the class is about to
+                            // refuse this record under `resident_source` —
+                            // unless an earlier gate answers first, which is why
+                            // the route is charged by the gate and not here.
+                            Err(miss) => {
+                                note_seam_read_answer(SeamReadSeam::Chain, ticket, None);
+                                note_seam_read_unreachable(
+                                    SeamReadSeam::Chain,
+                                    class_cannot_read_frame,
+                                    None,
+                                );
+                                chain_source_miss = Some(miss);
+                                None
+                            }
                         }
-                    },
+                    }
                     // The class refuses a chain that names no identity under
                     // its own slug (`render_provider_out_of_class_resident_
                     // identity`) before it reaches this refusal, so no route of
@@ -12077,7 +12116,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let sampled_target_frames = {
                 let _seam_sample_frames =
                     seam_span(crate::runtime::drain::FrameSpan::SeamSampleFrames);
-                sampled_target_frames(&resources, &mut sampled_target_frame_store)
+                sampled_target_frames(&resources, &mut sampled_target_frame_store, seam_charges)
             };
             // R34: the route the class's one `resident_source` refusal is
             // charged under, for the record whose chain neither byte arm above
@@ -14371,6 +14410,390 @@ fn seam_frame_borrow_enabled() -> bool {
 /// The test's own arm, beside the function it selects.
 static SEAM_FRAME_BORROW_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+// ---------------------------------------------------------------------------
+// R-SR2: the seam's two whole-frame reads, metered against a content version.
+// ---------------------------------------------------------------------------
+
+/// Which of the seam's two whole-frame reads a reading belongs to.
+///
+/// Two names rather than one because the sixth round prices them separately —
+/// `seam_frame_chain_us_mean` 15 007 µs and `seam_sample_frames_us_mean`
+/// 12 383 µs of a 393 747 µs host frame, both in the production pose — and the
+/// two call sites answer different questions: R23 reads **the record's own
+/// attachment** once per record that loads from a resident, while R24 reads
+/// **each sampled GPU target** the caller can serve, so the second scales with
+/// the bind count rather than with the record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeamReadSeam {
+    /// `resident_chain_source_frame` (R23).
+    Chain,
+    /// `read_target_four_byte_color` under `sampled_target_frames` (R24).
+    Sample,
+}
+
+/// How many of `SeamReadSeam`'s two names exist, for the fixed array below.
+const SEAM_READ_SEAMS: usize = 2;
+
+/// One counter per suffix, in the order [`note_seam_read_attempt`],
+/// [`note_seam_read_answer`] and [`note_seam_read_unreachable`] charge them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeamReadCount {
+    /// Read attempts: the seam asked the registry for a frame.
+    Attempts = 0,
+    /// Attempts that came back with one.
+    Reads = 1,
+    /// Attempts the registry declined (no identity, no ready content, a shape
+    /// this rail cannot hand over).
+    Misses = 2,
+    /// Bytes the reads that came back carried.
+    Bytes = 3,
+    /// Attempts whose witness found a resident — the attempts that could have
+    /// been keyed by anything at all.
+    Witnesses = 4,
+    /// Of those, how many carried a content version.
+    Serials = 5,
+    /// Of those, how many carried the mapping-level epoch stamp — the other
+    /// version this registry offers, and the one a reader without the serial
+    /// would have to key on.
+    Epochs = 6,
+    /// Attempts that repeated the previous attempt's identity *and* key
+    /// generation — the reading the task's own "same `(identity, generation)`"
+    /// asks for, and the weakest of the three keys because the content may have
+    /// moved under it.
+    SameAsPrevious = 7,
+    /// Attempts whose identity was already in this seam's table, at any
+    /// version: the population a memo could answer *for*.
+    Remembered = 8,
+    /// Attempts whose `(identity, allocation, view, content version)` was
+    /// already in the table — **the number a memo would have answered**, and
+    /// the only one of the three that cannot serve a frame the guest has
+    /// painted over.
+    VersionHits = 9,
+    /// The bytes those hits would have deleted: the memo's own reading.
+    VersionHitBytes = 10,
+    /// Attempts whose frame the class **cannot read** — the record states
+    /// `chain_loads_resident`, so the walk has already promised it the engine's
+    /// own image, or it states its attachment window, which the load arm takes
+    /// above the byte arms. Both conditions are checked *before* the read, so
+    /// this is the population `REIMS_VGPU_SEAM_UNREAD_FRAMES` narrows on and the
+    /// population a memo could never serve.
+    Unreachable = 11,
+    /// The bytes those attempts moved for a reader that could not ask.
+    UnreachableBytes = 12,
+    /// Attempts taken on a walk **probe**.
+    ///
+    /// The frame profile's seam bars are charged on the encode and deliberately
+    /// not on the probe the encode stands for (`seam_charges = !handoff
+    /// .is_probe()`), while the *read* is taken on both — the doc for
+    /// `REIMS_VGPU_SEAM_UNREAD_FRAMES` says so in as many words: "both are taken
+    /// once by the walk's probe and again by the encode the probe stands for".
+    /// Without this split a bar divided by an attempt count would price the two
+    /// passes as one and understate a read by the size of the probe's share.
+    Probed = 13,
+    /// Attempts the seam's own bars measure: the encode pass. Read together with
+    /// [`SeamReadCount::Probed`] so the two populations are always both stated.
+    Encoded = 14,
+}
+
+/// The counter names, one array per seam and one slot per [`SeamReadCount`].
+///
+/// Literal names rather than a format string because
+/// `drain::note_store_route` takes `&'static str` — the census registry keys on
+/// the pointer-identified string, which is what makes the per-window lookup a
+/// thread-local hit instead of an allocation.
+const SEAM_READ_COUNTERS: [[&str; 15]; SEAM_READ_SEAMS] = [
+    [
+        "seam_read_chain_n",
+        "seam_read_chain_ok_n",
+        "seam_read_chain_miss_n",
+        "seam_read_chain_bytes",
+        "seam_read_chain_witness_n",
+        "seam_read_chain_serial_n",
+        "seam_read_chain_epoch_n",
+        "seam_read_chain_same_n",
+        "seam_read_chain_memo_n",
+        "seam_read_chain_hit_n",
+        "seam_read_chain_hit_bytes",
+        "seam_read_chain_unreachable_n",
+        "seam_read_chain_unreachable_bytes",
+        "seam_read_chain_probe_n",
+        "seam_read_chain_encode_n",
+    ],
+    [
+        "seam_read_sample_n",
+        "seam_read_sample_ok_n",
+        "seam_read_sample_miss_n",
+        "seam_read_sample_bytes",
+        "seam_read_sample_witness_n",
+        "seam_read_sample_serial_n",
+        "seam_read_sample_epoch_n",
+        "seam_read_sample_same_n",
+        "seam_read_sample_memo_n",
+        "seam_read_sample_hit_n",
+        "seam_read_sample_hit_bytes",
+        "seam_read_sample_unreachable_n",
+        "seam_read_sample_unreachable_bytes",
+        "seam_read_sample_probe_n",
+        "seam_read_sample_encode_n",
+    ],
+];
+
+/// One resident this seam has read, as the version it read it at.
+struct SeamReadMemo {
+    identity: crate::backend::vulkan::engine::TargetIdentity,
+    witness: crate::backend::vulkan::engine::ResidentReadWitness,
+}
+
+/// What a seam remembers between reads: the last few residents it read, plus
+/// the immediately preceding attempt.
+///
+/// # Why a table rather than one entry
+///
+/// One entry answers "was the *previous* read of this seam the same target at
+/// the same version", which is the literal question the round asks and is the
+/// cheapest possible memo. It is also the wrong instrument for deciding whether
+/// to build one: a record's reads of its own attachment and of the targets it
+/// samples are interleaved with every other record's, so a one-entry table
+/// would read a repeat rate near zero for a seam whose reads are in fact highly
+/// repetitive. Eight entries is a bound chosen to be *smaller than the working
+/// set the round is trying to measure* — a hit here is a hit a real memo of the
+/// same size would take, and a miss here under-states the memo rather than
+/// over-stating it.
+///
+/// A hit requires the **allocation and the view** as well as the version,
+/// because a retired and recreated resident restarts its serial, and it
+/// requires the serial to be present: a table entry with no version is a
+/// resident nothing has vouched for, and serving its frame back would be the
+/// unsound memo this instrument exists to avoid building.
+#[derive(Default)]
+struct SeamReadState {
+    memos: [Vec<SeamReadMemo>; SEAM_READ_SEAMS],
+    previous: [Option<crate::backend::vulkan::engine::TargetIdentity>; SEAM_READ_SEAMS],
+}
+
+/// One read attempt's own record, handed back to the answer half.
+///
+/// Default throughout when the meter is off, which is what keeps every call
+/// site a branch and a move on the ordinary boot.
+#[derive(Clone, Copy, Debug, Default)]
+struct SeamReadTicket {
+    /// The attempt matched a table entry at the same allocation, view and
+    /// version: the frame this read is about to buy is one the seam already
+    /// holds.
+    version_hit: bool,
+}
+
+thread_local! {
+    /// The meter's own state. Thread-local for the reason every frame-profile
+    /// accumulator is: a span and a counter are read by the thread that paid
+    /// them, and the draw walk is one thread.
+    static SEAM_READ_STATE: std::cell::RefCell<SeamReadState> =
+        std::cell::RefCell::new(SeamReadState::default());
+}
+
+/// Whether [`crate::config::SEAM_READ_GENERATION`] is on, cached.
+///
+/// The meter is asked once per read *attempt*, not per record, so this is not
+/// the hot path the byte-arm meters sit on — but it is asked per attempt in a
+/// seam that runs on every record, and `config::switch`'s environment lookup
+/// would be the wrong price for the off arm of a bar the off arm does not read.
+fn seam_read_meter_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match SEAM_READ_METER_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let on = matches!(
+        crate::config::switch(crate::config::SEAM_READ_GENERATION),
+        crate::config::Switch::On
+    );
+    SEAM_READ_METER_ARM.store(if on { 2 } else { 1 }, Relaxed);
+    on
+}
+
+/// The test's own arm, in the shape `set_seam_frame_borrow_arm` gives its own
+/// switch (`None` gives the environment back).
+pub fn set_seam_read_meter_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    SEAM_READ_METER_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+    SEAM_READ_STATE.with(|state| *state.borrow_mut() = SeamReadState::default());
+}
+
+static SEAM_READ_METER_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Charge a counter by name, for the seam and slot given.
+fn note_seam_read_count(seam: SeamReadSeam, count: SeamReadCount, n: u64) {
+    if n == 0 {
+        return;
+    }
+    crate::runtime::drain::note_store_route_n(SEAM_READ_COUNTERS[seam as usize][count as usize], n);
+}
+
+/// Meter a read **before** it is taken, and hand the answer back to
+/// [`note_seam_read_answer`].
+///
+/// The witness is taken before rather than after deliberately, and the
+/// direction is the whole soundness argument for the memo this instruments: a
+/// version observed *after* the read can be newer than the bytes that read
+/// returned (another thread may publish a write in between), and a memo that
+/// recorded the newer version against the older bytes would serve a stale frame
+/// on the next hit. Observed before, a published write can only make the entry
+/// *unreachable* — the serial never goes back — which costs a hit and can never
+/// cost a frame.
+fn note_seam_read_attempt(
+    seam: SeamReadSeam,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    charged: bool,
+) -> SeamReadTicket {
+    if !seam_read_meter_enabled() {
+        return SeamReadTicket::default();
+    }
+    note_seam_read_count(
+        seam,
+        if charged {
+            SeamReadCount::Encoded
+        } else {
+            SeamReadCount::Probed
+        },
+        1,
+    );
+    let witness = crate::backend::vulkan::engine::resident_read_witness(identity);
+    seam_read_attempt_core(seam, identity, witness)
+}
+
+/// [`note_seam_read_attempt`]'s whole decision, with the witness handed in.
+///
+/// Split out so the classification can be driven by a test with witnesses no
+/// device in a unit test can produce: what is under test is which of the three
+/// keys a read repeated, and a live registry is not part of that question.
+fn seam_read_attempt_core(
+    seam: SeamReadSeam,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    witness: Option<crate::backend::vulkan::engine::ResidentReadWitness>,
+) -> SeamReadTicket {
+    note_seam_read_count(seam, SeamReadCount::Attempts, 1);
+    let mut ticket = SeamReadTicket::default();
+    let Some(witness) = witness else {
+        // Nothing in the registry under this identity: the read is about to
+        // decline, and there is no version to compare against.
+        note_seam_read_previous(seam, identity);
+        return ticket;
+    };
+    note_seam_read_count(seam, SeamReadCount::Witnesses, 1);
+    if witness.content_serial.is_some() {
+        note_seam_read_count(seam, SeamReadCount::Serials, 1);
+    }
+    if witness.content_epoch.is_some() {
+        note_seam_read_count(seam, SeamReadCount::Epochs, 1);
+    }
+    // The comparison and the table lookup happen under **one** borrow of the
+    // meter's own state, and every counter is charged from what that borrow
+    // hands back rather than inside it: `note_store_route` takes the census
+    // registry's lock, and holding a `RefCell` across another lock is how a
+    // re-entrant census turns a reading into a stall.
+    let (same, remembered) = SEAM_READ_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let slot = seam as usize;
+        let same = state.previous[slot].as_ref() == Some(identity);
+        state.previous[slot] = Some(identity.clone());
+        let remembered = state.memos[slot]
+            .iter()
+            .position(|memo| memo.identity == *identity)
+            .map(|position| state.memos[slot][position].witness);
+        (same, remembered)
+    });
+    if same {
+        note_seam_read_count(seam, SeamReadCount::SameAsPrevious, 1);
+    }
+    if let Some(previous) = remembered {
+        note_seam_read_count(seam, SeamReadCount::Remembered, 1);
+        let compatible = previous.image == witness.image
+            && previous.view == witness.view
+            && witness.content_serial.is_some()
+            && witness.content_serial == previous.content_serial;
+        if compatible {
+            ticket.version_hit = true;
+            note_seam_read_count(seam, SeamReadCount::VersionHits, 1);
+        }
+    }
+    // Remembered whatever the comparison said, in recency order: an entry that
+    // has just been read is the one a repeat is most likely to ask for again,
+    // and the table's bound is what evicts the least recently read resident.
+    SEAM_READ_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let memos = &mut state.memos[seam as usize];
+        if let Some(existing) = memos.iter_mut().find(|memo| memo.identity == *identity) {
+            existing.witness = witness;
+        } else {
+            memos.push(SeamReadMemo {
+                identity: identity.clone(),
+                witness,
+            });
+            if memos.len() > SEAM_READ_MEMO_ENTRIES {
+                memos.remove(0);
+            }
+        }
+    });
+    ticket
+}
+
+/// Record `identity` as this seam's most recent attempt.
+fn note_seam_read_previous(
+    seam: SeamReadSeam,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) {
+    SEAM_READ_STATE.with(|state| {
+        state.borrow_mut().previous[seam as usize] = Some(identity.clone());
+    });
+}
+
+/// How many residents one seam remembers. See [`SeamReadState`].
+const SEAM_READ_MEMO_ENTRIES: usize = 8;
+
+/// Meter a read **after** it is taken: `Some(bytes)` is the frame it answered
+/// with, `None` the refusal.
+fn note_seam_read_answer(seam: SeamReadSeam, ticket: SeamReadTicket, bytes: Option<u64>) {
+    if !seam_read_meter_enabled() {
+        return;
+    }
+    match bytes {
+        Some(bytes) => {
+            note_seam_read_count(seam, SeamReadCount::Reads, 1);
+            note_seam_read_count(seam, SeamReadCount::Bytes, bytes);
+            if ticket.version_hit {
+                note_seam_read_count(seam, SeamReadCount::VersionHitBytes, bytes);
+            }
+        }
+        None => note_seam_read_count(seam, SeamReadCount::Misses, 1),
+    }
+}
+
+/// Charge the share of a seam's reads whose frame the class cannot read.
+///
+/// Asked at the **call site** rather than inside the meter, because the two
+/// conditions are the seam's own facts about the record (`chain_loads_resident`
+/// and a stated attachment window) and the meter is handed only the identity.
+/// `unreachable` is false at the sampled-target seam: a frame declared there
+/// becomes a `TextureSource::OwnedBytes` the trace consumes, so the only way
+/// that read is wasted is a refusal, which that seam cannot know before asking.
+fn note_seam_read_unreachable(seam: SeamReadSeam, unreachable: bool, bytes: Option<u64>) {
+    if !unreachable || !seam_read_meter_enabled() {
+        return;
+    }
+    note_seam_read_count(seam, SeamReadCount::Unreachable, 1);
+    if let Some(bytes) = bytes {
+        note_seam_read_count(seam, SeamReadCount::UnreachableBytes, bytes);
+    }
+}
+
 /// The frames this caller can hand the canonical rail for sampled GPU targets
 /// it has no production to restate (R24).
 ///
@@ -14407,6 +14830,7 @@ static SEAM_FRAME_BORROW_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::A
 fn sampled_target_frames<'a>(
     req: &crate::backend::vulkan::engine::DrawRequest,
     frames: &'a mut Vec<(crate::backend::vulkan::engine::TargetIdentity, Vec<u8>)>,
+    charged: bool,
 ) -> Vec<crate::backend::provider_render::SampledTargetFrame<'a>> {
     for image in &req.sampled_images {
         let crate::backend::vulkan::engine::SampledSource::Target(identity) = &image.source else {
@@ -14430,10 +14854,31 @@ fn sampled_target_frames<'a>(
         {
             continue;
         }
-        let Ok(Some(frame)) = crate::backend::vulkan::engine::read_target_four_byte_color(identity)
-        else {
+        // R-SR2: the attempt is metered before the read, and the read itself is
+        // bracketed on its own bar so a round can tell the read's µs from the
+        // loop's. Both are gated on the same switch the meter caches; the span
+        // additionally needs the frame profile, which `frame_span` answers for.
+        let metered = seam_read_meter_enabled();
+        let ticket = if metered {
+            note_seam_read_attempt(SeamReadSeam::Sample, identity, charged)
+        } else {
+            SeamReadTicket::default()
+        };
+        let _seam_sample_read = metered
+            .then(|| {
+                crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::SeamSampleRead)
+            })
+            .flatten();
+        let read = crate::backend::vulkan::engine::read_target_four_byte_color(identity);
+        let Ok(Some(frame)) = read else {
+            note_seam_read_answer(SeamReadSeam::Sample, ticket, None);
             continue;
         };
+        note_seam_read_answer(
+            SeamReadSeam::Sample,
+            ticket,
+            Some(u64::try_from(frame.len()).unwrap_or(u64::MAX)),
+        );
         frames.push((identity.clone(), frame));
     }
     frames
@@ -20201,5 +20646,209 @@ mod resident_source_doors_tests {
             "a `load_from_target` no door claims is the canary, not a silence: a fourth door \
              added without its own route must read as a number in the census"
         );
+    }
+}
+
+#[cfg(test)]
+mod seam_read_meter_tests {
+    use super::{
+        note_seam_read_answer, seam_read_attempt_core, set_seam_read_meter_arm, SeamReadCount,
+        SeamReadSeam, SEAM_READ_COUNTERS,
+    };
+    use crate::backend::vulkan::engine::{ResidentReadWitness, TargetIdentity};
+    use ash::vk;
+
+    /// The three keys are three different readings, and only the third one can
+    /// be served.
+    ///
+    /// This is the whole case the round is decided on. A memo keyed on the
+    /// identity alone reads `memo_n` as its hit rate and would serve a frame the
+    /// guest has already painted over; a memo keyed on the content version reads
+    /// `hit_n`. `same_n` — the task's own "same `(identity, generation)` as the
+    /// last read" — is the weakest of the three and is here to show how much a
+    /// one-entry memo would have missed: a seam that interleaves two residents
+    /// reads it as zero while a table reads both.
+    ///
+    /// One scenario, seven reads over two identities, so the three keys are
+    /// compared on the same population rather than across two boots.
+    #[test]
+    fn only_a_repeated_content_version_is_a_repeat_the_memo_could_serve() {
+        set_seam_read_meter_arm(Some(true));
+        let surface = |id: u32| TargetIdentity::Surface {
+            id,
+            width: 1920,
+            height: 1080,
+            generation: 3,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let (first, second) = (surface(0x5EAD), surface(0x5EAE));
+        let witness = |serial: Option<u64>, image: u64| ResidentReadWitness {
+            key_generation: 3,
+            image,
+            view: image + 1,
+            content_serial: serial,
+            content_epoch: None,
+            content_ready: true,
+        };
+        let read = |identity: &TargetIdentity, serial: Option<u64>, image: u64| {
+            let ticket =
+                seam_read_attempt_core(SeamReadSeam::Chain, identity, Some(witness(serial, image)));
+            note_seam_read_answer(SeamReadSeam::Chain, ticket, Some(1024));
+        };
+        let count = |suffix: SeamReadCount| {
+            let name = SEAM_READ_COUNTERS[SeamReadSeam::Chain as usize][suffix as usize];
+            // The window's counter, read exactly as the census reads it: this
+            // test asserts the wiring, so it must not re-derive the number.
+            crate::runtime::drain::store_route_count(name)
+        };
+        let before = count(SeamReadCount::Attempts);
+        // Its own snapshot: the counter is a live window, and another test in
+        // this process may have charged it before this one started.
+        let before_unreachable = count(SeamReadCount::Unreachable);
+
+        // 1: first sight of the first resident — nothing to compare against.
+        read(&first, Some(41), 0xA000);
+        // 2: first sight of the second.
+        read(&second, Some(7), 0xB000);
+        // 3: back to the first, at the version it was read at. A table finds it;
+        //    the one-entry reading does not, because the second resident is what
+        //    the seam read last. This is the read a memo would have answered.
+        read(&first, Some(41), 0xA000);
+        // 4: the same resident with a moved version — the guest has drawn since,
+        //    so its frame is new and a memo keyed on the identity alone would
+        //    serve the previous one.
+        read(&first, Some(42), 0xA000);
+        // 5: a different allocation under the second identity at a version
+        //    number that has been seen before. A retired and recreated resident
+        //    restarts its serial, which is the second reason the memo cannot key
+        //    on the version alone.
+        read(&second, Some(1), 0xC000);
+        // 6: the same allocation at the same version: a hit.
+        read(&second, Some(1), 0xC000);
+        // 7: a resident no write has ever been recorded on, so there is no
+        //    version to key by and the read cannot be served from a memo.
+        read(&first, None, 0xA000);
+
+        assert_eq!(count(SeamReadCount::Attempts) - before, 7);
+        assert_eq!(count(SeamReadCount::Witnesses) - before, 7);
+        assert_eq!(
+            count(SeamReadCount::Serials) - before,
+            6,
+            "the seventh attempt carried no version and must not read as one"
+        );
+        assert_eq!(
+            count(SeamReadCount::Epochs) - before,
+            0,
+            "no attempt's slot carried the mapping-level stamp in this scenario"
+        );
+        assert_eq!(
+            count(SeamReadCount::SameAsPrevious) - before,
+            2,
+            "only the two runs of one resident — reads 4 and 6 — repeat the previous attempt's \
+             identity, so a one-entry memo reads this seam as a 2-of-7 repeat"
+        );
+        assert_eq!(
+            count(SeamReadCount::Remembered) - before,
+            5,
+            "four of the five are reads of a resident already in the table"
+        );
+        assert_eq!(
+            count(SeamReadCount::VersionHits) - before,
+            2,
+            "reads 3 and 6 re-asked at the same allocation and version; read 5's version number \
+             was seen before but belongs to another allocation, and read 7 has no version"
+        );
+        assert_eq!(
+            count(SeamReadCount::VersionHitBytes) - before,
+            2 * 1024,
+            "the hits are priced in the bytes they would have deleted"
+        );
+        assert_eq!(
+            count(SeamReadCount::Unreachable) - before_unreachable,
+            0,
+            "this scenario never states the two conditions a skip narrows on, and the meter is \
+             not allowed to invent them"
+        );
+        set_seam_read_meter_arm(None);
+    }
+
+    /// The skip's own share is charged on the read that already happened, so
+    /// the reading is comparable with the bar it is meant to price.
+    #[test]
+    fn a_frame_the_class_cannot_read_is_counted_with_the_bytes_it_moved() {
+        set_seam_read_meter_arm(Some(true));
+        let count = |suffix: SeamReadCount| {
+            let name = SEAM_READ_COUNTERS[SeamReadSeam::Chain as usize][suffix as usize];
+            crate::runtime::drain::store_route_count(name)
+        };
+        let before = count(SeamReadCount::Unreachable);
+
+        super::note_seam_read_unreachable(SeamReadSeam::Chain, true, Some(8_294_400));
+        super::note_seam_read_unreachable(SeamReadSeam::Chain, false, Some(8_294_400));
+
+        assert_eq!(
+            count(SeamReadCount::Unreachable) - before,
+            1,
+            "only the attempt whose record stated the condition counts"
+        );
+        assert_eq!(
+            count(SeamReadCount::UnreachableBytes) - before,
+            8_294_400,
+            "the skip's reading is the frame it would not have moved"
+        );
+        set_seam_read_meter_arm(None);
+    }
+
+    /// The probe's read and the encode's are two attempts and one bar.
+    ///
+    /// The seam's own bars are charged on the encode alone — the probe is the
+    /// walk's lookahead and the encode is the pass it stands for, and both take
+    /// the read. Dividing a bar by the whole attempt count would price two
+    /// passes as one and understate a single read by the probe's share, so the
+    /// two are counted apart and the bar is read against the encode count.
+    #[test]
+    fn the_probe_and_the_encode_are_counted_apart() {
+        set_seam_read_meter_arm(Some(true));
+        let identity = TargetIdentity::Anonymous { slot: 12 };
+        let count = |suffix: SeamReadCount| {
+            let name = SEAM_READ_COUNTERS[SeamReadSeam::Sample as usize][suffix as usize];
+            crate::runtime::drain::store_route_count(name)
+        };
+        let before = (
+            count(SeamReadCount::Attempts),
+            count(SeamReadCount::Probed),
+            count(SeamReadCount::Encoded),
+        );
+
+        let _ = super::note_seam_read_attempt(SeamReadSeam::Sample, &identity, false);
+        let _ = super::note_seam_read_attempt(SeamReadSeam::Sample, &identity, true);
+
+        assert_eq!(count(SeamReadCount::Attempts) - before.0, 2);
+        assert_eq!(count(SeamReadCount::Probed) - before.1, 1);
+        assert_eq!(count(SeamReadCount::Encoded) - before.2, 1);
+        set_seam_read_meter_arm(None);
+    }
+
+    /// Off is the state every ordinary boot is in, and it must charge nothing.
+    #[test]
+    fn a_meter_that_is_off_moves_no_counter() {
+        set_seam_read_meter_arm(Some(false));
+        let identity = TargetIdentity::Anonymous { slot: 7 };
+        let ticket = super::note_seam_read_attempt(SeamReadSeam::Sample, &identity, true);
+        note_seam_read_answer(SeamReadSeam::Sample, ticket, Some(4096));
+        for count in [
+            SeamReadCount::Attempts,
+            SeamReadCount::Reads,
+            SeamReadCount::Bytes,
+            SeamReadCount::Witnesses,
+        ] {
+            let name = SEAM_READ_COUNTERS[SeamReadSeam::Sample as usize][count as usize];
+            assert_eq!(
+                crate::runtime::drain::store_route_count(name),
+                0,
+                "{name} moved with the meter off"
+            );
+        }
+        set_seam_read_meter_arm(None);
     }
 }
