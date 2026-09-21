@@ -44,17 +44,25 @@ use std::sync::{Mutex, OnceLock};
 use metal_api_core::provider::{ComputeTrace, TextureSource};
 use metal_api_core::statement_payload::{payload_digest, PayloadLedger, PayloadPlan};
 
-/// The switch a launcher writes to arm the mechanism. Default off: off, the
-/// plan is one relaxed load and every statement keeps its exact bytes.
+/// The switch a launcher writes to disarm the mechanism. **Unset is on**,
+/// flipped 2026-09-21 once its round had priced it: the two arms read the wire
+/// texture payload at 616 488 → 22 285 B a statement (−96.4 %, the whole
+/// statement −36.7 %) against a control plane that stayed identical. Only
+/// `0/off/false/no` restore the exact pre-cut bytes.
 const SWITCH: &str = "REIMS_VGPU_STATEMENT_PAYLOAD_TABLE";
 
 /// Whether this process states the payload table's arms.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
-            std::env::var(SWITCH).ok().as_deref().map(str::trim),
-            Some("1") | Some("on") | Some("true") | Some("yes")
+        !matches!(
+            std::env::var(SWITCH)
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
         )
     })
 }
