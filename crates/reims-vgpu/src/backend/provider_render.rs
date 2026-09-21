@@ -20193,6 +20193,27 @@ fn declare_pipeline(
     }
 }
 
+/// The tail record's own delivery (E-TX14), read off the record while it is
+/// still whole on the cut's arm (TR1).
+///
+/// The pass the delivery is stated from is one of the values the walk moves, so
+/// the frame's shape and the two views it names are taken here, before the move,
+/// and the entry is pushed after the walk — in the one position the contract
+/// makes resolvable.
+struct NarrowLanding {
+    /// The attachment whose image the entry delivers: the resident store's own
+    /// identity, which is why the entry cannot deliver an image the pass did not
+    /// leave behind.
+    attachment: AttachmentIdentity,
+    /// The frame's shape, off the pass's own colour attachment.
+    format: metal_api_core::provider::AttachmentFormat,
+    width: u64,
+    height: u64,
+    /// The owner window the frame lands in, named by the record's landing view.
+    allocation_id: AllocationId,
+    view_id: ViewId,
+}
+
 /// The same trace, with the record's own render pass handed over **by value**
 /// instead of copied (TR1, `REIMS_VGPU_TRACE_PASS_OWNED`).
 ///
@@ -20228,11 +20249,7 @@ fn narrow_trace_owned(
     // the pass it is stated from is moved into the trace below, so the frame's
     // shape and the two identities are read here and the entry is pushed after
     // the walk, in the one position the contract makes resolvable.
-    let mut landing: Option<(
-        AttachmentIdentity,
-        (metal_api_core::provider::AttachmentFormat, u64, u64),
-        (AllocationId, ViewId),
-    )> = None;
+    let mut landing: Option<NarrowLanding> = None;
     for (index, record) in records.into_iter().enumerate() {
         let NarrowTraceRecord {
             declaring,
@@ -20300,11 +20317,14 @@ fn narrow_trace_owned(
                     .color_attachments
                     .first()
                     .expect("a record's trace states one colour attachment");
-                (
+                NarrowLanding {
                     attachment,
-                    (frame.format, frame.width, frame.height),
-                    (allocation_id, view_id),
-                )
+                    format: frame.format,
+                    width: frame.width,
+                    height: frame.height,
+                    allocation_id,
+                    view_id,
+                }
             })
         } else {
             None
@@ -20331,19 +20351,19 @@ fn narrow_trace_owned(
     // submission ends. See [`narrow_trace_borrowed`] for why the arm belongs to
     // the trace's last record and why the frame's identity is the attachment's
     // own.
-    if let Some((attachment, (format, width, height), (allocation_id, view_id))) = landing {
+    if let Some(landing) = landing {
         trace_passes.push(TracePass::Landing(
             metal_api_core::provider::KeptFrameLanding {
                 frame: metal_api_core::provider::KeptFrame {
-                    allocation_id: attachment.allocation,
-                    view_id: attachment.view,
-                    format,
-                    width,
-                    height,
+                    allocation_id: landing.attachment.allocation,
+                    view_id: landing.attachment.view,
+                    format: landing.format,
+                    width: landing.width,
+                    height: landing.height,
                 },
                 landing: AttachmentLandingView {
-                    allocation_id,
-                    view_id,
+                    allocation_id: landing.allocation_id,
+                    view_id: landing.view_id,
                 },
             },
         ));
@@ -20871,7 +20891,24 @@ fn finish_narrow_records(
     // the walk while the records whose plans already retired stay retired
     // (their bytes were published by a completion that ran).
     let mut out = Vec::with_capacity(answers.len());
-    for index in 0..answers.len() {
+    // The run's own size, read before the leases are walked: every reader below
+    // asks the same question (is this record the trace's tail?) and the walk
+    // holds the lease list mutably while it retires them one by one.
+    //
+    // One plan per record is the assembly's own invariant, stated once here in
+    // the same words the debug assertion above uses: a run that lost a plan must
+    // refuse rather than answer fewer records than it parked.
+    let records = answers.len();
+    assert_eq!(
+        leases.len(),
+        records,
+        "one owner plan per record: a run whose plans and records disagree is not a trace"
+    );
+    // The leases are walked rather than indexed: they are one per record (the
+    // debug assertion above is what holds the two lists to each other), and a
+    // plan's own retirement is the one step of this walk that *mutates* its
+    // half — `Plan::settle` takes the plan, so the walk needs the slot.
+    for (index, lease) in leases.iter_mut().enumerate() {
         // The record's own half of the trace, under the names this walk was
         // always written in: one indirection more than the single-record path
         // had, and the same statements after it — with the arm's own difference
@@ -20884,13 +20921,13 @@ fn finish_narrow_records(
         // publishing tail. Its own frame stays in the provider's image (which
         // is what its store arm states), and the writeback the completion
         // carries for the identity the whole run shares belongs to the tail.
-        let intermediate = answers.len() > 1 && index + 1 < answers.len();
+        let intermediate = records > 1 && index + 1 < records;
         // The present completion belongs to the record that stated one; every
         // other record of a batch reads `None` here.
         let present = if facts.present { present.take() } else { None };
         let _settle =
             crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvSettle);
-        if let Some(plan) = leases[index].take() {
+        if let Some(plan) = lease.take() {
             plan.settle(provider, result.completion)
                 .map_err(ProviderRenderDecline::Owner)?;
         }

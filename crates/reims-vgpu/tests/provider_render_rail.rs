@@ -7309,7 +7309,10 @@ fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_secon
             .collect()
     };
 
-    let import = 0x9e4c_u64;
+    // An import id of this case's own: the rail's owner registry is a process
+    // global and a case that re-registered the id its neighbour used would be
+    // refused by name (`DuplicateRegion`) rather than read as itself.
+    let import = 0x9e6b_u64;
     let gpa_base = 0x55_5000_u64;
     let window_bytes = pattern(0x00);
     let chain = pattern(0x5a);
@@ -7542,9 +7545,7 @@ fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_secon
 /// lengths. The table's *identities* are the plan's own numbering (see
 /// [`canonical_allocation_ids`]), and this case's subject is the pass list the
 /// walk states rather than the assembly's table.
-fn resource_table_shape(
-    table: &metal_api_core::provider::ResourceTableSnapshot,
-) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+fn resource_table_shape(table: &metal_api_core::provider::ResourceTableSnapshot) -> String {
     let mut allocations: Vec<(u64, u64)> = table
         .allocations()
         .map(|record| (record.size, record.owner_epoch.get()))
@@ -7555,7 +7556,7 @@ fn resource_table_shape(
         .collect();
     allocations.sort_unstable();
     leases.sort_unstable();
-    (allocations, leases)
+    format!("allocations={allocations:?} leases={leases:?}")
 }
 
 /// Renumber one trace's plan-minted allocation ids by first appearance (TR1).
