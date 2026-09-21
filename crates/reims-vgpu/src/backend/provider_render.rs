@@ -18342,7 +18342,7 @@ impl RenderBatch {
         }
         let records = std::mem::take(&mut self.records);
         let assembly = std::mem::replace(&mut self.assembly, NarrowAssembly::new());
-        match finish_narrow_records(&rail.provider, &records, assembly) {
+        match finish_narrow_records(&rail.provider, records, assembly) {
             Ok(completions) => {
                 let records = completions.len();
                 self.outcomes = Vec::with_capacity(completions.len());
@@ -18414,7 +18414,18 @@ impl RenderBatch {
                 Ok(())
             }
             Err(decline) => {
-                self.records = records;
+                // TR1: the run's records are not put back here. The cut's arm
+                // hands them to the walk by value — that is the whole of it —
+                // and the borrowed arm leaves them with `take` above, so the run
+                // cannot hold them after either. Nothing reads a run's own
+                // state after a failed finish: every reader of `len`,
+                // `is_empty` and `last_record_keeps_frame` reads it between a
+                // park and the finish (the walk's own check is guarded by
+                // `refusal.is_none()` and this path sets it), and the walk gives
+                // the run back whole and drops it on this path
+                // (`runtime::exec`'s refusal arm: `run.batch.abandon()` then
+                // `open_run = None`).
+                self.records = Vec::new();
                 self.abandon();
                 Err(decline)
             }
@@ -19548,6 +19559,98 @@ fn render_many_draws_enabled() -> bool {
     })
 }
 
+/// The cut's own arm, forced by a test (`None` gives the env back) — the same
+/// shape [`crate::backend::provider_wire::capture_submission_frames`] gives the
+/// wire's own tests.
+///
+/// A switch read through a `OnceLock` cannot be put back, and the arm this
+/// selects is the one thing an equivalence case has to vary **within one
+/// process**: a rail test that ran one arm in one binary and the other in the
+/// next would be comparing two scenarios, not two statements of one.
+static TRACE_PASS_OWNED_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the trace walk's own arm for a test (TR1).
+///
+/// `None` restores the switch's own reading. The values are the three states
+/// one byte can carry: unset, off, on.
+pub fn set_trace_pass_owned_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TRACE_PASS_OWNED_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the trace walk takes the record's own render pass by value instead of
+/// copying it (TR1, `REIMS_VGPU_TRACE_PASS_OWNED`).
+///
+/// **Off by default**, like every other cut in this rail: unset is the arm every
+/// round before this increment ran — the records stay with the caller, the walk
+/// copies the pass it states, and the completion reads the records where they
+/// lie. `REIMS_VGPU_TRACE_PASS_OWNED` spelled `1/on/true/yes` is the increment
+/// arm, where the records are split and the walk takes its half by value. The
+/// switch is read once, at the first trace, and a test may override it through
+/// [`set_trace_pass_owned_arm`].
+fn trace_pass_owned_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match TRACE_PASS_OWNED_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_trace_pass_owned(std::env::var("REIMS_VGPU_TRACE_PASS_OWNED").ok().as_deref())
+    })
+}
+
+/// The switch's own parser, apart from the process-global it caches into so a
+/// unit test can read every spelling without a switch it cannot put back.
+fn parse_trace_pass_owned(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+#[cfg(test)]
+mod trace_pass_owned_switch_tests {
+    use super::*;
+
+    /// The spellings the cut's switch answers to, and — the reading that matters
+    /// for a control arm — that everything else, an unset variable included, is
+    /// the path every round before this increment ran.
+    #[test]
+    fn the_trace_pass_owned_switch_reads_the_rail_s_own_spellings() {
+        for on in [
+            Some("1"),
+            Some("on"),
+            Some("ON"),
+            Some("true"),
+            Some("yes"),
+            Some(" on "),
+        ] {
+            assert!(parse_trace_pass_owned(on), "{on:?} is an ask");
+        }
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("OFF"),
+            Some("false"),
+            Some("no"),
+            Some(" No "),
+        ] {
+            assert!(!parse_trace_pass_owned(off), "{off:?} is the control arm");
+        }
+    }
+}
+
 /// The device's own answer for the multi-draw arm, and the states the test
 /// instrument below can put it in — the same three states, for the same reason,
 /// as [`KEPT_FRAME_LANDING_ANSWER`]'s.
@@ -19676,9 +19779,13 @@ fn declared_draws_per_pass(provider: &metal_api_vulkan::VulkanComputeProvider) -
 ///   raster, depth or stencil surface (`..._state_mismatch`). The contract
 ///   makes the agreement structural for a hand-built plan; this is the
 ///   assembly's own reading of its own records.
-fn many_draws_pass(
+///
+/// The election reads two fields off each record and nothing else, spelled once
+/// over both arms of TR1's cut through [`NarrowListRecord`]: the borrowed arm
+/// hands it the whole records, the cut's arm the half the walk owns.
+fn many_draws_pass<R: NarrowListRecord>(
     provider: &metal_api_vulkan::VulkanComputeProvider,
-    records: &[NarrowRecord],
+    records: &[R],
 ) -> Option<(usize, RenderDrawsDescriptor)> {
     // A run is at least two records: one record is the shape every single
     // submission has always had, and the arm exists to share one pass between
@@ -19700,7 +19807,7 @@ fn many_draws_pass(
     // list this arm has anything to say about.
     let carried = records
         .iter()
-        .take_while(|record| record.facts.keeps_frame)
+        .take_while(|record| record.list_facts().keeps_frame)
         .count();
     if carried < 2 {
         return None;
@@ -19714,15 +19821,15 @@ fn many_draws_pass(
         .first()
         .expect("a list of two draws states a first record");
     for (index, record) in members.iter().enumerate() {
-        if record.facts.present {
+        if record.list_facts().present {
             crate::runtime::drain::note_store_route("render_batch_many_draws_present");
             return None;
         }
-        if index > 0 && !record.facts.loads_resident {
+        if index > 0 && !record.list_facts().loads_resident {
             crate::runtime::drain::note_store_route("render_batch_many_draws_member_not_resident");
             return None;
         }
-        if !same_pass_state(&head.pass_descriptor, &record.pass_descriptor) {
+        if !same_pass_state(head.list_pass_descriptor(), record.list_pass_descriptor()) {
             crate::runtime::drain::note_store_route("render_batch_many_draws_state_mismatch");
             return None;
         }
@@ -19730,7 +19837,7 @@ fn many_draws_pass(
     let draws: Vec<RenderDraw> = members
         .iter()
         .skip(1)
-        .map(|record| record.pass_descriptor.draw())
+        .map(|record| record.list_pass_descriptor().draw())
         .collect();
     if carried < records.len() {
         crate::runtime::drain::note_store_route("render_batch_many_draws_publisher");
@@ -19747,11 +19854,139 @@ fn many_draws_pass(
         9..=16 => "render_batch_draws_per_pass_9_16",
         _ => "render_batch_draws_per_pass_over_16",
     });
+    // TR1: the list states the head's pass state once for the whole run, and
+    // the value it states is a copy of a descriptor the walk is holding a
+    // borrow of for exactly as long as this call. Its own bar and meter, so a
+    // round that prices `narrow_trace`'s three copies reads this one beside
+    // them instead of finding an unattributed descriptor copy in the total.
+    let head_descriptor = {
+        let _span = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvTraceDrawsHeadClone,
+        );
+        crate::runtime::drain::note_trace_clone(
+            crate::runtime::drain::TraceCloneMeter::DrawsHead,
+            || trace_clone_pass_descriptor_bytes(head.list_pass_descriptor()),
+        );
+        head.list_pass_descriptor().clone()
+    };
     Some(RenderDrawsDescriptor {
-        head: head.pass_descriptor.clone(),
+        head: head_descriptor,
         tail: draws,
     })
     .map(|list| (carried, list))
+}
+
+/// The two things the many-draws election reads off a record, in both arms of
+/// TR1's cut.
+///
+/// The election is one body of rules over records (the keeping prefix, the
+/// present arm, the member-not-resident arm, the pass-state agreement) and
+/// neither arm's record owns the election anything else. Spelling it once over
+/// this trait is what keeps the two arms one shape here rather than two
+/// readings of one set of rules that could drift apart.
+trait NarrowListRecord {
+    /// The facts the election reads: keeping, present, resident load.
+    fn list_facts(&self) -> NarrowRecordFacts;
+    /// The pass the list would state once for the run.
+    fn list_pass_descriptor(&self) -> &RenderPassDescriptor;
+}
+
+impl NarrowListRecord for NarrowRecord {
+    fn list_facts(&self) -> NarrowRecordFacts {
+        self.facts
+    }
+
+    fn list_pass_descriptor(&self) -> &RenderPassDescriptor {
+        &self.pass_descriptor
+    }
+}
+
+impl NarrowListRecord for NarrowTraceRecord {
+    fn list_facts(&self) -> NarrowRecordFacts {
+        self.facts
+    }
+
+    fn list_pass_descriptor(&self) -> &RenderPassDescriptor {
+        &self.pass_descriptor
+    }
+}
+
+/// The payload one deep copy of a list copies: `len * size_of::<T>()`.
+///
+/// The reading the trace walk's own meters are written in, and the same one
+/// [`crate::runtime::drain::LeaseVecMeter`] takes for a `Vec` — a copy's weight
+/// is what it allocates and fills, not the handle it produces.
+fn trace_clone_list_bytes<T>(items: &[T]) -> u64 {
+    u64::try_from(std::mem::size_of_val(items)).unwrap_or(u64::MAX)
+}
+
+/// The bytes one deep copy of a buffer view reproduces (TR1).
+///
+/// The struct's own size plus whichever byte source it owns: an `OwnedBytes`
+/// view carries its payload by value, a guest-run list carries
+/// `len * size_of::<GuestRun>()`, and the two lease arms carry an id. This is
+/// the number the trace's own copies are priced by — the walk copies the value,
+/// so the value's payload is what the copy costs.
+fn trace_clone_view_bytes(view: &BufferView) -> u64 {
+    let mut bytes = u64::try_from(std::mem::size_of::<BufferView>()).unwrap_or(u64::MAX);
+    bytes += match &view.source {
+        BufferSource::OwnedBytes(owned) => u64::try_from(owned.len()).unwrap_or(u64::MAX),
+        BufferSource::GuestRuns(runs) => trace_clone_list_bytes(runs.as_slice()),
+        BufferSource::StagedLease(_) | BufferSource::BorrowedNoCopy(_) => 0,
+    };
+    bytes
+}
+
+/// The bytes one deep copy of a render pass descriptor reproduces (TR1).
+///
+/// Every list the descriptor owns plus every byte source its views own, with
+/// the flat fields folded in as the struct's own size. A descriptor is the
+/// largest of the four values the walk copies — it is the one that carries the
+/// staged vertex bytes, the attachment's own source and the stage-buffer views
+/// at once — which is why the meter beside it is read as bytes and not as a
+/// count.
+fn trace_clone_pass_descriptor_bytes(descriptor: &RenderPassDescriptor) -> u64 {
+    let mut bytes = u64::try_from(std::mem::size_of::<RenderPassDescriptor>()).unwrap_or(u64::MAX);
+    bytes += trace_clone_list_bytes(descriptor.color_attachments.as_slice());
+    bytes += trace_clone_list_bytes(descriptor.samplers.as_slice());
+    bytes += trace_clone_list_bytes(descriptor.stage_buffers.as_slice());
+    for view in &descriptor.vertex_buffers {
+        bytes += trace_clone_view_bytes(view);
+    }
+    for stage in &descriptor.stage_buffers {
+        bytes += trace_clone_view_bytes(&stage.view);
+    }
+    for texture in &descriptor.textures {
+        bytes += u64::try_from(std::mem::size_of::<TextureView>()).unwrap_or(u64::MAX);
+        if let TextureSource::OwnedBytes(owned) = &texture.source {
+            bytes += u64::try_from(owned.len()).unwrap_or(u64::MAX);
+        }
+    }
+    if let Some(indices) = &descriptor.indices {
+        bytes += u64::try_from(std::mem::size_of::<IndexBufferBinding>()).unwrap_or(u64::MAX);
+        bytes += trace_clone_view_bytes(&indices.view);
+    }
+    bytes
+}
+
+/// The bytes one deep copy of a registered pipeline reproduces (TR1).
+///
+/// The entry carries the provider's own metadata rather than its artifact, so
+/// the copy is the contract's binding lists and the capability strings — two
+/// orders of magnitude below a pass descriptor, which is the reading that says
+/// whether the walk's de-duplicating copy is worth moving at all.
+fn trace_clone_pipeline_bytes(pipeline: &CompiledComputePipeline) -> u64 {
+    let mut bytes =
+        u64::try_from(std::mem::size_of::<CompiledComputePipeline>()).unwrap_or(u64::MAX);
+    bytes += trace_clone_list_bytes(pipeline.contract.buffer_bindings.as_slice());
+    bytes += trace_clone_list_bytes(pipeline.contract.texture_bindings.as_slice());
+    for capability in &pipeline.contract.shader_capabilities {
+        bytes += u64::try_from(capability.len()).unwrap_or(u64::MAX);
+    }
+    if pipeline.render.is_some() {
+        bytes += u64::try_from(std::mem::size_of::<RenderPipelineContract>()).unwrap_or(u64::MAX);
+    }
+    bytes
 }
 
 /// Whether two records of a run state the same **pass state** (G3-B/B-2).
@@ -19784,7 +20019,8 @@ fn same_pass_state(head: &RenderPassDescriptor, member: &RenderPassDescriptor) -
         && head.stencil_resolve == member.stencil_resolve
 }
 
-/// The trace one batch of assembled records states (G3-B/B-1).
+/// The trace one batch of assembled records states, with the records still
+/// borrowed — the arm every round before this increment ran (G3-B/B-1, TR1).
 ///
 /// The composition rules are the ones a single record's trace always used, read
 /// across records instead of within one:
@@ -19802,7 +20038,12 @@ fn same_pass_state(head: &RenderPassDescriptor, member: &RenderPassDescriptor) -
 ///   `validate_serial_buffer_reuse` walks;
 /// * and last the kept frame's own delivery (E-TX14), after the pass that
 ///   defined it and before the submission ends.
-fn narrow_trace(
+///
+/// This arm copies the values it states, because the walk holds the records only
+/// as a borrow: each copy is priced by the bars this increment added, and
+/// [`narrow_trace_owned`] is the same walk with the record's own values handed
+/// over instead.
+fn narrow_trace_borrowed(
     provider: &metal_api_vulkan::VulkanComputeProvider,
     records: &[NarrowRecord],
 ) -> ComputeTrace {
@@ -19839,6 +20080,16 @@ fn narrow_trace(
             ));
         }
         for production in &record.in_flight {
+            // TR1: one production restated in this trace's own coordinates, its
+            // pass descriptor copied because the record it came from is only
+            // borrowed here.
+            let _span = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvTraceProdClone,
+            );
+            crate::runtime::drain::note_trace_clone(
+                crate::runtime::drain::TraceCloneMeter::ProductionDescriptor,
+                || trace_clone_pass_descriptor_bytes(&production.descriptor),
+            );
             trace_passes.push(TracePass::Render(production.descriptor.clone()));
         }
         // The run's own draws: the ones the list carries are stated by it, once,
@@ -19851,6 +20102,17 @@ fn narrow_trace(
                 .expect("the list is stated at the position of its own last draw");
             trace_passes.push(TracePass::RenderDraws(list));
         } else if index >= listed {
+            // TR1: the record's own render pass, stated by the trace. Every
+            // record the many-draws list carries states its pass through the
+            // list's head instead, which is why this copy is per *tail* record
+            // rather than per record.
+            let _span = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvTracePassClone,
+            );
+            crate::runtime::drain::note_trace_clone(
+                crate::runtime::drain::TraceCloneMeter::PassDescriptor,
+                || trace_clone_pass_descriptor_bytes(&record.pass_descriptor),
+            );
             trace_passes.push(TracePass::Render(record.pass_descriptor.clone()));
         }
     }
@@ -19914,7 +20176,453 @@ fn declare_pipeline(
         .iter()
         .any(|known| known.pipeline_id == pipeline.pipeline_id)
     {
+        // TR1: the trace states one entry per pipeline id, so the copy below
+        // runs once per *distinct* id — a batch's records share their declaring
+        // kernel's entry and pay for it once. Priced apart from the two
+        // descriptor copies because it is the smallest value of the three and
+        // the de-duplicated one: a round has to be able to say the walk's
+        // copies are descriptors rather than metadata before anything moves.
+        let _span = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvTracePipelineClone,
+        );
+        crate::runtime::drain::note_trace_clone(
+            crate::runtime::drain::TraceCloneMeter::Pipeline,
+            || trace_clone_pipeline_bytes(pipeline),
+        );
         pipelines.push(pipeline.clone());
+    }
+}
+
+/// The tail record's own delivery (E-TX14), read off the record while it is
+/// still whole on the cut's arm (TR1).
+///
+/// The pass the delivery is stated from is one of the values the walk moves, so
+/// the frame's shape and the two views it names are taken here, before the move,
+/// and the entry is pushed after the walk — in the one position the contract
+/// makes resolvable.
+struct NarrowLanding {
+    /// The attachment whose image the entry delivers: the resident store's own
+    /// identity, which is why the entry cannot deliver an image the pass did not
+    /// leave behind.
+    attachment: AttachmentIdentity,
+    /// The frame's shape, off the pass's own colour attachment.
+    format: metal_api_core::provider::AttachmentFormat,
+    width: u64,
+    height: u64,
+    /// The owner window the frame lands in, named by the record's landing view.
+    allocation_id: AllocationId,
+    view_id: ViewId,
+}
+
+/// The same trace, with the record's own render pass handed over **by value**
+/// instead of copied (TR1, `REIMS_VGPU_TRACE_PASS_OWNED`).
+///
+/// Every composition rule, every pass order and every byte the trace states is
+/// [`narrow_trace_borrowed`]'s, read over the half of the record the walk owns
+/// ([`NarrowTraceRecord`]) rather than over the whole borrowed record. One value
+/// changes hands differently and nothing else does: the pass descriptor this
+/// walk states is the record's own, moved into the trace where the borrowed arm
+/// pushes a copy of the same value. So the two arms are one function written
+/// twice over two shapes of input, and the equivalence reading is the frame the
+/// provider was handed — the rail's own case runs one scenario through both arms
+/// and asserts the captured frames are the same bytes.
+///
+/// The values the walk still **copies** here are the ones this cut did not take:
+/// the pipeline entries ([`declare_pipeline`], de-duplicated by id and the
+/// smallest of the four values the round priced) and each in-flight production's
+/// own pass. Both are `Copy`-style borrows of the half the walk owns, and both
+/// carry the same bars the borrowed arm charges, so a round reads which of the
+/// walk's values moved and which stayed copies rather than inferring it.
+fn narrow_trace_owned(
+    provider: &metal_api_vulkan::VulkanComputeProvider,
+    records: Vec<NarrowTraceRecord>,
+) -> ComputeTrace {
+    let mut pipelines: Vec<CompiledComputePipeline> = Vec::new();
+    let mut trace_passes: Vec<TracePass> = Vec::new();
+    // The views this trace has already declared, keyed by the view id alone —
+    // which is what the contract's pool is keyed by.
+    let mut declared: Vec<ViewId> = Vec::new();
+    let mut many_draws = many_draws_pass(provider, &records);
+    let listed = many_draws.as_ref().map_or(0, |(carried, _)| *carried);
+    let count = records.len();
+    // E-TX14's own delivery, taken off the tail record while it is still whole:
+    // the pass it is stated from is moved into the trace below, so the frame's
+    // shape and the two identities are read here and the entry is pushed after
+    // the walk, in the one position the contract makes resolvable.
+    let mut landing: Option<NarrowLanding> = None;
+    for (index, record) in records.into_iter().enumerate() {
+        let NarrowTraceRecord {
+            declaring,
+            render_pipeline,
+            production_pipelines,
+            attachment,
+            declaration,
+            landing_view,
+            pass_descriptor,
+            in_flight,
+            facts,
+        } = record;
+        declare_pipeline(&mut pipelines, &declaring);
+        declare_pipeline(&mut pipelines, &render_pipeline);
+        for pipeline in &production_pipelines {
+            declare_pipeline(&mut pipelines, pipeline);
+        }
+        let declare_attachment = !declared.contains(&declaration.view_id);
+        if declare_attachment {
+            declared.push(declaration.view_id);
+        }
+        // The landing view's own ids, read before the view is moved into the
+        // declaring passes below: the tail's delivery names this view, and the
+        // view itself is the trace's value from here on.
+        let landing_ids = landing_view
+            .as_ref()
+            .map(|view| (view.allocation_id, view.view_id));
+        trace_passes.extend(declaring_passes_for_owned_record(
+            &declaring,
+            &pass_descriptor,
+            declaration,
+            landing_view,
+            declare_attachment,
+        ));
+        for production in &in_flight {
+            trace_passes.push(declaring_pass(
+                declaring.pipeline_id,
+                vec![production_declaration(production)],
+            ));
+        }
+        for production in &in_flight {
+            // The production's own pass stays a copy on this arm: the cut takes
+            // the record's own render pass, and this value is inside the
+            // production the record carries rather than beside it.
+            let _span = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvTraceProdClone,
+            );
+            crate::runtime::drain::note_trace_clone(
+                crate::runtime::drain::TraceCloneMeter::ProductionDescriptor,
+                || trace_clone_pass_descriptor_bytes(&production.descriptor),
+            );
+            trace_passes.push(TracePass::Render(production.descriptor.clone()));
+        }
+        // The run's own draws: the ones the list carries are stated by it, once,
+        // at its last draw's position — every other record keeps the pass it has
+        // always had, which is the shape (and the bytes) every round before this
+        // increment submitted.
+        //
+        // E-TX14's own delivery is read here, while the pass is still whole: the
+        // record that states it is the trace's last, and on this arm its pass is
+        // moved into the trace immediately below.
+        let landing_here = if index + 1 == count && facts.kept_frame_landing {
+            landing_ids.map(|(allocation_id, view_id)| {
+                let frame = pass_descriptor
+                    .color_attachments
+                    .first()
+                    .expect("a record's trace states one colour attachment");
+                NarrowLanding {
+                    attachment,
+                    format: frame.format,
+                    width: frame.width,
+                    height: frame.height,
+                    allocation_id,
+                    view_id,
+                }
+            })
+        } else {
+            None
+        };
+        if index + 1 == listed {
+            let (_, list) = many_draws
+                .take()
+                .expect("the list is stated at the position of its own last draw");
+            trace_passes.push(TracePass::RenderDraws(list));
+        } else if index >= listed {
+            // TR1: the cut. The record's own pass travels as the value the trace
+            // states — the bar the borrowed arm charges for the copy reads zero
+            // here, and the meter beside it counts the bytes that moved instead.
+            crate::runtime::drain::note_trace_clone(
+                crate::runtime::drain::TraceCloneMeter::Moved,
+                || trace_clone_pass_descriptor_bytes(&pass_descriptor),
+            );
+            trace_passes.push(TracePass::Render(pass_descriptor));
+        }
+        landing = landing_here;
+    }
+    // E-TX14: the kept frame's own delivery, in the one position the contract
+    // makes resolvable — *after* the pass that kept it, and before the
+    // submission ends. See [`narrow_trace_borrowed`] for why the arm belongs to
+    // the trace's last record and why the frame's identity is the attachment's
+    // own.
+    if let Some(landing) = landing {
+        trace_passes.push(TracePass::Landing(
+            metal_api_core::provider::KeptFrameLanding {
+                frame: metal_api_core::provider::KeptFrame {
+                    allocation_id: landing.attachment.allocation,
+                    view_id: landing.attachment.view,
+                    format: landing.format,
+                    width: landing.width,
+                    height: landing.height,
+                },
+                landing: AttachmentLandingView {
+                    allocation_id: landing.allocation_id,
+                    view_id: landing.view_id,
+                },
+            },
+        ));
+    }
+    ComputeTrace {
+        schema_version: PROVIDER_SCHEMA_VERSION,
+        device_epoch: provider.device_epoch(),
+        operation_id: OperationId::new(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)),
+        pipelines,
+        encoder_dispatch_type: DispatchType::Serial,
+        passes: trace_passes,
+        completion_policy: CompletionPolicy::HostReadback,
+        heap: None,
+        indirect: None,
+    }
+}
+
+/// The declaring passes one record states, with the record's own views handed
+/// over by value on the cut's arm (TR1).
+///
+/// The rules are [`declaring_passes_for_record`]'s, one by one: the attachment's
+/// declaration unless an earlier record of this trace already stated that view,
+/// then one pass per *writable* stage buffer at the declaring kernel's own
+/// interface, then the landing view (E-TX13) when the record carries one. The
+/// two views the record owns are moved in; the stage buffers' pool views are
+/// still copies of views inside the pass descriptor, because that descriptor is
+/// itself the trace's next entry and cannot be walked and moved at once.
+fn declaring_passes_for_owned_record(
+    declaring: &CompiledComputePipeline,
+    pass_descriptor: &RenderPassDescriptor,
+    declaration: BufferView,
+    landing_view: Option<BufferView>,
+    declare_attachment: bool,
+) -> Vec<TracePass> {
+    let pipeline = declaring.pipeline_id;
+    let mut passes = Vec::new();
+    if declare_attachment {
+        passes.push(declaring_pass(pipeline, vec![declaration]));
+    }
+    for buffer in pass_descriptor
+        .stage_buffers
+        .iter()
+        .filter(|buffer| buffer.view.access.is_writable())
+    {
+        let mut pool = buffer.view.clone();
+        // The declaring kernel's own interface: one buffer, read.
+        pool.metal_binding = 0;
+        pool.access = BufferAccess::Read;
+        passes.push(declaring_pass(pipeline, vec![pool]));
+    }
+    if let Some(landing) = landing_view {
+        passes.push(declaring_pass(pipeline, vec![landing]));
+    }
+    passes
+}
+
+/// The half of a record the trace states, handed to the walk **by value** on
+/// the cut's arm (TR1).
+///
+/// A record is one value because the assembly builds it that way: the walk
+/// states parts of it and the completion's post-checks read other parts of it,
+/// and while the walk only borrowed the record both readers had to share one
+/// `&NarrowRecord`. The cut's arm splits the value at the one point where both
+/// halves are still owned — the walk then takes what it states and the
+/// post-checks keep what they read, with nothing copied between them.
+struct NarrowTraceRecord {
+    /// The declaring kernel this record's pool entries land through.
+    declaring: CompiledComputePipeline,
+    /// The record's own translated pipeline.
+    render_pipeline: CompiledComputePipeline,
+    /// The compiled pipeline each of those productions was recorded with.
+    production_pipelines: Vec<CompiledComputePipeline>,
+    /// The `(allocation, view)` pair this record's colour attachment names.
+    attachment: AttachmentIdentity,
+    /// This record's own declaration of that view.
+    declaration: BufferView,
+    /// The second declaration an elected landing view carries (E-TX13).
+    landing_view: Option<BufferView>,
+    /// This record's own render pass.
+    pass_descriptor: RenderPassDescriptor,
+    /// The productions this record's trace carries (R22).
+    in_flight: Vec<ProductionInFlight>,
+    /// The record's own facts, which the many-draws election reads while the
+    /// record is whole. `Copy`, so the completion keeps its own copy of the
+    /// same answer rather than borrowing this one.
+    facts: NarrowRecordFacts,
+}
+
+/// One production's identity: the only part of it the completion's post-checks
+/// read, beside the passes the trace stated (TR1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProductionIdentity {
+    allocation: AllocationId,
+    attachment: ViewId,
+}
+
+/// The half of a record the completion's own post-checks read (TR1).
+struct NarrowRecordAnswer {
+    attachment: AttachmentIdentity,
+    facts: NarrowRecordFacts,
+    in_flight: Vec<ProductionIdentity>,
+    stage_buffer_slots: Vec<StageBufferSlot>,
+    pending_production: Option<PendingProduction>,
+}
+
+/// Split one trace's assembled records into the half the walk states and the
+/// half the completion reads (TR1).
+///
+/// Every field moves: the two `Vec`s this builds are the split's own cost, and
+/// a record with no productions and no writable stage buffers allocates
+/// nothing at all (`Vec::new` and `Vec::with_capacity(0)` are both free).
+fn split_narrow_records(
+    records: Vec<NarrowRecord>,
+) -> (Vec<NarrowTraceRecord>, Vec<NarrowRecordAnswer>) {
+    records
+        .into_iter()
+        .map(|record| {
+            let NarrowRecord {
+                declaring,
+                render_pipeline,
+                attachment,
+                declaration,
+                landing_view,
+                stage_buffer_slots,
+                in_flight,
+                production_pipelines,
+                pass_descriptor,
+                facts,
+                pending_production,
+            } = record;
+            let identities = in_flight
+                .iter()
+                .map(|production| ProductionIdentity {
+                    allocation: production.allocation,
+                    attachment: production.attachment,
+                })
+                .collect();
+            (
+                NarrowTraceRecord {
+                    declaring,
+                    render_pipeline,
+                    production_pipelines,
+                    attachment,
+                    declaration,
+                    landing_view,
+                    pass_descriptor,
+                    in_flight,
+                    facts,
+                },
+                NarrowRecordAnswer {
+                    attachment,
+                    facts,
+                    in_flight: identities,
+                    stage_buffer_slots,
+                    pending_production,
+                },
+            )
+        })
+        .unzip()
+}
+
+/// One trace's records as the completion's post-checks read them, in both arms
+/// of the cut (TR1).
+///
+/// The two arms hold the answers differently — the borrowed arm's records are
+/// still whole, the cut's arm keeps only the half the walk did not take — and
+/// this is the one place that difference is spelled, so the completion below is
+/// one shape rather than two.
+enum NarrowAnswers {
+    /// The arm every round before this increment ran: the walk borrowed the
+    /// records, so the post-checks read them where they lie.
+    Borrowed(Vec<NarrowRecord>),
+    /// The cut's arm: the walk took the half it states, and this is what is
+    /// left of the record.
+    Owned(Vec<NarrowRecordAnswer>),
+}
+
+/// The productions one record states, by identity, in both arms (TR1).
+enum InFlightIdentities<'a> {
+    Borrowed(std::slice::Iter<'a, ProductionInFlight>),
+    Owned(std::slice::Iter<'a, ProductionIdentity>),
+}
+
+impl Iterator for InFlightIdentities<'_> {
+    type Item = ProductionIdentity;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Borrowed(productions) => {
+                productions.next().map(|production| ProductionIdentity {
+                    allocation: production.allocation,
+                    attachment: production.attachment,
+                })
+            }
+            Self::Owned(identities) => identities.next().copied(),
+        }
+    }
+}
+
+impl NarrowAnswers {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(records) => records.len(),
+            Self::Owned(answers) => answers.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The trace's tail record's own answers: the present probe and the batch's
+    /// shared identity are read off this one, before the walk runs.
+    fn tail(&self) -> Option<(AttachmentIdentity, NarrowRecordFacts)> {
+        match self {
+            Self::Borrowed(records) => records
+                .last()
+                .map(|record| (record.attachment, record.facts)),
+            Self::Owned(answers) => answers
+                .last()
+                .map(|answer| (answer.attachment, answer.facts)),
+        }
+    }
+
+    fn attachment(&self, index: usize) -> AttachmentIdentity {
+        match self {
+            Self::Borrowed(records) => records[index].attachment,
+            Self::Owned(answers) => answers[index].attachment,
+        }
+    }
+
+    fn facts(&self, index: usize) -> NarrowRecordFacts {
+        match self {
+            Self::Borrowed(records) => records[index].facts,
+            Self::Owned(answers) => answers[index].facts,
+        }
+    }
+
+    fn in_flight(&self, index: usize) -> InFlightIdentities<'_> {
+        match self {
+            Self::Borrowed(records) => {
+                InFlightIdentities::Borrowed(records[index].in_flight.iter())
+            }
+            Self::Owned(answers) => InFlightIdentities::Owned(answers[index].in_flight.iter()),
+        }
+    }
+
+    fn stage_buffer_slots(&self, index: usize) -> &[StageBufferSlot] {
+        match self {
+            Self::Borrowed(records) => &records[index].stage_buffer_slots,
+            Self::Owned(answers) => &answers[index].stage_buffer_slots,
+        }
+    }
+
+    fn pending_production(&self, index: usize) -> Option<&PendingProduction> {
+        match self {
+            Self::Borrowed(records) => records[index].pending_production.as_ref(),
+            Self::Owned(answers) => answers[index].pending_production.as_ref(),
+        }
     }
 }
 
@@ -19931,7 +20639,7 @@ fn declare_pipeline(
 /// back out of that one completion in record order.
 fn finish_narrow_records(
     provider: &metal_api_vulkan::VulkanComputeProvider,
-    records: &[NarrowRecord],
+    records: Vec<NarrowRecord>,
     assembly: NarrowAssembly,
 ) -> Result<Vec<RenderCompletion>, ProviderRenderDecline> {
     let NarrowAssembly {
@@ -19939,13 +20647,28 @@ fn finish_narrow_records(
         mut leases,
         ..
     } = assembly;
-    debug_assert_eq!(records.len(), leases.len());
-    debug_assert!(!records.is_empty());
     // The frame profile's trace bar, on this path: the *composition* of the
     // assembled records into one trace, which is the work a batch adds where a
     // single record only stated its own pass.
     let _trace = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvTrace);
-    let trace = narrow_trace(provider, records);
+    // TR1: the walk's own arm, decided here because it decides the shape the
+    // records are handed over in. The borrowed arm leaves them whole — the shape
+    // every round before this increment ran, where the walk copies the values it
+    // states and the completion reads the records where they lie — and the cut's
+    // arm splits each record into the half the walk takes by value and the half
+    // the completion reads, with nothing copied between them.
+    let (trace, answers) = if trace_pass_owned_enabled() {
+        let (walk_records, answers) = split_narrow_records(records);
+        (
+            narrow_trace_owned(provider, walk_records),
+            NarrowAnswers::Owned(answers),
+        )
+    } else {
+        let trace = narrow_trace_borrowed(provider, &records);
+        (trace, NarrowAnswers::Borrowed(records))
+    };
+    debug_assert_eq!(answers.len(), leases.len());
+    debug_assert!(!answers.is_empty());
     // R9j/R9q: a pass that declares a stage buffer — or, since R9q, carries a
     // vertex stream through the owner's window — crosses the owner→provider
     // wire before anything is admitted. The frame is the payload (every
@@ -20057,9 +20780,9 @@ fn finish_narrow_records(
     // submission's action rather than a neighbour's. A presenting record is a
     // *sole or tail* record by construction, so in a batch the reading belongs
     // to the trace's last record and no intermediate record can state one.
-    let present_before = records
-        .last()
-        .and_then(|record| record.facts.present.then(|| provider.present_counts()));
+    let present_before = answers
+        .tail()
+        .and_then(|(_, facts)| facts.present.then(|| provider.present_counts()));
     // The frame profile's submission bar. This is the one bar on the provider
     // rail that is GPU latency rather than CPU work: `provider.submit` submits
     // and blocks on the completion, and the completion is what carries the
@@ -20092,9 +20815,9 @@ fn finish_narrow_records(
     // presented frame, so the one fact that makes that claim checkable is the
     // provider's own acquire/present pair.
     let mut present = match (
-        records
-            .last()
-            .and_then(|record| record.facts.present_attachment),
+        answers
+            .tail()
+            .and_then(|(_, facts)| facts.present_attachment),
         present_before,
     ) {
         (Some(target), Some(before)) => {
@@ -20126,11 +20849,9 @@ fn finish_narrow_records(
     // whose tail publishes carries exactly one writeback for it. A single-record
     // trace is not covered here — it keeps that record's own arm below, which is
     // the same statement with one record in it.
-    let shared_identity = records.last().map(|record| record.attachment);
-    let tail_keeps_frame = records
-        .last()
-        .is_some_and(|record| record.facts.keeps_frame);
-    if records.len() > 1 {
+    let shared_identity = answers.tail().map(|(attachment, _)| attachment);
+    let tail_keeps_frame = answers.tail().is_some_and(|(_, facts)| facts.keeps_frame);
+    if answers.len() > 1 {
         if let Some(identity) = shared_identity {
             let published = result
                 .writebacks
@@ -20169,26 +20890,44 @@ fn finish_narrow_records(
     // is read, exactly as a single record's did, and a plan that refuses stops
     // the walk while the records whose plans already retired stay retired
     // (their bytes were published by a completion that ran).
-    let mut out = Vec::with_capacity(records.len());
-    for (index, record) in records.iter().enumerate() {
+    let mut out = Vec::with_capacity(answers.len());
+    // The run's own size, read before the leases are walked: every reader below
+    // asks the same question (is this record the trace's tail?) and the walk
+    // holds the lease list mutably while it retires them one by one.
+    //
+    // One plan per record is the assembly's own invariant, stated once here in
+    // the same words the debug assertion above uses: a run that lost a plan must
+    // refuse rather than answer fewer records than it parked.
+    let records = answers.len();
+    assert_eq!(
+        leases.len(),
+        records,
+        "one owner plan per record: a run whose plans and records disagree is not a trace"
+    );
+    // The leases are walked rather than indexed: they are one per record (the
+    // debug assertion above is what holds the two lists to each other), and a
+    // plan's own retirement is the one step of this walk that *mutates* its
+    // half — `Plan::settle` takes the plan, so the walk needs the slot.
+    for (index, lease) in leases.iter_mut().enumerate() {
         // The record's own half of the trace, under the names this walk was
         // always written in: one indirection more than the single-record path
-        // had, and the same statements after it.
-        let attachment = record.attachment;
-        let facts = &record.facts;
+        // had, and the same statements after it — with the arm's own difference
+        // (a whole record or the half the walk did not take) behind
+        // [`NarrowAnswers`] rather than in this walk.
+        let attachment = answers.attachment(index);
+        let facts = answers.facts(index);
         let loads_resident = facts.loads_resident;
-        let in_flight = &record.in_flight;
         // G3-B/B-1: an intermediate record of a batch is not the trace's
         // publishing tail. Its own frame stays in the provider's image (which
         // is what its store arm states), and the writeback the completion
         // carries for the identity the whole run shares belongs to the tail.
-        let intermediate = records.len() > 1 && index + 1 < records.len();
+        let intermediate = records > 1 && index + 1 < records;
         // The present completion belongs to the record that stated one; every
         // other record of a batch reads `None` here.
         let present = if facts.present { present.take() } else { None };
         let _settle =
             crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvSettle);
-        if let Some(plan) = leases[index].take() {
+        if let Some(plan) = lease.take() {
             plan.settle(provider, result.completion)
                 .map_err(ProviderRenderDecline::Owner)?;
         }
@@ -20200,7 +20939,7 @@ fn finish_narrow_records(
         // truncated into place. The bytes leave here for the caller, which owns the
         // guest destination (`StageBufferLanding`).
         let stage_writebacks =
-            stage_buffer_writebacks(&record.stage_buffer_slots, &result.writebacks)?;
+            stage_buffer_writebacks(answers.stage_buffer_slots(index), &result.writebacks)?;
         drop(_settle);
         // R22: every production this trace carried has to have landed its bytes in
         // the trace's own writeback channel, or the consuming declaration sampled a
@@ -20209,7 +20948,7 @@ fn finish_narrow_records(
         // `StoreOp::Store`, so this is a check rather than an expectation: a
         // submission whose trace states a production and no writeback for it is a
         // wiring defect and a typed decline, never a frame.
-        for production in in_flight {
+        for production in answers.in_flight(index) {
             let landed = result.writebacks.iter().any(|writeback| {
                 writeback.view_id == production.attachment
                     && writeback.allocation_id == production.allocation
@@ -20221,7 +20960,7 @@ fn finish_narrow_records(
         // A production is recorded only once it has actually run: the re-run the
         // consuming trace states is the pass this submission sent, and the bytes a
         // later consumer samples are the ones this completion published.
-        if let Some(pending) = record.pending_production.as_ref() {
+        if let Some(pending) = answers.pending_production(index) {
             commit_production(pending);
         }
         // The resident arm's whole claim is that the frame stayed in the provider's
@@ -20449,7 +21188,7 @@ fn submit_narrow(
         texture_copies,
         &mut assembly,
     )?;
-    let mut completions = finish_narrow_records(&rail.provider, &[record], assembly)?;
+    let mut completions = finish_narrow_records(&rail.provider, vec![record], assembly)?;
     Ok(completions.pop().expect("one record, one completion"))
 }
 

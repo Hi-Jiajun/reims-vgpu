@@ -22,11 +22,12 @@
 #![cfg(feature = "provider-render")]
 
 use metal_api_core::provider::{
-    AttachmentFormat, BufferAccess, BufferSource, ComputeProvider, FieldValue, FootprintProof,
+    AllocationId, AttachmentFormat, BufferAccess, BufferSource, BufferView, ComputeProvider,
+    ComputeTrace, FieldValue, FootprintProof, RenderDraw, RenderPassDescriptor,
     RenderPipelineContract, RenderPipelineStage, SamplerAddressMode, SamplerFilter, SamplerPolicy,
-    SemanticDigest, StageBufferBinding, TextureBindingContract, TextureSource, TextureView,
-    TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout, VertexStep,
-    MAX_RENDER_SAMPLERS, MAX_RENDER_TEXTURES,
+    SemanticDigest, StageBufferBinding, StoreOp, TextureBindingContract, TextureSource,
+    TextureView, TracePass, VertexAttribute, VertexBufferLayout, VertexFormat, VertexLayout,
+    VertexStep, MAX_RENDER_SAMPLERS, MAX_RENDER_TEXTURES,
 };
 use metal_api_core::{ComputeExecutor, Device};
 use metal_api_vulkan::{
@@ -7308,7 +7309,10 @@ fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_secon
             .collect()
     };
 
-    let import = 0x9e4c_u64;
+    // An import id of this case's own: the rail's owner registry is a process
+    // global and a case that re-registered the id its neighbour used would be
+    // refused by name (`DuplicateRegion`) rather than read as itself.
+    let import = 0x9e6b_u64;
     let gpa_base = 0x55_5000_u64;
     let window_bytes = pattern(0x00);
     let chain = pattern(0x5a);
@@ -7533,6 +7537,288 @@ fn a_guest_backed_tail_whose_load_is_the_chain_value_lands_in_the_window_a_secon
         moved, copied,
         "the frame is the same bytes whether its inputs were copied or moved: \
          REIMS_VGPU_SUBMIT_FRAME_OWNED cannot change what the guest sees"
+    );
+}
+
+/// The one part of a resource table two runs of one scenario can share: how many
+/// allocations and leases it states, and each of their sizes, epochs and
+/// lengths. The table's *identities* are the plan's own numbering (see
+/// [`canonical_allocation_ids`]), and this case's subject is the pass list the
+/// walk states rather than the assembly's table.
+fn resource_table_shape(table: &metal_api_core::provider::ResourceTableSnapshot) -> String {
+    let mut allocations: Vec<(u64, u64)> = table
+        .allocations()
+        .map(|record| (record.size, record.owner_epoch.get()))
+        .collect();
+    let mut leases: Vec<(u64, u64)> = table
+        .leases()
+        .map(|reservation| (reservation.offset, reservation.length))
+        .collect();
+    allocations.sort_unstable();
+    leases.sort_unstable();
+    format!("allocations={allocations:?} leases={leases:?}")
+}
+
+/// Renumber one trace's plan-minted allocation ids by first appearance (TR1).
+///
+/// The owner plan mints a fresh allocation id for every registration it records,
+/// and it records one per submission — so the second run of one scenario names
+/// the same allocation by the next number, and two runs of one scenario can
+/// never carry the same ids verbatim (the operation id is the other such field).
+/// Everything else about the trace is the walk's own product and has to match
+/// exactly, which is what the comparison below reads. Returns how many distinct
+/// ids the trace named, so a trace that lost or gained an allocation cannot pass
+/// by being renumbered.
+fn canonical_allocation_ids(trace: &mut ComputeTrace) -> usize {
+    let mut order: Vec<AllocationId> = Vec::new();
+    for_each_allocation_id(trace, |id| {
+        if !order.contains(id) {
+            order.push(*id);
+        }
+    });
+    let known = order.clone();
+    for_each_allocation_id(trace, |id| {
+        let position = known
+            .iter()
+            .position(|candidate| candidate == id)
+            .unwrap_or(0);
+        *id = AllocationId::new(u64::try_from(position + 1).unwrap_or(u64::MAX));
+    });
+    order.len()
+}
+
+/// Every allocation id one trace's passes name, in the order the walk states
+/// them: the declaring pass's pool, then each pass's own views and landings.
+fn for_each_allocation_id(trace: &mut ComputeTrace, mut visit: impl FnMut(&mut AllocationId)) {
+    fn view(view: &mut BufferView, visit: &mut impl FnMut(&mut AllocationId)) {
+        visit(&mut view.allocation_id);
+    }
+
+    fn draw(draw: &mut RenderDraw, visit: &mut impl FnMut(&mut AllocationId)) {
+        for buffer in &mut draw.vertex_buffers {
+            view(buffer, visit);
+        }
+        if let Some(indices) = draw.indices.as_mut() {
+            view(&mut indices.view, visit);
+        }
+        for texture in &mut draw.textures {
+            visit(&mut texture.allocation_id);
+        }
+        for stage in &mut draw.stage_buffers {
+            view(&mut stage.view, visit);
+        }
+    }
+
+    fn pass(pass: &mut RenderPassDescriptor, visit: &mut impl FnMut(&mut AllocationId)) {
+        for attachment in &mut pass.color_attachments {
+            visit(&mut attachment.allocation_id);
+            // The landing arm (E-TX13) names a second allocation: the owner
+            // window the frame lands in, which the plan registers per
+            // submission like every other allocation this test renumbers.
+            if let StoreOp::BorrowedLanding(landing) = &mut attachment.store {
+                visit(&mut landing.allocation_id);
+            }
+        }
+        for buffer in &mut pass.vertex_buffers {
+            view(buffer, visit);
+        }
+        if let Some(indices) = pass.indices.as_mut() {
+            view(&mut indices.view, visit);
+        }
+        for texture in &mut pass.textures {
+            visit(&mut texture.allocation_id);
+        }
+        for stage in &mut pass.stage_buffers {
+            view(&mut stage.view, visit);
+        }
+        if let Some(depth) = pass
+            .depth
+            .as_mut()
+            .and_then(|depth| depth.identity.as_mut())
+        {
+            visit(&mut depth.allocation_id);
+        }
+        if let Some(stencil) = pass
+            .stencil
+            .as_mut()
+            .and_then(|stencil| stencil.identity.as_mut())
+        {
+            visit(&mut stencil.allocation_id);
+        }
+        if let Some(target) = pass.present.as_mut().map(|present| &mut present.target) {
+            visit(&mut target.allocation_id);
+        }
+    }
+
+    for entry in &mut trace.passes {
+        match entry {
+            TracePass::Compute(compute) => {
+                for buffer in &mut compute.buffers {
+                    view(buffer, &mut visit);
+                }
+            }
+            TracePass::Render(descriptor) => pass(descriptor, &mut visit),
+            TracePass::RenderDraws(list) => {
+                pass(&mut list.head, &mut visit);
+                for tail in &mut list.tail {
+                    draw(tail, &mut visit);
+                }
+            }
+            TracePass::Landing(landing) => {
+                visit(&mut landing.frame.allocation_id);
+                visit(&mut landing.landing.allocation_id);
+            }
+        }
+    }
+}
+
+/// TR1 (RAIL): the trace walk's own cut, read on the frame the provider was
+/// handed.
+///
+/// One scenario — a guest-backed tail whose load is the chain value and whose
+/// landing window is a registered owner window, so the submission states a lease
+/// and crosses the owner→provider wire — is run **twice in this one process**:
+/// once with the walk borrowing the records (the arm every round before this
+/// increment ran, where the pass it states is a copy) and once with the walk
+/// taking the record's own pass by value
+/// (`REIMS_VGPU_TRACE_PASS_OWNED=on`, forced here through
+/// [`provider_render::set_trace_pass_owned_arm`] because a switch read through a
+/// `OnceLock` cannot be put back and the two arms have to be two statements of
+/// *one* scenario rather than two scenarios).
+///
+/// The wire frame is where that is checkable: it carries the trace this rail
+/// stated and the resource table beside it, so the provider's own decoder reads
+/// back exactly the passes the walk composed. The rendered frame is compared
+/// beside it, so an arm that stated the same bytes but executed them differently
+/// — or one that took a value the other still needed — could not pass either.
+#[test]
+fn the_trace_walk_hands_the_provider_the_same_frame_whether_it_copies_or_takes_the_pass() {
+    let _guard = engine_test_session();
+    // The scenario below is the E-TX13 arm — the one whose completion publishes
+    // the frame, so the two runs have a rendered frame to compare beside the
+    // wire. E-TX14's own delivery of the same window has its own case; pinning
+    // the door here is what the neighbouring case does for the same reason.
+    let _no_kept_frame = provider_render::override_kept_frame_landing(Some(false));
+    let stages = reviewed_stages();
+    let (width, height) = (8u32, 4u32);
+    let frame_len = u64::from(width) * u64::from(height) * 4;
+    // Per-texel bytes rather than one colour, so a frame that came from the
+    // wrong pass would show it in the half this pass does not draw.
+    let pattern = |tint: u8| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|index| {
+                let x = (index % width) as u8;
+                let y = (index / width) as u8;
+                [x ^ tint, y, x ^ y, 0xff]
+            })
+            .collect()
+    };
+    let import = 0x9e4c_u64;
+    let gpa_base = 0x55_5000_u64;
+    let window_bytes = pattern(0x00);
+    let chain = pattern(0x5a);
+    let (mut owner, memory) = seed_backing_fixture(gpa_base, &window_bytes, 4 * u64::from(width));
+    let identity = surface_identity(0x7c_13_01);
+    let memory = std::sync::Arc::new(memory);
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.width = width;
+        req.height = height;
+        req.color0_declared = Some(reims_vgpu::protocol::pass_action::LoadAction::Load);
+        req.target_identity = Some(identity.clone());
+        req.guest_target_memory = Some((*memory).clone());
+        req.load_guest_target_backing = false;
+        req.target_rgba8 = Some(std::sync::Arc::new(chain.clone()));
+        req.skip_readback = true;
+        req.readback_skip_reason = ReadbackSkipReason::ResidentStore;
+        req
+    };
+    owner.as_mut_slice()[..frame_len as usize].copy_from_slice(&window_bytes);
+    let window = register_seed_backing(&owner, import, gpa_base, frame_len);
+
+    let run = |arm: bool| -> (Vec<Vec<u8>>, Vec<u8>) {
+        provider_render::set_trace_pass_owned_arm(Some(arm));
+        provider_wire::capture_submission_frames(true);
+        let deliveries = provider_render::provider_submissions();
+        let frame = {
+            let single = [window];
+            let mut inputs =
+                inputs_with_landing_window(&stages, RenderChainRole::SoleOrTail, &single);
+            inputs.load_seed_source_bytes = Some(chain.as_slice());
+            match provider_render::submit_render(&inputs, &request()) {
+                RenderRailOutcome::ProviderCompleted(out) => semantic_rgba(out.bytes, out.bgra),
+                other => panic!(
+                    "the guest-backed tail whose frame the guest's pages are owed is in class on \
+                     the landing door, whichever arm the walk ran: {other:?}"
+                ),
+            }
+        };
+        let frames = provider_wire::captured_submission_frames();
+        provider_wire::capture_submission_frames(false);
+        assert!(
+            provider_render::provider_submissions() > deliveries,
+            "the shape reached the canonical provider instead of the engine"
+        );
+        (frames, frame)
+    };
+    let (borrowed_frames, borrowed) = run(false);
+    let (owned_frames, owned) = run(true);
+    provider_render::set_trace_pass_owned_arm(None);
+
+    assert_eq!(
+        borrowed_frames.len(),
+        1,
+        "one scenario, one submission scope, one owner→provider frame"
+    );
+    assert_eq!(
+        owned_frames.len(),
+        1,
+        "and the increment arm states the same one — a trace that crossed the wire twice, or not \
+         at all, would not be the shape this cut leaves alone"
+    );
+    assert_eq!(
+        borrowed_frames[0].len(),
+        owned_frames[0].len(),
+        "the two arms state a trace of the same length"
+    );
+    // Decoded rather than compared as bytes because one field is minted per
+    // *trace* from a process-global counter: the operation id two runs cannot
+    // share. Every other field of the trace and the whole resource table have to
+    // be the same value, which is the reading this case exists for — the bytes
+    // of the frame are that value's encoding, so equal values are equal frames
+    // (the fifth cut's own case asserts the encoder is a fixed point).
+    let (mut borrowed_trace, borrowed_resources) =
+        provider_wire::carried_submission(&borrowed_frames[0])
+            .expect("the provider's own decoder reads the borrowing arm's frame");
+    let (mut owned_trace, owned_resources) =
+        provider_wire::carried_submission(&owned_frames[0]).expect("and the taking arm's frame");
+    assert_ne!(
+        borrowed_trace.operation_id, owned_trace.operation_id,
+        "the two runs are two traces: each mints its own operation id"
+    );
+    owned_trace.operation_id = borrowed_trace.operation_id;
+    assert_eq!(
+        canonical_allocation_ids(&mut borrowed_trace),
+        canonical_allocation_ids(&mut owned_trace),
+        "the two traces name the same number of plan-minted allocations"
+    );
+    assert_eq!(
+        borrowed_trace, owned_trace,
+        "the trace is the same value whether the walk copied the record's own pass or took it: \
+         REIMS_VGPU_TRACE_PASS_OWNED cannot change what the provider is handed. The operation id \
+         and the plan's own allocation numbering are what the two runs cannot share; every other \
+         field of every pass is compared as a value"
+    );
+    assert_eq!(
+        resource_table_shape(&borrowed_resources),
+        resource_table_shape(&owned_resources),
+        "and the resource table beside it is the same table: the assembly's own product, whose \
+         only per-submission columns are the plan's allocation numbering this case renumbers and \
+         the sizes..."
+    );
+    assert_eq!(
+        borrowed, owned,
+        "and the frame the two arms rendered is the same frame, texel for texel"
     );
 }
 
