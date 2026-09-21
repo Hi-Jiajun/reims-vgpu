@@ -915,11 +915,50 @@ pub(crate) enum FrameSpan {
     /// Without the split, a round could not say which of the two the ask region
     /// was spent on, and the two cuts are not each other's substitute.
     ProvGateModules = 65,
+    /// `pixel_coordinate_sampler_module` inside [`Self::ProvGateModules`]: the
+    /// memo whose customer is a request that states the texel space, carved
+    /// out of the parent so a round can price the three memos apart.
+    ///
+    /// # Why the parent was not enough
+    ///
+    /// R-RG1 priced the three per-module memos as one number
+    /// (`prov_gate_modules_us_mean` **11 916.5 µs/frame**, peak
+    /// **1 633 972 µs/window** in the boot's first windows against a steady
+    /// **543 µs/window**) and named the cut they support — one parse and one
+    /// translation per module instead of three — as the increment its readings
+    /// pointed at. What the parent could not say is *which* of the three works
+    /// on which population: this one is asked only for a request whose own
+    /// bound sampler states the texel space, while the two below it are asked
+    /// for every request the gate is handed. Three bars and the route
+    /// denominators beside them (`render_gate_module_pixel_parse_n` /
+    /// `_xlate_n`) are what turn "the same module is walked three times" from
+    /// an inference about the code into a reading of the round.
+    ProvGateModulePixel = 66,
+    /// `fragment_output_superset_module` inside [`Self::ProvGateModules`]: the
+    /// memo asked for **every** request the gate is handed, whose answer is
+    /// `true` for every module but the superset one.
+    ///
+    /// The population is the reason it is priced apart from the memo above: a
+    /// module that is never drawn with a texel-space bind is walked by this one
+    /// and the half memo below it and by no other, so the three route counts
+    /// read as three populations rather than three names for one.
+    ProvGateModuleSuperset = 67,
+    /// `half_capability_module` inside [`Self::ProvGateModules`]: the memo
+    /// whose walk is E's own `declared_shader_capabilities`, asked for the same
+    /// population as the superset memo above.
+    ///
+    /// The one of the three whose translation is *not* the one the other two
+    /// pay: the capability walk translates the module under
+    /// `SpirvFeaturePolicy::ADMITTING`, while the two beside it translate under
+    /// the device's own policy. That is why the merged walk of R-GM1 counts the
+    /// fallback separately (`render_gate_module_half_walk_n`) rather than
+    /// assuming the two policies are the same one.
+    ProvGateModuleHalf = 68,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::ProvGateModules as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::ProvGateModuleHalf as usize + 1;
 
 /// One byte source the owner mints for the attachment's own declaration, with
 /// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
@@ -1325,6 +1364,11 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "prov_gate_window_us_mean",
     "prov_gate_make_us_mean",
     "prov_gate_modules_us_mean",
+    // R-GM1: the same three memos the parent above brackets, one bar each, so
+    // the round that merges them can price the populations it merges.
+    "prov_gate_module_pixel_us_mean",
+    "prov_gate_module_superset_us_mean",
+    "prov_gate_module_half_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.

@@ -9416,6 +9416,10 @@ fn pixel_coordinate_sampler_module(
     // one whose customer is a request that states the texel space.
     let _module =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
+    // R-GM1: this memo's own share of the parent above, and the population it
+    // is asked on (a texel-space bind, not every request).
+    let _mine =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModulePixel);
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail.pixel_sampler_modules.lock().map_err(|_| {
@@ -9429,12 +9433,16 @@ fn pixel_coordinate_sampler_module(
     }
     let answer = (|| -> Option<bool> {
         let entry = inputs.fragment_entry?;
+        // R-GM1's denominator: the times this memo parsed the module itself,
+        // charged before the attempt so a refusal counts as one of them.
+        crate::runtime::drain::note_store_route("render_gate_module_pixel_parse_n");
         let function = provider_rail
             .device
             .new_library_with_binary_air(inputs.fragment_air.to_vec())
             .ok()?
             .function(entry)
             .ok()?;
+        crate::runtime::drain::note_store_route("render_gate_module_pixel_xlate_n");
         let stage = TranslatedRenderStage::translate_with_policy(
             RenderStage::Fragment,
             &function,
@@ -9475,6 +9483,10 @@ fn fragment_output_superset_module(
     // handed (its answer is `true` for every module but the superset one).
     let _module =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
+    // R-GM1: this memo's own share of the parent above.
+    let _mine = crate::runtime::drain::frame_span(
+        crate::runtime::drain::FrameSpan::ProvGateModuleSuperset,
+    );
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail
@@ -9489,12 +9501,15 @@ fn fragment_output_superset_module(
     }
     let answer = (|| -> Option<bool> {
         let entry = inputs.fragment_entry?;
+        // R-GM1's denominator, charged the way the memo above charges its own.
+        crate::runtime::drain::note_store_route("render_gate_module_superset_parse_n");
         let function = provider_rail
             .device
             .new_library_with_binary_air(inputs.fragment_air.to_vec())
             .ok()?
             .function(entry)
             .ok()?;
+        crate::runtime::drain::note_store_route("render_gate_module_superset_xlate_n");
         let stage = TranslatedRenderStage::translate_with_policy(
             RenderStage::Fragment,
             &function,
@@ -9535,6 +9550,10 @@ fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, Provide
     // R-RG1: the third, asked for the same population as the memo above it.
     let _module =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
+    // R-GM1: this memo's own share of the parent above — the one of the three
+    // whose translation is E's own capability walk under `ADMITTING`.
+    let _mine =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModuleHalf);
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail.half_capability_modules.lock().map_err(|_| {
@@ -9548,12 +9567,16 @@ fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, Provide
     }
     let answer = (|| -> Option<bool> {
         let entry = inputs.fragment_entry?;
+        // R-GM1's denominator, charged the way the two memos above charge
+        // theirs, so the three counts are read against each other.
+        crate::runtime::drain::note_store_route("render_gate_module_half_parse_n");
         let function = provider_rail
             .device
             .new_library_with_binary_air(inputs.fragment_air.to_vec())
             .ok()?
             .function(entry)
             .ok()?;
+        crate::runtime::drain::note_store_route("render_gate_module_half_xlate_n");
         Some(
             TranslatedRenderStage::declared_shader_capabilities(RenderStage::Fragment, &function)
                 .ok()?
@@ -22302,6 +22325,27 @@ fn declaring_pipeline(
     Ok(compiled)
 }
 
+/// The two route names one registration's own stage pays (R-GM1).
+///
+/// The register miss path parses and translates the **same** fragment module
+/// the class gate's three memos walk a few calls earlier, which is the fourth
+/// time that module is read inside one admission. The counters are what make
+/// the overlap a reading rather than a claim: the three memos' own denominators
+/// beside these two are the "three times" the merged walk removes, and this
+/// pair is the fourth it must not lose sight of (`fragment_stage` only — the
+/// vertex module is another module with its own parse).
+#[derive(Clone, Copy)]
+struct StageRouteCounters {
+    parse: &'static str,
+    xlate: &'static str,
+}
+
+/// The fragment half's own two charges, the module the three memos walk.
+const FRAGMENT_STAGE_COUNTERS: StageRouteCounters = StageRouteCounters {
+    parse: "render_register_fragment_parse_n",
+    xlate: "render_register_fragment_xlate_n",
+};
+
 /// Register (or look up) the request's own translated pipeline pair.
 ///
 /// The contract is built from the *request*, not from the AIR: the attachment
@@ -22415,7 +22459,15 @@ fn register_render_pipeline(
     // it was, and the provider reads each bound slot back out of the module's
     // own reflection. Only the folded request whose device declared the split
     // takes that layout, so every other pair is translated exactly as it was.
-    let stage = |air: &[u8], entry: &str, which: &'static str, stage, layout| {
+    let stage = |air: &[u8],
+                 entry: &str,
+                 which: &'static str,
+                 stage: RenderStage,
+                 layout: metal2vulkan::reflect::DescriptorLayout,
+                 counters: Option<StageRouteCounters>| {
+        if let Some(counters) = counters {
+            crate::runtime::drain::note_store_route(counters.parse);
+        }
         let function = device
             .new_library_with_binary_air(air.to_vec())
             .map_err(|error| ProviderRenderDecline::PipelineCompile {
@@ -22427,6 +22479,9 @@ fn register_render_pipeline(
                 step: which,
                 detail: error.to_string(),
             })?;
+        if let Some(counters) = counters {
+            crate::runtime::drain::note_store_route(counters.xlate);
+        }
         TranslatedRenderStage::translate_with_policy_and_layout(stage, &function, policy, layout)
             .map_err(|error| ProviderRenderDecline::PipelineCompile {
                 step: which,
@@ -22444,6 +22499,7 @@ fn register_render_pipeline(
         "vertex_stage",
         RenderStage::Vertex,
         vertex_layout,
+        None,
     )?;
     let fragment = stage(
         inputs.fragment_air,
@@ -22451,6 +22507,7 @@ fn register_render_pipeline(
         "fragment_stage",
         RenderStage::Fragment,
         metal2vulkan::reflect::DescriptorLayout::default(),
+        Some(FRAGMENT_STAGE_COUNTERS),
     )?;
     let digest = SemanticDigest::new(
         "reims-provider-render-v1",
