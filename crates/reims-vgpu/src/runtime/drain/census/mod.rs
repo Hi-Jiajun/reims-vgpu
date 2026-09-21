@@ -835,11 +835,91 @@ pub(crate) enum FrameSpan {
     /// populations are counted apart as `seam_read_sample_probe_n` and
     /// `seam_read_sample_encode_n`, and the parent is read against the second.
     SeamSampleRead = 53,
+    /// `declaring_pipeline` inside [`Self::ProvRegister`]: the declaring
+    /// kernel's own cached lookup and clone.
+    ///
+    /// # Why the two provider bars are split at all
+    ///
+    /// The sixth round's production profile reads `prov_register_us_mean`
+    /// **22 952.7 µs/frame** and `prov_gate_us_mean` **20 987.7 µs/frame** —
+    /// 12 % of the 372 ms host frame between them, and the two largest
+    /// *R-side* bars no round had opened. Both were priced as one number, and
+    /// neither number said which statement inside it to move: the gate's own
+    /// doc names four different regions (the pure walk, the device's
+    /// capability answers, the two window arms, the two make arms), and the
+    /// registration's names six (the declaring lookup, the contract, its
+    /// fingerprint, the cache key, the cache lock and the hit's lookup).
+    ///
+    /// The ten bars below are that split, each bracket **inside** its parent
+    /// and charged on the same call, so the sum against the parent is an
+    /// identity a reader can check before believing any one of them. Nothing
+    /// here changes an answer: a bar with `REIMS_VGPU_FRAME_PROFILE` off is one
+    /// relaxed load and no clock read, exactly as every other bar in this enum.
+    ProvRegisterDeclare = 54,
+    /// The `RenderPipelineContract` construction inside
+    /// [`Self::ProvRegister`]: the two entry names, the attachment format
+    /// list, the vertex layout, the stage-buffer declarations and the sampled
+    /// texture declarations, all built from the request.
+    ProvRegisterContract = 55,
+    /// `contract_fingerprint` inside [`Self::ProvRegister`]: the canonical
+    /// rendering of that contract, one `format!` per field.
+    ProvRegisterFingerprint = 56,
+    /// The `RenderPipelineKey` itself inside [`Self::ProvRegister`]: the two
+    /// modules' own bytes (`to_vec`, two allocations and two memcpys per
+    /// record), the entry names, the fingerprint and the namespace fold.
+    ProvRegisterKey = 57,
+    /// The registration cache's mutex acquisition inside
+    /// [`Self::ProvRegister`].
+    ///
+    /// A separate bar from the lookup below it because the two are different
+    /// findings: a lock read large is contention (the guest draws from more
+    /// than one vCPU), and a lookup read large with a small lock is work.
+    ProvRegisterLock = 58,
+    /// `HashMap::get` and the hit's `clone()` inside
+    /// [`Self::ProvRegister`], with the lock already held.
+    ProvRegisterLookup = 59,
+    /// Everything the class gate asks the device *before* the pure walk, plus
+    /// its own four route charges: the declared-window checks, the folded
+    /// stage-buffer pair, the cache-key candidate tests and the sixteen
+    /// `declared_*` capability answers they gate.
+    ///
+    /// The reading this split exists for is the *count*: each answer is one
+    /// encode and one decode of the provider's whole capability frame
+    /// (`provider_wire::capabilities_frame`), so this bar against
+    /// `wire_capability_frames` says what one frame was worth.
+    ProvGateAsks = 60,
+    /// `narrow_class` itself inside [`Self::ProvGate`]: the pure walk over the
+    /// request, its stage buffers, its streams and its textures.
+    ProvGateWalk = 61,
+    /// The device answers the class needs *after* the walk — the attachment
+    /// window, the host-import alignment, the stage-buffer, sampler-carriage
+    /// and texture-support sections — up to the window arms' own entry.
+    ProvGateDevice = 62,
+    /// The two copy-forced window arms inside [`Self::ProvGate`]:
+    /// `window_arm` for the window-backed binds and `texture_window_arm` for
+    /// the sampled textures, with the alignment ask they share.
+    ProvGateWindow = 63,
+    /// The two make arms inside [`Self::ProvGate`]: `read_gathered_window`'s
+    /// padded-row repack and the folded channel plan, one copy per sampled
+    /// texture that needs either.
+    ProvGateMake = 64,
+    /// The three per-module memos the ask region reads before it can answer
+    /// (`pixel_coordinate_sampler_module`, `fragment_output_superset_module`,
+    /// `half_capability_module`), carved out of [`Self::ProvGateAsks`].
+    ///
+    /// A separate bar from the two dozen capability answers beside it because
+    /// the two are different *mechanisms* with different cuts: an answer is one
+    /// encode and one decode of the provider's whole capability frame, while a
+    /// memo is a `HashMap` probe keyed by the fragment module's own bytes — so
+    /// this bar scales with the module and that one with the answer's count.
+    /// Without the split, a round could not say which of the two the ask region
+    /// was spent on, and the two cuts are not each other's substitute.
+    ProvGateModules = 65,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::SeamSampleRead as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::ProvGateModules as usize + 1;
 
 /// One byte source the owner mints for the attachment's own declaration, with
 /// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
@@ -1231,6 +1311,20 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     // `seam_sample_frames_us_mean` so a round can divide the seam's µs by the
     // reads it actually paid them for.
     "seam_sample_read_us_mean",
+    // R-RG1: the two provider bars the sixth round left unsplit — the
+    // registration's six regions, then the class gate's five.
+    "prov_register_declare_us_mean",
+    "prov_register_contract_us_mean",
+    "prov_register_fingerprint_us_mean",
+    "prov_register_key_us_mean",
+    "prov_register_lock_us_mean",
+    "prov_register_lookup_us_mean",
+    "prov_gate_asks_us_mean",
+    "prov_gate_walk_us_mean",
+    "prov_gate_device_us_mean",
+    "prov_gate_window_us_mean",
+    "prov_gate_make_us_mean",
+    "prov_gate_modules_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.

@@ -1036,6 +1036,10 @@ fn capabilities_frame(
     })
     .map_err(|error| WireDecline::new("capabilities_frame", error))?;
     note_capability_frame();
+    // R-RG1: the same event in the per-second window the census reads, so a
+    // round can divide a class gate's capability µs by the frames it encoded
+    // rather than by the calls it made. One charge per encode.
+    crate::runtime::drain::note_store_route("wire_capability_frames");
     match CommandCodec::decode_response(&frame)
         .map_err(|error| WireDecline::new("capabilities_decode", error))?
     {
