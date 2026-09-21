@@ -834,17 +834,25 @@ pub(crate) enum ByteArmMeter {
     /// (`chain_middle_source_frame`), the copy the three arms above are the
     /// other end of.
     SeamFrame = 2,
+    /// The same seam handing over the caller's **own** frame instead of a copy
+    /// of it, on the arm `REIMS_VGPU_SEAM_FRAME_BORROW` selects when the fold
+    /// is the identity. No bar of its own — a borrow reads no clock — and the
+    /// byte count is the reading: on the increment arm the bytes the seam
+    /// borrowed are the bytes `seam_frame_material` stops copying, so the two
+    /// fields are read against each other rather than assumed.
+    SeamFrameBorrowed = 3,
 }
 
 /// Number of [`ByteArmMeter`] slots, derived from the enum the same way
 /// [`FRAME_SPANS`] is.
-const BYTE_ARM_METERS: usize = ByteArmMeter::SeamFrame as usize + 1;
+const BYTE_ARM_METERS: usize = ByteArmMeter::SeamFrameBorrowed as usize + 1;
 
 /// The emitted field-name stem of each meter, in slot order.
 const BYTE_ARM_NAMES: [&str; BYTE_ARM_METERS] = [
     "attach_bytes_copy",
     "attach_zero_mint",
     "seam_frame_material",
+    "seam_frame_borrowed",
 ];
 
 impl ByteArmMeter {

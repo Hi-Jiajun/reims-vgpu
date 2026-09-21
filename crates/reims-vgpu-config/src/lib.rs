@@ -1328,6 +1328,42 @@ pub const FRAME_PROFILE: &str = "REIMS_VGPU_FRAME_PROFILE";
 /// values in every field the gate can read. Off is today's device exactly, and
 /// unset and an unrecognized value are `off`.
 pub const SEAM_UNREAD_FRAMES: &str = "REIMS_VGPU_SEAM_UNREAD_FRAMES";
+
+/// `on` hands the rail the caller's **own** frame when the seam's fold is the
+/// identity, instead of a `to_vec` of it.
+///
+/// # The fold
+///
+/// `chain_middle_source_frame` turns the request's own `target_rgba8` into the
+/// bytes the attachment's view declares: the frame has to travel in the
+/// *attachment's* order, so a seed that states the other order has its first
+/// and third channels exchanged on the way. The exchange is the reason a
+/// buffer exists at all — but it is not what usually happens: when the two
+/// orders already agree the function's whole answer is `seed.to_vec()` of a
+/// buffer the caller owns, handed back to the same caller as a borrow one
+/// statement later.
+///
+/// # The reading that motivated it
+///
+/// The sixth round's production-posture profile (300 s, `guest import off`,
+/// **the pose the user's interactive run boots** — `sp24b`) reads
+/// `seam_frame_carry_us_mean` **6 206.9 µs per present frame** against
+/// `seam_frame_material_bytes` **139 032 186 B per frame**: a whole frame
+/// memcpy per record that carries one, 32 of them a frame, and the seam's own
+/// bar names the copy. The same round's `attach_bytes_copy` reads the *second*
+/// copy of the same bytes on the way to the wire (16 records, 69 591 668 B),
+/// which is the declaration's own `to_vec` and is left to its own cut.
+///
+/// # It only narrows
+///
+/// The borrow is of `DrawRequest::target_rgba8`'s own `Arc<Vec<u8>>`, which
+/// outlives the rail inputs built beside it and is never mutated through. The
+/// bytes the rail is handed are the same bytes the `to_vec` produced — the
+/// exchange is skipped by exactly the condition that decided it was not needed
+/// — so no decision, no frame byte and no guest-visible pixel changes. Off is
+/// today's device exactly: `unset` and an unrecognized value are `off`, and the
+/// call site is then the `to_vec` statement it always was.
+pub const SEAM_FRAME_BORROW: &str = "REIMS_VGPU_SEAM_FRAME_BORROW";
 }
 
 counts! {
