@@ -1621,6 +1621,53 @@ pub const GATE_MODULES_ONE_MEMO: &str = "REIMS_VGPU_GATE_MODULES_ONE_MEMO";
 /// over the runs' coordinates per proved bind — no bytes — and the read the
 /// trace makes instead.
 pub const GATE_PROVE_GATHER: &str = "REIMS_VGPU_GATE_PROVE_GATHER";
+
+/// **Whether a vertex stream whose bytes the walk *drops* is proved instead of
+/// read** (`R-WS1`, the walk's stream tables).
+///
+/// # The reading it answers
+///
+/// The walk states one canonical vertex stream per *fetch table* the request's
+/// layout reads (`one_vertex_stream` groups the attributes of one interleaved
+/// bind), and it elects — and copies — one source per *record*: the record that
+/// opens a table keeps its source, and every record that joins one drops the
+/// source it just elected, because the table it lands in already carries the
+/// one its own head elected. The split round priced that: on the production
+/// pose's own workload (single-interleaved-stream draws), **4.00 stream copies
+/// per stated table against 1.00 kept** — 331 264 copies for 82 822 tables over
+/// 84 611 walks, at 0.195 µs a copy, with the election around each copy worth
+/// another 0.343 µs.
+///
+/// # What `on` does, and what it cannot change
+///
+/// A record that joins a table already stated asks the *same* election the copy
+/// would have asked (`dropped_stream_len`) for the answer it owes — the
+/// refusals it can raise and the length the record-length rule reads — and gets
+/// the windowless gather's read **proved** rather than made: the same
+/// two-decision arithmetic and the same run walk with no sink
+/// (`stage_run_walk`), so every shape the copy refused is refused now, by the
+/// same slug and sentence, and the length the coverage rules below read is the
+/// length the copy would have carried. The record that *opens* a table keeps
+/// its read on both arms: its bytes are the ones the pass states.
+///
+/// The census keeps reading one population across the two arms: the copies that
+/// happen are counted where they always were
+/// (`render_provider_out_of_class_vertex_staging_staged`/`_bytes`) and the
+/// reads that were proved are counted beside them
+/// (`render_gate_walk_stream_proofs_n`/`_proven_bytes`), so
+/// `copies + proofs` is the record population on both arms and
+/// `copied_bytes + proven_bytes` is the bytes those records carry. The shapes
+/// the reach cut answers for (`G1-C`'s declared/copied histograms and the slack
+/// they leave) are charged on both arms, because they are facts about the bind
+/// rather than about the read.
+///
+/// # What it costs
+///
+/// Off is one relaxed load per record and nothing else — the copy, the walk and
+/// every counter are the ones the round before it ran. On adds one pass over
+/// the runs' coordinates per *dropped* read (no bytes, no `Vec`) and removes a
+/// `Vec::with_capacity` plus a `memcpy` from each of them.
+pub const GATE_PROVE_JOINED_STREAM: &str = "REIMS_VGPU_GATE_PROVE_JOINED_STREAM";
 }
 
 counts! {

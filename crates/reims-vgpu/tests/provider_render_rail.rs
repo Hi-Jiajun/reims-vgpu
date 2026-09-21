@@ -24045,6 +24045,11 @@ fn the_walks_stream_split_counts_its_records_tables_and_asks() {
     const STREAM_BYTES: u64 = 24;
 
     let _guard = engine_test_session();
+    // The counters this case reads are the *split's*: it pins the shape the
+    // round before the cut read, whatever the cut's own switch says, so the arm
+    // is forced off for its own body (`R-WS1`'s proof arm has its own case
+    // beside this one).
+    provider_render::set_gate_prove_joined_stream_arm(Some(false));
     let stages = two_stream_stages();
     let alignment = host_import_alignment().expect("the owner rail's provider answers");
     let page = usize::try_from(alignment).expect("the alignment fits usize");
@@ -24159,6 +24164,190 @@ fn the_walks_stream_split_counts_its_records_tables_and_asks() {
         (submit[7], submit[8]),
         (2, 2 * STREAM_BYTES),
         "and the submission pays the same two copies for the same one table: {submit:?}"
+    );
+    provider_render::set_gate_prove_joined_stream_arm(None);
+}
+
+/// R-WS1: a vertex record that lands in a table the walk has already stated
+/// *proves* its stream's read instead of making it, and the frame is the same
+/// frame.
+///
+/// The walk states one canonical vertex stream per *fetch table* the request's
+/// layout reads (`one_vertex_stream` groups the attributes of one interleaved
+/// bind) and elects — and reads — one source per *record*. The record that opens
+/// a table keeps its source, because that is the one the pass states; every
+/// record that joins one drops the source it just elected. The split round read
+/// the shape on the production pose's own workload: **4.00 stream copies per
+/// stated table against 1.00 kept** — 331 264 copies for 82 822 tables over
+/// 84 611 walks — at 0.195 µs a copy inside a 0.538 µs election, in a region
+/// that is 54 % a class probe's (whose whole pass is dropped by its caller).
+///
+/// `REIMS_VGPU_GATE_PROVE_JOINED_STREAM` answers a joining record with the
+/// election it always owed — the refusals it can raise and the length the
+/// record-length rule reads — and gets the windowless gather's read *proved*
+/// instead of made: `gathered_stream_len` for the two numbers the copy decides
+/// on, and `stage_run_walk` with no sink for the coverage proof, which is the
+/// same walk `stage_run_bytes` copies through. This case holds the two arms to
+/// each other on the shape the arm is for:
+///
+/// - the same draw lands the same frame on both arms, and the same frame the
+///   engine's own rail lands (the bytes travel from the guest's runs into the
+///   declaration either way, and the interleaved table is read at both offsets);
+/// - the read is counted once per *table* on the increment arm and once per
+///   *record* on the control arm, while the asks stay one per record on both
+///   (`render_gate_walk_vertex_source_submit_n`) — the population that does not
+///   move with the arm;
+/// - and the census reads one population across the two arms: `staged` +
+///   `proofs` is the record count and `staged_bytes` + `proven_bytes` is the
+///   bytes those records carry, so the arm that stopped reading is named rather
+///   than the reading going dark.
+#[test]
+fn the_proved_joined_stream_lands_the_same_frame_and_reads_once_per_table() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    /// Three interleaved records: the position `float2` at offset 0 and the
+    /// offset `float2` at offset 8, one stride of 16 bytes.
+    const STRIDE: u32 = 16;
+    const BIND_BYTES: u64 = 3 * STRIDE as u64;
+    /// The offsets the fixture adds are exact binary fractions, so the two rails'
+    /// own arithmetic rounds them the same way and parity stays an assertion
+    /// about stream plumbing rather than about rounding.
+    const OFFSET: f32 = 0.25;
+
+    let _guard = engine_test_session();
+    let stages = two_stream_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    // The interleaved table the guest's own descriptor states: one fetch table,
+    // two locations, one stride.
+    let mut interleaved: Vec<u8> = Vec::with_capacity(BIND_BYTES as usize);
+    for (x, y) in [(0.0f32, 0.0f32), (1.0, 0.0), (0.0, 1.0)] {
+        for value in [x, y, OFFSET, OFFSET] {
+            interleaved.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    owner.as_mut_slice()[..interleaved.len()].copy_from_slice(&interleaved);
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    // The production pose's own reading of this bind: one live host run over the
+    // table's own bytes and no `pages`, so the ledger names no window and the
+    // gate is the one that would read them.
+    let content = BufferContent::GuestRuns(engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            mapping,
+            mapping_len,
+            0,
+            BIND_BYTES,
+        )
+        .expect("the table's own bytes are inside the mapping")]),
+        source_offset: 0,
+        total_len: BIND_BYTES,
+        row_length_texels: 0,
+        pages: None,
+        direct_image: None,
+    });
+    // Two locations of **one** table: the same content `Arc` at one stride and
+    // one step is one canonical stream read at two offsets.
+    let attribute = |location: u32, offset: u32| VertexAttributeResource {
+        location,
+        binding: location,
+        format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+            .expect("Float2 is a vertex format"),
+        offset,
+        stride: STRIDE,
+        step_function: VertexStepFunction::PerVertex,
+        step_rate: 1,
+        content: content.clone(),
+    };
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes = vec![attribute(0, 0), attribute(1, 8)];
+        req
+    };
+    // The engine's own frame is the expectation: the two arms have to land
+    // *that* frame, not merely each other's.
+    let engine = engine_pixels("R-WS1 proved joined stream", &stages, request());
+    let run = |arm: Option<bool>| {
+        provider_render::set_gate_prove_joined_stream_arm(arm);
+        let before = [
+            route_count("render_provider_out_of_class_vertex_staging_staged"),
+            route_count("render_provider_out_of_class_vertex_staging_bytes"),
+            route_count("render_gate_walk_stream_proofs_n"),
+            route_count("render_gate_walk_stream_proven_bytes"),
+            route_count("render_gate_walk_vertex_source_submit_n"),
+            route_count("render_gate_walk_stream_tables_n"),
+        ];
+        let frame = match provider_render::submit_render(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request(),
+        ) {
+            RenderRailOutcome::ProviderCompleted(out) => Some(semantic_rgba(out.bytes, out.bgra)),
+            other => panic!(
+                "R-WS1: a draw whose interleaved table the runs cover is in class on both \
+                 arms: {other:?}"
+            ),
+        };
+        let after = [
+            route_count("render_provider_out_of_class_vertex_staging_staged"),
+            route_count("render_provider_out_of_class_vertex_staging_bytes"),
+            route_count("render_gate_walk_stream_proofs_n"),
+            route_count("render_gate_walk_stream_proven_bytes"),
+            route_count("render_gate_walk_vertex_source_submit_n"),
+            route_count("render_gate_walk_stream_tables_n"),
+        ];
+        let delta = std::array::from_fn::<_, 6, _>(|slot| after[slot] - before[slot]);
+        provider_render::set_gate_prove_joined_stream_arm(None);
+        (frame, delta)
+    };
+    let (control_frame, control) = run(Some(false));
+    let (proved_frame, proved) = run(Some(true));
+
+    eprintln!("R-WS1 joined stream: control={control:?} proved={proved:?}");
+    assert_eq!(
+        control_frame, proved_frame,
+        "the two arms are one scenario: the same declaration, the same copies and the same \
+         bytes land the same frame"
+    );
+    if let Some(engine) = engine.as_deref() {
+        assert_frames_equal(
+            "R-WS1 proved joined stream, both arms",
+            control_frame.as_deref().expect("the control arm completed"),
+            engine,
+        );
+    }
+
+    // The control arm reads one source per record: two copies for the two
+    // records that state one table.
+    assert_eq!(
+        (control[0], control[2]),
+        (2, 0),
+        "the control arm copies once per record and proves nothing: {control:?}"
+    );
+    assert_eq!(
+        (control[1], control[3]),
+        (2 * BIND_BYTES, 0),
+        "and carries the table's bytes twice: {control:?}"
+    );
+    // The increment arm reads one source per *table*: the record that opens it
+    // keeps its copy, and the record that joins it proves the read it drops.
+    assert_eq!(
+        (proved[0], proved[2]),
+        (1, 1),
+        "the increment arm copies once for the table and proves the record that joins it: \
+         {proved:?}"
+    );
+    assert_eq!(
+        (proved[1], proved[3]),
+        (BIND_BYTES, BIND_BYTES),
+        "and the census reads one population: the bytes carried plus the bytes proved are the \
+         bytes the two records state: {proved:?}"
+    );
+    // The population that does not move: the walk still elects once per record.
+    assert_eq!(
+        (control[4], proved[4], control[5], proved[5]),
+        (2, 2, 1, 1),
+        "one ask per record and one table stated, on both arms: {control:?} {proved:?}"
     );
 }
 
