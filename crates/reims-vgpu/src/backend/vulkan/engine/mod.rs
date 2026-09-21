@@ -2992,9 +2992,13 @@ fn landing_resident_enabled() -> bool {
         LANDING_RESIDENT_OFF => false,
         LANDING_RESIDENT_ON => true,
         _ => {
-            let on = matches!(
+            // Unset is on (flipped 2026-09-22 once the two arms had read it:
+            // missed_no_resident 3 249 -> 0, present-path direct_frac 0.00 ->
+            // 1.00, present_capture FAIL 6 -> 0, with the control plane
+            // unchanged). The control words restore the miss.
+            let on = !matches!(
                 crate::config::switch(crate::config::LANDING_RESIDENT),
-                crate::config::Switch::On
+                crate::config::Switch::Off
             );
             LANDING_RESIDENT_ARM.store(
                 if on {

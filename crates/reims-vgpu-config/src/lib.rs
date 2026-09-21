@@ -1708,12 +1708,17 @@ pub const ONE_ELECTION_PER_SOURCE: &str = "REIMS_VGPU_GATE_ONE_ELECTION_PER_SOUR
 ///
 /// # What it costs
 ///
-/// Off is one `OnceLock` load per landing merge and nothing else: the empty
-/// identity keeps the refusal (`no_resident`) it has today, no image is created,
-/// and no counter moves. On adds one image creation and one whole-extent upload
-/// per landed surface identity; the created resident is deliberately not marked
-/// as this device's only copy of its pixels (they also live in the guest's pages
-/// and the host cache), so the existing idle reclaim can take it back.
+/// **Unset is on** (flipped 2026-09-22 once the two arms had read it: census
+/// pose `winpub_no_resident` 402 → 0, present-path `direct_frac` 0.00 → 1.00,
+/// `present_capture FAIL` 6 → 0, `resident_image_merge_missed_no_resident`
+/// 3 249 → 0). The control words `0`/`off`/`false`/`no` are one `OnceLock` load
+/// per landing merge and nothing else: the empty identity keeps the refusal
+/// (`no_resident`), no image is created, and no counter moves.
+///
+/// On adds one image creation and one whole-extent upload per landed surface
+/// identity; the created resident is deliberately not marked as this device's
+/// only copy of its pixels (they also live in the guest's pages and the host
+/// cache), so the existing idle reclaim can take it back.
 pub const LANDING_RESIDENT: &str = "REIMS_VGPU_LANDING_RESIDENT";
 }
 
