@@ -9817,6 +9817,10 @@ fn note_wire_stage_buffers(trace: &ComputeTrace) {
             // (`BufferSource::GuestRuns`); the seam does not declare it yet, so
             // the wire note names the population rather than inventing a view.
             Some(BufferSource::GuestRuns(runs)) => format!("guest_runs={}", runs.len()),
+            // W2-A's own arm: a declaration whose bytes are its length in
+            // zeros (`BufferSource::ZeroFill`). The note names the length it
+            // stands for, which is the only content the arm has.
+            Some(BufferSource::ZeroFill { length }) => format!("zero_fill={length}"),
             None => "view=absent".to_owned(),
         };
         crate::observe::line(format!(
@@ -19028,14 +19032,7 @@ fn assemble_narrow_record(
                     .and_then(|plan| plan.guest_runs(load_seed_owner_binding()))
                     .expect("the owner plan covers an admitted guest-runs seed"),
             )),
-            NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => {
-                let zeros = vec![0u8; usize::try_from(pass.extent).unwrap_or(0)];
-                crate::runtime::drain::note_byte_arm(
-                    crate::runtime::drain::ByteArmMeter::ZeroMint,
-                    u64::try_from(zeros.len()).unwrap_or(u64::MAX),
-                );
-                BufferSource::OwnedBytes(zeros)
-            }
+            NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => clear_attachment_source(pass.extent),
         }
     };
     let declaration = BufferView {
@@ -20086,6 +20083,11 @@ fn trace_clone_view_bytes(view: &BufferView) -> u64 {
     bytes += match &view.source {
         BufferSource::OwnedBytes(owned) => u64::try_from(owned.len()).unwrap_or(u64::MAX),
         BufferSource::GuestRuns(runs) => trace_clone_list_bytes(runs.as_slice()),
+        // The zero-fill declaration carries no payload at all (statement
+        // economy W2-A): it is a length, which is inside the struct's own size
+        // counted above, so a clone of a trace that states it costs nothing
+        // beyond the copy of the value.
+        BufferSource::ZeroFill { .. } => 0,
         BufferSource::StagedLease(_) | BufferSource::BorrowedNoCopy(_) => 0,
     };
     bytes
@@ -21536,11 +21538,165 @@ fn production_declaration(production: &ProductionInFlight) -> BufferView {
         length: production.extent,
         access: BufferAccess::Read,
         attribute_stride: None,
-        source: BufferSource::OwnedBytes(vec![
-            0u8;
-            usize::try_from(production.extent)
-                .unwrap_or(usize::MAX)
-        ]),
+        source: zero_fill_declaration_source(production.extent),
+    }
+}
+
+/// The source one **in-flight production's** own declaration states.
+///
+/// The second of the two zero-fill producers (`REIMS_VGPU_ZERO_FILL_DECL`,
+/// statement economy W2-A): see [`clear_attachment_source`] for the first and
+/// for what the two arms read as.
+fn zero_fill_declaration_source(extent: u64) -> BufferSource {
+    if zero_fill_decl_enabled() {
+        BufferSource::zero_fill(extent)
+    } else {
+        BufferSource::OwnedBytes(vec![0u8; usize::try_from(extent).unwrap_or(usize::MAX)])
+    }
+}
+
+/// The source one attachment declaration states on its `Clear` / `Resident`
+/// arms (`REIMS_VGPU_ZERO_FILL_DECL`, statement economy W2-A).
+///
+/// The first of the two zero-fill producers. Off — the shipped default — this
+/// mints the extent's zeros and prices them with [`ByteArmMeter::ZeroMint`],
+/// exactly as every round before the cut read; on, it states the contract's
+/// zero-fill arm and prices the same number, so a round can read the two arms'
+/// byte bars side by side while the statement stops carrying the bytes.
+fn clear_attachment_source(extent: u64) -> BufferSource {
+    if zero_fill_decl_enabled() {
+        crate::runtime::drain::note_byte_arm(crate::runtime::drain::ByteArmMeter::ZeroMint, extent);
+        BufferSource::zero_fill(extent)
+    } else {
+        let zeros = vec![0u8; usize::try_from(extent).unwrap_or(0)];
+        crate::runtime::drain::note_byte_arm(
+            crate::runtime::drain::ByteArmMeter::ZeroMint,
+            u64::try_from(zeros.len()).unwrap_or(u64::MAX),
+        );
+        BufferSource::OwnedBytes(zeros)
+    }
+}
+
+/// The cut's own arm, forced by a test (`None` gives the env back) — the same
+/// shape [`set_trace_pass_owned_arm`] gives TR1's own switch.
+///
+/// A switch read through a `OnceLock` cannot be put back, and the arm this
+/// selects is the one thing an equivalence case has to vary **within one
+/// process**: a rail test that ran one arm in one binary and the other in the
+/// next would be comparing two scenarios, not two statements of one.
+static ZERO_FILL_DECL_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the two zero-fill declarations' own arm for a test (W2-A).
+///
+/// `None` restores the switch's own reading. The values are the three states
+/// one byte can carry: unset, off, on.
+pub fn set_zero_fill_decl_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    ZERO_FILL_DECL_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the attachment's `Clear` / `Resident` arm and every in-flight
+/// production's declaration state the contract's zero-fill arm instead of
+/// carrying the extent's zeros (`REIMS_VGPU_ZERO_FILL_DECL`, statement economy
+/// W2-A).
+///
+/// **Off by default.** The two producers stand for `extent` zero bytes that
+/// nothing in the submission reads as content, and both used to mint that
+/// vector and ship it as an `OwnedBytes` payload — 1.12 MB of a 1.86 MB
+/// statement, which is what the statement's own section account measured. On,
+/// the declaration states `BufferSource::ZeroFill` and the provider materializes
+/// the same zeros at the view's own window, so the device-visible bytes, the
+/// execution order and the landed frame are unchanged while the statement stops
+/// carrying them.
+///
+/// `REIMS_VGPU_ZERO_FILL_DECL=0/off/false/no` is the arm the shipped default
+/// takes. The switch is read once, at the first declaration, and a test may
+/// override it through [`set_zero_fill_decl_arm`].
+fn zero_fill_decl_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ZERO_FILL_DECL_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_zero_fill_decl(std::env::var("REIMS_VGPU_ZERO_FILL_DECL").ok().as_deref())
+    })
+}
+
+/// The switch's own parser, apart from the process-global it caches into so a
+/// unit test can read every spelling without a switch it cannot put back.
+fn parse_zero_fill_decl(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+#[cfg(test)]
+mod zero_fill_decl_switch_tests {
+    use super::*;
+
+    /// The spellings the cut's switch answers to, and the two arms of the
+    /// producer that both the attachment's declaration and every in-flight
+    /// production go through.
+    #[test]
+    fn the_zero_fill_decl_switch_reads_the_rail_s_own_spellings() {
+        for on in ["1", "on", "ON", "true", "yes", " YEs "] {
+            assert!(parse_zero_fill_decl(Some(on)), "{on:?} is an ask");
+        }
+        for off in [None, Some(""), Some("0"), Some("off"), Some("false")] {
+            assert!(!parse_zero_fill_decl(off), "{off:?} is the shipped arm");
+        }
+    }
+
+    /// **Both** producers' own source, in both arms: the shipped arm mints the
+    /// extent's zeros, the cut's arm states them, and the two stand for the same
+    /// bytes. The attachment's `Clear` / `Resident` arm and every in-flight
+    /// production's declaration are the cut's two producers, so a case that
+    /// pinned only one of them would leave the other's spelling unread.
+    #[test]
+    fn a_declaration_states_the_arm_or_carries_the_zeros_it_stands_for() {
+        set_zero_fill_decl_arm(Some(false));
+        let payloads = [
+            clear_attachment_source(16),
+            zero_fill_declaration_source(16),
+        ];
+        set_zero_fill_decl_arm(Some(true));
+        let arms = [
+            clear_attachment_source(16),
+            zero_fill_declaration_source(16),
+        ];
+        set_zero_fill_decl_arm(None);
+
+        for (payload, arm) in payloads.iter().zip(arms.iter()) {
+            assert_eq!(*payload, BufferSource::OwnedBytes(vec![0_u8; 16]));
+            assert_eq!(*arm, BufferSource::zero_fill(16));
+            // The two sources state the same content: the arm is a checked door
+            // over exactly the payload the shipped arm ships (statement economy
+            // W2-A), and a payload that is not that zero fill is refused by name
+            // rather than declared as zeros.
+            let BufferSource::OwnedBytes(bytes) = payload else {
+                panic!("the shipped arm of both producers carries the extent's zeros");
+            };
+            assert_eq!(
+                BufferSource::zero_fill_of(bytes).expect("the shipped payload is the zero fill"),
+                *arm
+            );
+        }
+        assert_eq!(
+            BufferSource::zero_fill_of(&[0, 7, 0, 0]),
+            Err(metal_api_core::provider::ContractError::NonZeroFillPayload { bytes: 4 }),
+            "a payload that is not all zero has no zero-fill spelling"
+        );
     }
 }
 
