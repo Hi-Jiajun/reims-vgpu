@@ -32937,3 +32937,173 @@ fn one_gate_frame_lands_the_same_frame_and_encodes_fewer_of_them() {
          the frame read per answer and {one_frame_frames} with one frame per call"
     );
 }
+
+/// R-GM1: the merged walk states the same three facts the three memos state,
+/// and its own capability reader states what E's capability walk states.
+///
+/// The class gate asks three questions about the draw's **own** fragment module
+/// — the pixel-coordinate sibling the texel space executes, the superset
+/// fragment interface, and the 16-bit shader capability pair — and each of them
+/// was its own memo parsing and translating that module, for three answers about
+/// one value. `REIMS_VGPU_GATE_MODULES_ONE_MEMO` reads all three out of one
+/// walk, and this case holds the two arms to each other **fact by fact** on the
+/// modules the rail is exercised with, rather than only through a landed frame:
+/// every fixture below is a module one of the three facts is about.
+///
+/// The last assertion is the one the cut's own reader needs. The half fact is
+/// E's walk under `SpirvFeaturePolicy::ADMITTING`, a translation the merged walk
+/// has already paid for when the *device's* policy is the admitting one — the
+/// case the production device is in. This suite's Lavapipe device need not admit
+/// every optional capability, so the merged arm can take the counted fallback
+/// here; translating under `ADMITTING` in this case and comparing the reader
+/// with E's own walk is what pins the two to each other either way, refusals
+/// included.
+#[test]
+fn the_merged_walk_states_the_same_three_facts_as_the_three_memos() {
+    let _guard = engine_test_session();
+    for (label, stages) in [
+        ("the reviewed solid module", reviewed_stages()),
+        ("the superset module", two_outputs_stages()),
+        ("the runtime-sampled module", runtime_sampled_stages()),
+        ("the half-truncating module", half_capability_stages()),
+    ] {
+        let arms =
+            provider_render::fragment_module_arms_for_test(&stages.air.1, stages.fragment_entry)
+                .unwrap_or_else(|decline| panic!("{label}: the module is readable: {decline:?}"));
+        assert_eq!(
+            arms.separate, arms.merged,
+            "{label}: one parse and one translation state the three facts the three memos state"
+        );
+        assert_eq!(
+            arms.reader_under_admitting, arms.e_walk,
+            "{label}: the merged walk's own capability reader states what E's capability walk \
+             states, refusals included"
+        );
+        eprintln!(
+            "R-GM1 {label}: facts {:?}, reader/e_walk {:?}/{:?}",
+            arms.merged, arms.reader_under_admitting, arms.e_walk
+        );
+    }
+}
+
+/// R-GM1: **one** scenario, two arms of the three per-module memos' switch.
+///
+/// The shape is the runtime-sampled pair bound through an unnormalized state,
+/// so the gate asks all three memos about the same module: the texel space moves
+/// the pixel-coordinate question, and the superset and half questions are asked
+/// for every request. The attachment is the BGR8 twin of the fixture's own
+/// format so this scenario's registration is a miss in a process that has run
+/// this file's other cases — the cut's register arm is only paid on a miss.
+///
+/// Two properties, and the second is what the cut is *for*: the same shape lands
+/// the same frame on both arms, and the arm that merges the walks parses and
+/// translates the module strictly fewer times — once at the gate and none at the
+/// registration, against three at the gate and one at the registration. The
+/// counts are read as deltas around each call, after
+/// [`provider_render::forget_module_memos_for_test`] drops the memos they are
+/// about (`Some(false)` first, then `Some(true)`), so the two arms are measured
+/// on the same work rather than on whichever test ran first.
+#[test]
+fn one_modules_memo_lands_the_same_frame_and_translates_fewer_modules() {
+    let _guard = engine_test_session();
+    use reims_vgpu::protocol::sampler as mtl;
+
+    let stages = runtime_sampled_stages();
+    let (width, height) = (8u32, 4u32);
+    let mut req = widened_runtime_sampled_request(
+        &stages,
+        sampled_texels(width, height),
+        (width, height),
+        mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    );
+    req.samplers[0].unnormalized_coordinates = true;
+    req.color_attachment = Some(attachment(MTL_FORMAT_BGRA8_UNORM));
+
+    const ROUTES: [&str; 12] = [
+        "render_gate_module_pixel_parse_n",
+        "render_gate_module_pixel_xlate_n",
+        "render_gate_module_superset_parse_n",
+        "render_gate_module_superset_xlate_n",
+        "render_gate_module_half_parse_n",
+        "render_gate_module_half_xlate_n",
+        "render_gate_module_memo_parse_n",
+        "render_gate_module_memo_xlate_n",
+        "render_gate_module_half_walk_n",
+        "render_register_fragment_parse_n",
+        "render_register_fragment_xlate_n",
+        "render_register_fragment_reuse_n",
+    ];
+    // The `map` takes the reader itself rather than a closure that calls it:
+    // clippy's site set is one of this cut's gates, and a `redundant closure`
+    // here would be a site the base does not have.
+    let snapshot = || ROUTES.map(reims_vgpu::runtime::drain::store_route_count_for_test);
+    let run = |arm: Option<bool>| {
+        provider_render::forget_module_memos_for_test();
+        provider_render::set_gate_modules_one_memo_arm(arm);
+        let before = snapshot();
+        let frame = provider_pixels("one modules memo", &stages, &req);
+        let after = snapshot();
+        let delta = before
+            .iter()
+            .zip(after.iter())
+            .map(|(before, after)| after - before)
+            .collect::<Vec<u64>>();
+        (frame, delta)
+    };
+    let (separate_frame, separate) = run(Some(false));
+    let (merged_frame, merged) = run(Some(true));
+    provider_render::set_gate_modules_one_memo_arm(None);
+
+    assert_eq!(
+        separate_frame, merged_frame,
+        "the two arms are one scenario: the gate answers with the same class, the same \
+         registration and the same frame, so the bytes it lands are the same bytes"
+    );
+
+    let separate_parses = separate[0] + separate[2] + separate[4];
+    let separate_xlates = separate[1] + separate[3] + separate[5];
+    assert_eq!(
+        (separate_parses, separate_xlates),
+        (3, 3),
+        "the three memos parse and translate the one module once each: {separate:?}"
+    );
+    assert_eq!(
+        (separate[9], separate[10]),
+        (1, 1),
+        "and the registration parses and translates it a fourth time: {separate:?}"
+    );
+
+    assert_eq!(
+        &merged[..6],
+        &[0, 0, 0, 0, 0, 0],
+        "the merged arm never walks a module through the three memos: {merged:?}"
+    );
+    assert_eq!(
+        merged[6], 1,
+        "the merged walk parses the module once: {merged:?}"
+    );
+    let merged_xlates = merged[7] + merged[8];
+    assert!(
+        merged_xlates < separate_xlates,
+        "the merged walk translates it strictly fewer times than three: {merged:?}"
+    );
+    assert_eq!(
+        (merged[9], merged[10], merged[11]),
+        (0, 0, 1),
+        "and the registration takes the walk's own translation instead of paying for a fourth \
+         parse and translation: {merged:?}"
+    );
+    eprintln!(
+        "R-GM1: the separate arm parsed the module {} times and translated it {} (three memos \
+         plus the registration); the merged arm parsed it {} and translated it {} ({} of them \
+         the half fact's own walk under ADMITTING, {} from the registration's reuse)",
+        separate_parses + separate[9],
+        separate_xlates + separate[10],
+        merged[6] + merged[9],
+        merged_xlates + merged[10],
+        merged[8],
+        merged[11]
+    );
+}

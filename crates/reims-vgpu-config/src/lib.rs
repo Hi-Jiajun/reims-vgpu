@@ -1517,6 +1517,60 @@ pub const SEAM_READ_GENERATION: &str = "REIMS_VGPU_SEAM_READ_GENERATION";
 /// counters that price the wire (`wire_capability_frames`, the codec's own
 /// `capability_frames`) divide by the calls instead of by the answers.
 pub const GATE_ONE_FRAME: &str = "REIMS_VGPU_GATE_ONE_FRAME";
+
+/// **Unset is off** — the three per-module memos keep their own walk. On, the
+/// class gate reads one fragment module's three facts out of **one** parse and
+/// **one** translation, and the registration that follows can take that same
+/// translation instead of paying for a fourth one.
+///
+/// # The reading that motivated it
+///
+/// R-RG1's split of the class gate reads the ask region's three per-module
+/// memos at **11 916.5 µs per present frame** (peak **1 633 972 µs/window** in
+/// the boot's first windows, steady **543 µs/window**) — the largest single
+/// region any round has priced inside the class gate — and names what they are:
+/// `pixel_coordinate_sampler_module`, `fragment_output_superset_module` and
+/// `half_capability_module` each parse the draw's **own** fragment module
+/// (`Device::new_library_with_binary_air`) and translate it (the first two under
+/// the device's policy, the third under `SpirvFeaturePolicy::ADMITTING`), keyed
+/// by the module's own bytes and differing only in which field of the result
+/// they read. The register miss path (34 times in a 9.75 s round, ~274 ms each)
+/// parses and translates the same module a fourth time.
+///
+/// # What `on` does, and what it cannot change
+///
+/// One walk per distinct module, cached by the module's bytes: one parse, one
+/// translation under the device's policy, and the three facts read out of that
+/// one result — the explicit-LOD sibling the texel space executes, whether the
+/// module stores more colour locations than the class's contract attaches, and
+/// whether it declares the 16-bit shader capability pair. Each fact keeps the
+/// default its own memo answered when the module could not be read at all
+/// (`false` for the sibling, `true` for the superset, `false` for the pair),
+/// and every fact the gate reads is the same value it read before.
+///
+/// The half-capability fact is the one that is not simply another field of the
+/// same translation: E's walk translates under `ADMITTING`, while the other two
+/// translate under the device's own policy. The merged walk reads the pair out
+/// of its own translation when the device's policy *is* the admitting one, and
+/// otherwise keeps E's walk — a second translation, counted as
+/// `render_gate_module_half_walk_n` rather than assumed away.
+///
+/// The registration that follows a miss takes the walk's own translated stage
+/// when it names the module and the AIR entry the walk translated (fragment
+/// stages translate against the default descriptor layout on both paths), so
+/// the fourth parse and translation disappear. A module whose stage the first
+/// registration already took pays its own translation again.
+///
+/// # What it costs
+///
+/// Off is one relaxed load per module question and nothing else. On adds one
+/// relaxed add per walk and the module cache's own probe; the two arms are held
+/// to each other by `one_modules_memo_lands_the_same_frame_and_translates_fewer_modules`
+/// and `the_merged_walk_states_the_same_three_facts_as_the_three_memos`
+/// (`crates/reims-vgpu/tests/provider_render_rail.rs`), which run both arms
+/// inside one process and compare the landed frame, the three facts and the
+/// walk counts.
+pub const GATE_MODULES_ONE_MEMO: &str = "REIMS_VGPU_GATE_MODULES_ONE_MEMO";
 }
 
 counts! {
