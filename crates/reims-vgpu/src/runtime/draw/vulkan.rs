@@ -14309,6 +14309,14 @@ fn chain_middle_source_frame(
             texel.swap(0, 2);
         }
     }
+    // The seam's own copy of this frame, priced beside the declaration that
+    // reproduces it a second time on the way to the wire
+    // (`ByteArmMeter::BytesCopy`). Default off behind the frame profile, so a
+    // profile that is off costs this call site one relaxed load.
+    crate::runtime::drain::note_byte_arm(
+        crate::runtime::drain::ByteArmMeter::SeamFrame,
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    );
     Some(bytes)
 }
 

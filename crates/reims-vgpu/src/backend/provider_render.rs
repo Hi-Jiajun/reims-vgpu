@@ -18874,16 +18874,39 @@ fn assemble_narrow_record(
     // frame the pass begins from and have to be the caller's own — and R32's
     // run list is the second: its bytes are the guest's own pages, read through
     // the lease the plan just imported.
-    let attachment_source = match &pass.load {
-        NarrowLoad::Bytes(bytes) => BufferSource::OwnedBytes(bytes.to_vec()),
-        NarrowLoad::GuestRuns(_) => BufferSource::GuestRuns(copied_guest_runs(
-            leases
-                .as_ref()
-                .and_then(|plan| plan.guest_runs(load_seed_owner_binding()))
-                .expect("the owner plan covers an admitted guest-runs seed"),
-        )),
-        NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => {
-            BufferSource::OwnedBytes(vec![0u8; usize::try_from(pass.extent).unwrap_or(0)])
+    let attachment_source = {
+        // W2's R-side half, priced before it is taken: the whole
+        // materialization of the bytes this declaration carries, whichever arm
+        // answers it, with the count and the bytes of that arm beside the bar
+        // ([`FrameSpan::AttachDeclare`], default off behind the frame profile).
+        // A window in which `attach_bytes_copy_bytes` equals
+        // `seam_frame_material_bytes` says the same frame was reproduced twice
+        // between the seam that made it and the wire that ships it.
+        let _declare =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::AttachDeclare);
+        match &pass.load {
+            NarrowLoad::Bytes(bytes) => {
+                let copied = bytes.to_vec();
+                crate::runtime::drain::note_byte_arm(
+                    crate::runtime::drain::ByteArmMeter::BytesCopy,
+                    u64::try_from(copied.len()).unwrap_or(u64::MAX),
+                );
+                BufferSource::OwnedBytes(copied)
+            }
+            NarrowLoad::GuestRuns(_) => BufferSource::GuestRuns(copied_guest_runs(
+                leases
+                    .as_ref()
+                    .and_then(|plan| plan.guest_runs(load_seed_owner_binding()))
+                    .expect("the owner plan covers an admitted guest-runs seed"),
+            )),
+            NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => {
+                let zeros = vec![0u8; usize::try_from(pass.extent).unwrap_or(0)];
+                crate::runtime::drain::note_byte_arm(
+                    crate::runtime::drain::ByteArmMeter::ZeroMint,
+                    u64::try_from(zeros.len()).unwrap_or(u64::MAX),
+                );
+                BufferSource::OwnedBytes(zeros)
+            }
         }
     };
     let declaration = BufferView {

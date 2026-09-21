@@ -785,11 +785,75 @@ pub(crate) enum FrameSpan {
     /// pipeline id the trace states (the function de-duplicates by id, so a
     /// batch's records share their declaring kernel's entry).
     ProvTracePipelineClone = 51,
+    /// Materializing the frame bytes the attachment's own declaration carries
+    /// (`BufferSource::OwnedBytes` over the packed extent).
+    ///
+    /// The statement-economy reconnaissance named this as the R side's half of
+    /// the zero-fill question: the frozen contract asks a storing attachment to
+    /// land through its own bytes, and on the clear and resident arms nothing
+    /// ever reads them, while the load arms (`NarrowLoad::Bytes`) copy a frame
+    /// the caller has already materialized once. The bar is the whole
+    /// materialization — whichever arm ran — and the meters beside it
+    /// (`attach_bytes_copy` / `attach_zero_mint`) say which one it was and how
+    /// many bytes it minted. The run-list arm is priced by the seventh cut's
+    /// own `lease_run_copy` meter, because it copies entries rather than bytes.
+    ///
+    /// The R-side cut it is read against is "hand the declaration the frame the
+    /// caller owns instead of a copy of it"
+    /// (`seam_frame_material` is the same bytes one copy earlier), so the two
+    /// meters are read side by side: equal byte counts mean the same frame was
+    /// reproduced twice between the seam and the wire.
+    AttachDeclare = 52,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::ProvTracePipelineClone as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::AttachDeclare as usize + 1;
+
+/// One byte source the owner mints for the attachment's own declaration, with
+/// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
+///
+/// The three arms are the three `NarrowLoad` shapes that reach the wire as
+/// `BufferSource::OwnedBytes`-carrying declarations, and they are read apart
+/// because their cut lives in different places: the load arms reproduce bytes
+/// the caller already holds (a move can replace the copy), while the clear and
+/// resident arms mint zeros nothing reads (a shared block or a byte-less
+/// declaration can replace the mint).
+///
+/// The run-list arm (`NarrowLoad::GuestRuns`) is deliberately not here: its
+/// construction copies `GuestRun` entries rather than bytes, and the seventh
+/// cut's own [`LeaseVecMeter::RunCopy`] already prices it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub(crate) enum ByteArmMeter {
+    /// `NarrowLoad::Bytes` → `OwnedBytes(bytes.to_vec())`.
+    BytesCopy = 0,
+    /// `NarrowLoad::Clear | NarrowLoad::Resident` → `OwnedBytes(vec![0; extent])`.
+    ZeroMint = 1,
+    /// The seam's own materialization of a frame it hands the rail as bytes
+    /// (`chain_middle_source_frame`), the copy the three arms above are the
+    /// other end of.
+    SeamFrame = 2,
+}
+
+/// Number of [`ByteArmMeter`] slots, derived from the enum the same way
+/// [`FRAME_SPANS`] is.
+const BYTE_ARM_METERS: usize = ByteArmMeter::SeamFrame as usize + 1;
+
+/// The emitted field-name stem of each meter, in slot order.
+const BYTE_ARM_NAMES: [&str; BYTE_ARM_METERS] = [
+    "attach_bytes_copy",
+    "attach_zero_mint",
+    "seam_frame_material",
+];
+
+impl ByteArmMeter {
+    /// This meter's slot in the count/byte tables, which is its discriminant.
+    #[inline]
+    pub(crate) fn slot(self) -> usize {
+        self as usize
+    }
+}
 
 /// One deep copy the trace walk makes of a value it only borrowed, with its own
 /// slot in the count/byte tables beside the span bar of the same name.
@@ -1122,6 +1186,8 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "prov_trace_draws_head_clone_us_mean",
     "prov_trace_prod_clone_us_mean",
     "prov_trace_pipeline_clone_us_mean",
+    // The attachment declaration's own byte source (W2's R-side half).
+    "attach_declare_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.
@@ -1235,6 +1301,14 @@ pub(crate) struct FrameProfileCensus {
     trace_clone_bytes_sum: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
     last_present_trace_clone_n: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
     last_present_trace_clone_bytes: [std::sync::atomic::AtomicU64; TRACE_CLONE_METERS],
+    // The attachment declaration's own byte sources ([`ByteArmMeter`]), counted
+    // and sized on the same terms as the two families above.
+    byte_arm_n: [std::sync::atomic::AtomicU64; BYTE_ARM_METERS],
+    byte_arm_bytes: [std::sync::atomic::AtomicU64; BYTE_ARM_METERS],
+    byte_arm_n_sum: [std::sync::atomic::AtomicU64; BYTE_ARM_METERS],
+    byte_arm_bytes_sum: [std::sync::atomic::AtomicU64; BYTE_ARM_METERS],
+    last_present_byte_arm_n: [std::sync::atomic::AtomicU64; BYTE_ARM_METERS],
+    last_present_byte_arm_bytes: [std::sync::atomic::AtomicU64; BYTE_ARM_METERS],
     // The previous frame's close; 0 before the first present.
     last_present_us: std::sync::atomic::AtomicU64,
     last_present_draws: std::sync::atomic::AtomicU64,
@@ -1290,6 +1364,12 @@ impl FrameProfileCensus {
             trace_clone_bytes_sum: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
             last_present_trace_clone_n: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
             last_present_trace_clone_bytes: [const { AtomicU64::new(0) }; TRACE_CLONE_METERS],
+            byte_arm_n: [const { AtomicU64::new(0) }; BYTE_ARM_METERS],
+            byte_arm_bytes: [const { AtomicU64::new(0) }; BYTE_ARM_METERS],
+            byte_arm_n_sum: [const { AtomicU64::new(0) }; BYTE_ARM_METERS],
+            byte_arm_bytes_sum: [const { AtomicU64::new(0) }; BYTE_ARM_METERS],
+            last_present_byte_arm_n: [const { AtomicU64::new(0) }; BYTE_ARM_METERS],
+            last_present_byte_arm_bytes: [const { AtomicU64::new(0) }; BYTE_ARM_METERS],
             last_present_us: AtomicU64::new(0),
             last_present_draws: AtomicU64::new(0),
             last_present_draw_us: AtomicU64::new(0),
@@ -1384,6 +1464,18 @@ impl FrameProfileCensus {
         self.trace_clone_bytes[meter.slot()].fetch_add(bytes, Relaxed);
     }
 
+    /// Bank one [`ByteArmMeter`]'s byte source: how many ran and how many bytes
+    /// each one minted.
+    ///
+    /// Called only through the module-level [`note_byte_arm`], which is where
+    /// the switch is read, so a profile that is off costs the call site one
+    /// relaxed load and no counter write.
+    pub(crate) fn note_byte_arm(&self, meter: ByteArmMeter, n: u64, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.byte_arm_n[meter.slot()].fetch_add(n, Relaxed);
+        self.byte_arm_bytes[meter.slot()].fetch_add(bytes, Relaxed);
+    }
+
     /// Close the frame a present ends, and report when the window fills.
     ///
     /// `not_enabled` names the arm
@@ -1472,6 +1564,23 @@ impl FrameProfileCensus {
             let prev = self.last_present_trace_clone_bytes[slot].swap(cur, Relaxed);
             *bytes = cur.saturating_sub(prev);
         }
+        // The attachment declaration's byte sources are differenced on the same
+        // edge, so the copy the seam makes and the copy the declaration makes
+        // are read against the same frame.
+        let mut byte_arm_n = [0u64; BYTE_ARM_METERS];
+        let mut byte_arm_bytes = [0u64; BYTE_ARM_METERS];
+        for (slot, (n, bytes)) in byte_arm_n
+            .iter_mut()
+            .zip(byte_arm_bytes.iter_mut())
+            .enumerate()
+        {
+            let cur = self.byte_arm_n[slot].load(Relaxed);
+            let prev = self.last_present_byte_arm_n[slot].swap(cur, Relaxed);
+            *n = cur.saturating_sub(prev);
+            let cur = self.byte_arm_bytes[slot].load(Relaxed);
+            let prev = self.last_present_byte_arm_bytes[slot].swap(cur, Relaxed);
+            *bytes = cur.saturating_sub(prev);
+        }
         // The sub-phase table is differenced the same way and on the same
         // terms, so a frame that straddles a report boundary stays whole.
         let mut frame_spans = [0u64; FRAME_SPANS];
@@ -1526,6 +1635,10 @@ impl FrameProfileCensus {
         {
             self.trace_clone_n_sum[slot].fetch_add(*n, Relaxed);
             self.trace_clone_bytes_sum[slot].fetch_add(*bytes, Relaxed);
+        }
+        for (slot, (n, bytes)) in byte_arm_n.iter().zip(byte_arm_bytes.iter()).enumerate() {
+            self.byte_arm_n_sum[slot].fetch_add(*n, Relaxed);
+            self.byte_arm_bytes_sum[slot].fetch_add(*bytes, Relaxed);
         }
         self.host_sum_us.fetch_add(frame_host_us, Relaxed);
         self.host_max_us.fetch_max(frame_host_us, Relaxed);
@@ -1600,6 +1713,13 @@ impl FrameProfileCensus {
                     " {name}_n={} {name}_bytes={}",
                     mean(self.trace_clone_n_sum[slot].swap(0, Relaxed)),
                     mean(self.trace_clone_bytes_sum[slot].swap(0, Relaxed)),
+                ));
+            }
+            for (slot, name) in BYTE_ARM_NAMES.iter().enumerate() {
+                line.push_str(&format!(
+                    " {name}_n={} {name}_bytes={}",
+                    mean(self.byte_arm_n_sum[slot].swap(0, Relaxed)),
+                    mean(self.byte_arm_bytes_sum[slot].swap(0, Relaxed)),
                 ));
             }
             for (name, acc) in SPAN_NAMES.iter().zip(self.span_sum_us.iter()) {
@@ -1773,6 +1893,21 @@ pub(crate) fn note_trace_clone(meter: TraceCloneMeter, bytes: impl FnOnce() -> u
         return;
     }
     FRAME_PROFILE.note_trace_clone(meter, 1, bytes());
+}
+
+/// Bank one [`ByteArmMeter`]'s byte source against the open frame: one
+/// materialization and the bytes it minted.
+///
+/// `bytes` is a plain number here rather than a closure: every call site is
+/// already holding the value it is about to hand over (a `Vec<u8>`'s length or
+/// an extent), so the reading costs the call site a `len()` and nothing else.
+/// Charged at the materialization's own site, so the count, the bytes and the
+/// [`FrameSpan::AttachDeclare`] bar beside them are of the same events.
+pub(crate) fn note_byte_arm(meter: ByteArmMeter, bytes: u64) {
+    if !frame_profile_on() {
+        return;
+    }
+    FRAME_PROFILE.note_byte_arm(meter, 1, bytes);
 }
 
 /// Bank one of [`crate::runtime::chain_phase`]'s bars, named by its ordinal.
