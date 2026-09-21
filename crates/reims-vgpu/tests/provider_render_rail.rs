@@ -26582,8 +26582,15 @@ fn a_sampled_pass_whose_frame_carries_the_declarations_leaves_for_the_provider()
         direct_image: None,
     });
     let stages = sampled_stages();
+    // The texels are this test's own: the ledger is one table for the process,
+    // so a payload another case already filed would be *named* by this test's
+    // first statement rather than filed by it — which is the reading the second
+    // assertion below is about. One texel's channel is therefore moved off the
+    // shared fixture's bytes, and both arms read the same request.
+    let mut texels = sampled_texels(8, 4);
+    texels[7][2] ^= 0x5a;
     let request = || {
-        let mut request = sampled_request(&stages, sampled_texels(8, 4), (8, 4));
+        let mut request = sampled_request(&stages, texels.clone(), (8, 4));
         request.vertex_attributes[0].content = content.clone();
         request
     };
