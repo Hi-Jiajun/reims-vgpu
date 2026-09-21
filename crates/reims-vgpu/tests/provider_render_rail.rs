@@ -26582,15 +26582,8 @@ fn a_sampled_pass_whose_frame_carries_the_declarations_leaves_for_the_provider()
         direct_image: None,
     });
     let stages = sampled_stages();
-    // The texels are this test's own: the ledger is one table for the process,
-    // so a payload another case already filed would be *named* by this test's
-    // first statement rather than filed by it — which is the reading the second
-    // assertion below is about. One texel's channel is therefore moved off the
-    // shared fixture's bytes, and both arms read the same request.
-    let mut texels = sampled_texels(8, 4);
-    texels[7][2] ^= 0x5a;
     let request = || {
-        let mut request = sampled_request(&stages, texels.clone(), (8, 4));
+        let mut request = sampled_request(&stages, sampled_texels(8, 4), (8, 4));
         request.vertex_attributes[0].content = content.clone();
         request
     };
@@ -26775,8 +26768,17 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
         direct_image: None,
     });
     let stages = sampled_stages();
+    // The texels are this test's own, and so is the payload they state. Two
+    // reasons, both about a process-wide reading: the ledger is one table for
+    // the process, so a payload another case already filed would be *named* by
+    // this test's first statement rather than filed by it, and the frame
+    // capture below collects every submitting case's frames, so each step has
+    // to recognise its own by the bytes it states.
+    let mut texels = sampled_texels(8, 4);
+    texels[7][2] ^= 0x5a;
+    let payload: Vec<u8> = texels.iter().flatten().copied().collect();
     let request = || {
-        let mut request = sampled_request(&stages, sampled_texels(8, 4), (8, 4));
+        let mut request = sampled_request(&stages, texels.clone(), (8, 4));
         request.vertex_attributes[0].content = content.clone();
         request
     };
@@ -26797,9 +26799,11 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
 
     // 1. The shipped shape: no plan, the payload travels, the frame lands.
     set_statement_payload_table_for_test(Some(false));
-    let (_, plain_views, plain_pixels) = wire_textures_of_one_submission("E-SW3 plain", || {
-        provider_pixels("E-SW3 plain", &stages, &request())
-    });
+    let (plain_views, plain_pixels, _) = wire_frame_of_one_submission(
+        "E-SW3 plain",
+        |views| matches!(&views[0].source, TextureSource::OwnedBytes(bytes) if bytes == &payload),
+        || provider_pixels("E-SW3 plain", &stages, &request()),
+    );
     assert_eq!(
         plain_views.len(),
         1,
@@ -26811,8 +26815,11 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
             texture_source_arm(&plain_views[0].source)
         );
     };
-    let payload = plain_bytes.len();
-    assert!(payload > 0, "the fixture's texture has a payload");
+    assert_eq!(
+        plain_bytes.as_slice(),
+        payload.as_slice(),
+        "the shipped shape carries this test's own bytes"
+    );
     assert_frames_equal(
         "the payload travels and the frame lands",
         &plain_pixels,
@@ -26821,10 +26828,16 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
 
     // 2. The first statement with the table on *files* the payload.
     set_statement_payload_table_for_test(Some(true));
-    let (declared_views, declared_pixels, declared_frame) =
-        wire_frame_of_one_submission("E-SW3 declare", || {
-            provider_pixels("E-SW3 declare", &stages, &request())
-        });
+    let digest = metal_api_core::statement_payload::payload_digest(&payload);
+    let (declared_views, declared_pixels, declared_frame) = wire_frame_of_one_submission(
+        "E-SW3 declare",
+        |views| match &views[0].source {
+            TextureSource::OwnedInSlot { bytes, .. } => bytes == &payload,
+            TextureSource::SlottedBytes { digest: held, .. } => *held == digest,
+            _ => false,
+        },
+        || provider_pixels("E-SW3 declare", &stages, &request()),
+    );
     assert!(
         matches!(declared_views[0].source, TextureSource::OwnedInSlot { .. }),
         "the first statement files its payload: {:?}",
@@ -26838,10 +26851,17 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
 
     // 3. The next statement *names* it: the same frame again, and the frame
     //    that carried it is shorter by the payload it no longer carries.
-    let (named_views, named_pixels, named_frame) =
-        wire_frame_of_one_submission("E-SW3 reference", || {
-            provider_pixels("E-SW3 reference", &stages, &request())
-        });
+    let (named_views, named_pixels, named_frame) = wire_frame_of_one_submission(
+        "E-SW3 reference",
+        |views| {
+            matches!(
+                &views[0].source,
+                TextureSource::SlottedBytes { length, digest: held, .. }
+                    if *length == payload.len() as u64 && *held == digest
+            )
+        },
+        || provider_pixels("E-SW3 reference", &stages, &request()),
+    );
     let TextureSource::SlottedBytes { length, .. } = named_views[0].source else {
         panic!(
             "the second statement names what the first filed: {:?}",
@@ -26850,7 +26870,7 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
     };
     assert_eq!(
         usize::try_from(length).expect("the payload fits usize"),
-        payload,
+        payload.len(),
         "the reference names the payload's own length"
     );
     assert_frames_equal(
@@ -26866,16 +26886,17 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
     const REFERENCE_ARM_FIELDS: usize = 8 + 16;
     const DECLARATION_ARM_FIELDS: usize = 8;
     assert!(
-        payload > REFERENCE_ARM_FIELDS - DECLARATION_ARM_FIELDS,
+        payload.len() > REFERENCE_ARM_FIELDS - DECLARATION_ARM_FIELDS,
         "the fixture's payload has to be wider than the reference arm's own fields"
     );
-    let saving = payload - (REFERENCE_ARM_FIELDS - DECLARATION_ARM_FIELDS);
+    let saving = payload.len() - (REFERENCE_ARM_FIELDS - DECLARATION_ARM_FIELDS);
     assert_eq!(
         named_frame,
         declared_frame - saving,
         "the naming statement's frame is shorter by the payload it names, less the \
          reference arm's own length and digest (declared {declared_frame} vs named \
-         {named_frame}, payload {payload}, saving {saving})"
+         {named_frame}, payload {}, saving {saving})",
+        payload.len()
     );
     set_statement_payload_table_for_test(None);
 }
@@ -26884,8 +26905,14 @@ fn a_statement_names_the_payload_an_earlier_one_filed() {
 /// published: [`wire_textures_of_one_submission`] plus the two readings this
 /// test needs beside the views (the frame's own size, which is what the cut is
 /// about, and the pixels, which are what it must not change).
+///
+/// `is_this_submission` picks the frame among the ones the capture facility
+/// collected: it is process-wide, so a run that arms the cut for the whole
+/// suite has other cases submitting beside this one, and a step that took the
+/// first frame that decoded as a sampled pass would read a neighbour's arm.
 fn wire_frame_of_one_submission(
     label: &str,
+    is_this_submission: impl Fn(&[TextureView]) -> bool,
     submit: impl FnOnce() -> Vec<u8>,
 ) -> (Vec<TextureView>, Vec<u8>, usize) {
     provider_wire::capture_submission_frames(true);
@@ -26899,8 +26926,8 @@ fn wire_frame_of_one_submission(
             let pass = trace.passes.iter().find_map(TracePass::as_render)?;
             (!pass.textures.is_empty()).then(|| (pass.textures.clone(), frame.len()))
         })
-        .next()
-        .unwrap_or_else(|| panic!("{label}: the submission's frame decodes as a sampled pass"));
+        .find(|(views, _)| is_this_submission(views))
+        .unwrap_or_else(|| panic!("{label}: no captured frame carries this submission's own arm"));
     (views, pixels, frame_len)
 }
 
