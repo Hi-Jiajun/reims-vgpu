@@ -22159,7 +22159,7 @@ fn register_render_pipeline(
         let _contract = crate::runtime::drain::frame_span(
             crate::runtime::drain::FrameSpan::ProvRegisterContract,
         );
-        let contract = RenderPipelineContract {
+        RenderPipelineContract {
             vertex_entry: pass.vertex_entry.clone(),
             fragment_entry: pass.fragment_entry.clone(),
             color_formats: vec![pass.format],
@@ -22188,8 +22188,7 @@ fn register_render_pipeline(
             // AIR sampler state at the Metal index the pass's own view states
             // (E-RS3, §104), in the same canonical order those views are stated in.
             textures: pass.texture_declarations(),
-        };
-        contract
+        }
     };
     let fingerprint = {
         let _fingerprint = crate::runtime::drain::frame_span(
@@ -22200,15 +22199,14 @@ fn register_render_pipeline(
     let key = {
         let _key =
             crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvRegisterKey);
-        let key = RenderPipelineKey {
+        RenderPipelineKey {
             vertex_air: inputs.vertex_air.to_vec(),
             fragment_air: inputs.fragment_air.to_vec(),
             vertex_entry: pass.vertex_entry.clone(),
             fragment_entry: pass.fragment_entry.clone(),
             contract: fingerprint.clone(),
             vertex_stage_buffer_namespace_split: pass.vertex_stage_buffer_namespace_split,
-        };
-        key
+        }
     };
     let rail = render_rail();
     // R-RG1: the acquisition is its own bar — a large one is contention and not

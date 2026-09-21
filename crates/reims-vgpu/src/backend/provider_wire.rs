@@ -1099,7 +1099,7 @@ thread_local! {
     /// than global because the gate runs on the vCPU thread that drew, and a
     /// second thread's gate must not read the first one's frame.
     static GATE_FRAME: std::cell::RefCell<Option<GateFrame>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The guard a class gate holds while its own frame is stated, so the slot goes
