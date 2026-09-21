@@ -5210,6 +5210,44 @@ fn canonical_vertex_stream_count(attributes: &[VertexAttributeResource]) -> usiz
     heads.len()
 }
 
+/// Whether two of a request's attributes read one table through **one source**
+/// (`R-WS1`), rather than merely landing in one table ([`one_vertex_stream`]).
+///
+/// The table rule compares the bind and the layout — the `runs` allocation, the
+/// window inside it, the stride and the step — which is what makes two records
+/// one canonical vertex stream. The **source election** reads one fact more: the
+/// page runs the ledger derived for that bind ([`GuestRunSource::pages`], the
+/// list [`gather_run_windows`] walks), which is what decides whether the bind
+/// travels as one registered window, as a scatter no declaration of this rail
+/// states, or as the windowless gather it reads itself. Two records whose
+/// `pages` are one list — or both absent — therefore ask the election *the same
+/// question*, and the answer the table's own head was given stands for both.
+///
+/// That is what this predicate's caller is decided on: a record that reads one
+/// source with its table's head has no second election to run, and the source
+/// its own election would mint is dropped where the record lands. Nothing else
+/// in the source is read by that election — `row_length_texels` and
+/// `direct_image` are the texture rails' facts — and a field the election does
+/// not read cannot change its answer.
+fn one_vertex_source(a: &VertexAttributeResource, b: &VertexAttributeResource) -> bool {
+    if !one_vertex_stream(a, b) {
+        return false;
+    }
+    match (&a.content, &b.content) {
+        // The table rule already holds that the two *are* one allocation, and a
+        // staged source's election reads nothing but its length.
+        (BufferContent::Bytes(_), BufferContent::Bytes(_)) => true,
+        (BufferContent::GuestRuns(left), BufferContent::GuestRuns(right)) => {
+            match (&left.pages, &right.pages) {
+                (None, None) => true,
+                (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// The plan's own gathered runs, copied into the owned list one
 /// `BufferSource::GuestRuns` declaration carries.
 ///
@@ -7250,7 +7288,11 @@ fn stream_run_bytes(
     routes: StreamStagingRoutes,
     reach: Option<u64>,
 ) -> Option<Vec<u8>> {
-    let (declared, len) = gathered_stream_len(source, reach)?;
+    if gather_run_windows(source).is_some() {
+        return None;
+    }
+    let declared = source.total_len;
+    let len = reach.map_or(declared, |reach| reach.min(declared));
     // R-WS1: the copy itself, as its own arm of the walk's stream region — the
     // `Vec`, the run walk and the `memcpy`, once per stream this rail reads
     // itself (a vertex fetch table or the index array). Priced inside
@@ -7282,100 +7324,6 @@ fn stream_run_bytes(
         u64::try_from(copy.len()).unwrap_or(u64::MAX),
     );
     Some(copy)
-}
-
-/// The two numbers every windowless gather's read is decided on (`R-WS1`): the
-/// length the bind declares, and the length this read covers.
-///
-/// One function rather than two copies of the same three lines, because the
-/// copy ([`stream_run_bytes`]) and the proof that replaces it where the walk
-/// drops the bytes ([`stream_run_proved`]) have to answer about **one** range:
-/// `None` is the scatter the ledger *does* name windows for — the shape no
-/// single declaration of this rail's arms states — and the `min` against the
-/// draw's own reach is the `G1-C` cut both arms make.
-#[inline]
-fn gathered_stream_len(source: &GuestRunSource, reach: Option<u64>) -> Option<(u64, u64)> {
-    if gather_run_windows(source).is_some() {
-        return None;
-    }
-    let declared = source.total_len;
-    Some((
-        declared,
-        reach.map_or(declared, |reach| reach.min(declared)),
-    ))
-}
-
-/// The same read, proved instead of made (`R-WS1`).
-///
-/// The arm a record takes when the bytes it would read are *dropped*: it joins a
-/// vertex stream the walk has already stated, so the source its own election
-/// mints is thrown away where the record is pushed into the table an earlier
-/// attribute opened. What the record still owes is the answer — every refusal
-/// the copy could raise, and the length the record-length rule beside it reads —
-/// and that is what this returns: `gathered_stream_len` for the two numbers, and
-/// `stage_run_walk` with no sink for the coverage proof, the *same* walk
-/// [`stage_run_bytes`] copies through, so a run list this returns `None` for is
-/// one the copy refuses for the same reason.
-///
-/// The censuses are the copy's own, less the copy: the two shape histograms and
-/// the reach cut's routes are charged here exactly as they are charged on the
-/// reading arm (they are facts about the bind, not about the read), and the two
-/// counters the reading arm charges for the bytes it carried
-/// (`render_provider_out_of_class_vertex_staging_staged`/`_bytes`) are replaced
-/// by this arm's own pair (`render_gate_walk_stream_proofs_n`,
-/// `render_gate_walk_stream_proven_bytes`), so `copies + proofs` is the record
-/// population on both arms.
-fn stream_run_proved(
-    source: &GuestRunSource,
-    routes: StreamStagingRoutes,
-    reach: Option<u64>,
-) -> Option<u64> {
-    let (declared, len) = gathered_stream_len(source, reach)?;
-    let _walk_streams_gather_prove = crate::runtime::drain::frame_span(
-        crate::runtime::drain::FrameSpan::ProvGateWalkStreamsGatherProve,
-    );
-    let proven = stage_run_walk(source, len, |_, _| {})?;
-    note_length(routes.lengths.declared, declared);
-    note_length(routes.lengths.copied, len);
-    if len < declared {
-        if let Some(route) = routes.truncated {
-            crate::runtime::drain::note_store_route(route);
-        }
-        if let Some(route) = routes.slack {
-            crate::runtime::drain::note_store_route_n(route, declared - len);
-        }
-    }
-    crate::runtime::drain::note_store_route("render_gate_walk_stream_proofs_n");
-    crate::runtime::drain::note_store_route_n("render_gate_walk_stream_proven_bytes", proven);
-    Some(proven)
-}
-
-/// The answer one record's stream owes when the walk drops its bytes
-/// (`R-WS1`): the arm it would have been stated from, and the length that arm
-/// covers.
-///
-/// The same election [`stream_source`] makes, arm for arm — the request's own
-/// staged copy, the one registered window a zero-copy bind was cut from, or the
-/// windowless gather this rail reads itself — with the one difference the
-/// caller's situation allows: the gather's bytes are *proved* rather than read
-/// ([`stream_run_proved`]), because the source that would have carried them is
-/// dropped. `None` is every refusal the election raises, at the same position
-/// and with the same conditions as the copy's own arm.
-fn dropped_stream_len(content: &BufferContent, reach: Option<u64>) -> Option<u64> {
-    match content {
-        BufferContent::Bytes(bytes) => Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
-        BufferContent::GuestRuns(source) => match gather_single_window(source) {
-            Some(window) => Some(window.bytes_len),
-            None => stream_run_proved(source, VERTEX_STREAM_STAGING, reach),
-        },
-    }
-}
-
-/// [`dropped_stream_len`] with the refusal [`vertex_stream_source`] raises
-/// (`R-WS1`): the shape one record's dropped stream owes, or the vertex
-/// staging bucket's own slug and sentence.
-fn vertex_stream_shape(content: &BufferContent, reach: Option<u64>) -> Result<u64, OutOfClass> {
-    dropped_stream_len(content, reach).ok_or_else(vertex_staging_refusal)
 }
 
 /// The bytes one stream may be stated from, arm by arm (`R9q`, `R11`,
@@ -7458,25 +7406,16 @@ fn vertex_stream_source(
     content: &BufferContent,
     reach: Option<u64>,
 ) -> Result<StreamSource<'_>, OutOfClass> {
-    stream_source(content, VERTEX_STREAM_STAGING, reach).ok_or_else(vertex_staging_refusal)
-}
-
-/// The vertex stream's own refusal for a gather no arm states (`R9q`, `G1-B`).
-///
-/// One spelling for the two readers that ask the question — the record that
-/// states a source ([`vertex_stream_source`]) and the record that only owes the
-/// answer ([`vertex_stream_shape`], R-WS1) — so the arm that stopped reading
-/// cannot answer a different refusal than the arm that reads, which is the whole
-/// of the cut's equivalence claim. The sentence is `R9q`'s, byte for byte.
-fn vertex_staging_refusal() -> OutOfClass {
-    OutOfClass::new(
-        "render_provider_out_of_class_vertex_staging",
-        "a vertex stream the GPU gathers from guest RAM stays on the engine when the \
-         gather is not one registered window: this class mints a stream's bytes through \
-         the owner rail — the staged copy the request holds, or the registered window a \
-         zero-copy bind was cut from — and a gather that is neither has no source this \
-         rail can state",
-    )
+    stream_source(content, VERTEX_STREAM_STAGING, reach).ok_or_else(|| {
+        OutOfClass::new(
+            "render_provider_out_of_class_vertex_staging",
+            "a vertex stream the GPU gathers from guest RAM stays on the engine when the \
+             gather is not one registered window: this class mints a stream's bytes through \
+             the owner rail — the staged copy the request holds, or the registered window a \
+             zero-copy bind was cut from — and a gather that is neither has no source this \
+             rail can state",
+        )
+    })
 }
 
 /// The source the draw's one index stream may be stated from (`R11`).
@@ -14253,16 +14192,16 @@ fn gate_prove_gather() -> bool {
 
 /// The cut's own arm, forced by a test (`None` gives the switch back) — the
 /// shape [`set_gate_prove_gather_arm`] gives its own cut.
-static GATE_PROVE_JOINED_STREAM_ARM: std::sync::atomic::AtomicU8 =
+static ONE_ELECTION_PER_SOURCE_ARM: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
-/// Force the joined vertex stream's proof arm for a test (R-WS1).
+/// Force the one-election-per-source arm for a test (R-WS1).
 ///
 /// `None` restores the switch's own reading. The values are the three states
 /// one byte can carry: unset, off, on.
-pub fn set_gate_prove_joined_stream_arm(arm: Option<bool>) {
+pub fn set_one_election_per_source_arm(arm: Option<bool>) {
     use std::sync::atomic::Ordering::Relaxed;
-    GATE_PROVE_JOINED_STREAM_ARM.store(
+    ONE_ELECTION_PER_SOURCE_ARM.store(
         match arm {
             None => 0,
             Some(false) => 1,
@@ -14272,32 +14211,33 @@ pub fn set_gate_prove_joined_stream_arm(arm: Option<bool>) {
     );
 }
 
-/// Whether a vertex record that lands in a table the walk already stated
-/// *proves* its stream's read instead of making it
-/// ([`GATE_PROVE_JOINED_STREAM`](crate::config::GATE_PROVE_JOINED_STREAM),
+/// Whether one vertex source is elected once rather than once per record
+/// ([`ONE_ELECTION_PER_SOURCE`](crate::config::ONE_ELECTION_PER_SOURCE),
 /// R-WS1).
 ///
 /// **Off unless a control word turns it on**: the round that priced the split
 /// read 4.00 stream copies per stated table against 1.00 kept, at 0.195 µs a
 /// copy inside a 0.538 µs election, over a region that is 54 % a class probe's
-/// (whose whole pass is dropped). Off, every record elects and copies a source
+/// (whose whole pass is dropped). Off, every record elects and reads a source
 /// of its own and every count, bar and landed byte is the path every round
 /// before this increment ran.
 ///
-/// On, a record that joins an existing table takes [`dropped_stream_len`]:
-/// the same election, the same refusals and the same length, with the
-/// windowless gather's copy proved (`stage_run_walk` with no sink) instead of
-/// made. The record that *opens* a table keeps its read on both arms — its
-/// bytes are the ones the pass states — so a walk that states one table of four
-/// records reads one stream instead of four.
+/// On, a record that joins a table already stated *through one source*
+/// ([`one_vertex_source`]) takes the answer that table's own head was given:
+/// the record's source is dropped where it lands, so no second election runs and
+/// the length the record-length rule reads is the head's own. A record that
+/// joins a table through a *different* source, and every record that opens one,
+/// elects and reads exactly as it always did — the predicate is the only thing
+/// that can move an answer, and it is the identity of the election's own
+/// inputs.
 ///
 /// Read once per record, and the walk is handed every draw's probe and every
 /// draw's submission: the environment lookup behind `config::switch` is cached
 /// in a `OnceLock`, and the test-forcing byte above is read first so a rail case
 /// can vary the arm within one process.
-fn gate_prove_joined_stream() -> bool {
+fn one_election_per_source() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    match GATE_PROVE_JOINED_STREAM_ARM.load(Relaxed) {
+    match ONE_ELECTION_PER_SOURCE_ARM.load(Relaxed) {
         1 => return false,
         2 => return true,
         _ => {}
@@ -14305,7 +14245,7 @@ fn gate_prove_joined_stream() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            crate::config::switch(crate::config::GATE_PROVE_JOINED_STREAM),
+            crate::config::switch(crate::config::ONE_ELECTION_PER_SOURCE),
             crate::config::Switch::Off
         )
     })
@@ -18947,14 +18887,27 @@ fn narrow_class<'a>(
         // request's own staged copy) travel into a pass the probe drops.
         //
         // R-WS1's cut, at the same position: a record that lands in a table the
-        // walk has already stated drops the source its own election mints — the
-        // table carries the one its head elected — so the election is asked for
-        // its answer alone ([`dropped_stream_len`]) and the gathered read is
-        // *proved* rather than made. The question is asked before the election
-        // because it decides which election runs.
+        // walk has already stated *through one source* has no second election to
+        // run — the source its own would mint is dropped where the record lands,
+        // and the election that answered the table's head answers this record
+        // (same bind, same window facts, one length). The question is asked
+        // before the election because it decides whether one runs at all.
         let joins = vertex_streams
             .iter()
             .position(|stream| one_vertex_stream(&req.vertex_attributes[stream.head], attribute));
+        // R-WS1: whether this record reads *one source* with the table it lands
+        // in — asked only when the cut is on, because the predicate is a question
+        // about the election the cut skips.
+        let reuses = if one_election_per_source() {
+            joins.filter(|slot| {
+                one_vertex_source(
+                    &req.vertex_attributes[vertex_streams[*slot].head],
+                    attribute,
+                )
+            })
+        } else {
+            None
+        };
         let (source, source_len) = {
             let _walk_streams_attr_source = crate::runtime::drain::frame_span(
                 crate::runtime::drain::FrameSpan::ProvGateWalkStreamsAttrSource,
@@ -18967,11 +18920,24 @@ fn narrow_class<'a>(
             } else {
                 "render_gate_walk_vertex_source_submit_n"
             });
-            let reach =
-                vertex_reach_bytes(req.indexed.is_some(), draw_count, index_highest, stride);
-            if joins.is_some() && gate_prove_joined_stream() {
-                (None, vertex_stream_shape(&attribute.content, reach)?)
+            if let Some(slot) = reuses {
+                // The head's election is this record's answer: same bind, same
+                // window facts, one length. The record's own source is dropped
+                // where it lands, so the walk does not elect — and does not
+                // read — one at all.
+                let len = vertex_streams[slot].source.len();
+                crate::runtime::drain::note_store_route("render_gate_walk_stream_reused_n");
+                crate::runtime::drain::note_store_route_n(
+                    "render_gate_walk_stream_reused_bytes",
+                    len,
+                );
+                (None, len)
             } else {
+                let reach =
+                    vertex_reach_bytes(req.indexed.is_some(), draw_count, index_highest, stride);
+                // Every other record — the one that opens a table, and the one
+                // that joins a table through a *different* source — elects and
+                // reads exactly as it always did.
                 let source = vertex_stream_source(&attribute.content, reach)?;
                 let len = source.len();
                 (Some(source), len)

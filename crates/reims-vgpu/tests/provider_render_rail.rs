@@ -24049,7 +24049,7 @@ fn the_walks_stream_split_counts_its_records_tables_and_asks() {
     // round before the cut read, whatever the cut's own switch says, so the arm
     // is forced off for its own body (`R-WS1`'s proof arm has its own case
     // beside this one).
-    provider_render::set_gate_prove_joined_stream_arm(Some(false));
+    provider_render::set_one_election_per_source_arm(Some(false));
     let stages = two_stream_stages();
     let alignment = host_import_alignment().expect("the owner rail's provider answers");
     let page = usize::try_from(alignment).expect("the alignment fits usize");
@@ -24165,12 +24165,11 @@ fn the_walks_stream_split_counts_its_records_tables_and_asks() {
         (2, 2 * STREAM_BYTES),
         "and the submission pays the same two copies for the same one table: {submit:?}"
     );
-    provider_render::set_gate_prove_joined_stream_arm(None);
+    provider_render::set_one_election_per_source_arm(None);
 }
 
-/// R-WS1: a vertex record that lands in a table the walk has already stated
-/// *proves* its stream's read instead of making it, and the frame is the same
-/// frame.
+/// R-WS1: one vertex source is elected once, not once per record, and the frame
+/// is the same frame.
 ///
 /// The walk states one canonical vertex stream per *fetch table* the request's
 /// layout reads (`one_vertex_stream` groups the attributes of one interleaved
@@ -24182,27 +24181,26 @@ fn the_walks_stream_split_counts_its_records_tables_and_asks() {
 /// 84 611 walks — at 0.195 µs a copy inside a 0.538 µs election, in a region
 /// that is 54 % a class probe's (whose whole pass is dropped by its caller).
 ///
-/// `REIMS_VGPU_GATE_PROVE_JOINED_STREAM` answers a joining record with the
-/// election it always owed — the refusals it can raise and the length the
-/// record-length rule reads — and gets the windowless gather's read *proved*
-/// instead of made: `gathered_stream_len` for the two numbers the copy decides
-/// on, and `stage_run_walk` with no sink for the coverage proof, which is the
-/// same walk `stage_run_bytes` copies through. This case holds the two arms to
-/// each other on the shape the arm is for:
+/// `REIMS_VGPU_GATE_ONE_ELECTION_PER_SOURCE` answers a record that reads **one
+/// source** with its table (`one_vertex_source`: one `runs` allocation, one
+/// window inside it, one `pages` list) out of the election that answered the
+/// table's own head: the record's source is dropped where it lands, so no second
+/// election runs and the length the record-length rule reads is the head's own.
+/// This case holds the two arms to each other on the shape the arm is for:
 ///
 /// - the same draw lands the same frame on both arms, and the same frame the
 ///   engine's own rail lands (the bytes travel from the guest's runs into the
 ///   declaration either way, and the interleaved table is read at both offsets);
-/// - the read is counted once per *table* on the increment arm and once per
-///   *record* on the control arm, while the asks stay one per record on both
-///   (`render_gate_walk_vertex_source_submit_n`) — the population that does not
-///   move with the arm;
+/// - the election runs once per *table* on the increment arm and once per
+///   *record* on the control arm — the copies move with it — while the asks stay
+///   one per record on both (`render_gate_walk_vertex_source_submit_n`), which is
+///   the population that does not move with the arm;
 /// - and the census reads one population across the two arms: `staged` +
-///   `proofs` is the record count and `staged_bytes` + `proven_bytes` is the
-///   bytes those records carry, so the arm that stopped reading is named rather
+///   `reused` is the record count and `staged_bytes` + `reused_bytes` is the
+///   bytes those records state, so the arm that stopped electing is named rather
 ///   than the reading going dark.
 #[test]
-fn the_proved_joined_stream_lands_the_same_frame_and_reads_once_per_table() {
+fn one_election_per_source_lands_the_same_frame_and_elects_once_per_table() {
     use reims_vgpu::backend::provider_compute::host_import_alignment;
 
     /// Three interleaved records: the position `float2` at offset 0 and the
@@ -24269,14 +24267,15 @@ fn the_proved_joined_stream_lands_the_same_frame_and_reads_once_per_table() {
     // *that* frame, not merely each other's.
     let engine = engine_pixels("R-WS1 proved joined stream", &stages, request());
     let run = |arm: Option<bool>| {
-        provider_render::set_gate_prove_joined_stream_arm(arm);
+        provider_render::set_one_election_per_source_arm(arm);
         let before = [
             route_count("render_provider_out_of_class_vertex_staging_staged"),
             route_count("render_provider_out_of_class_vertex_staging_bytes"),
-            route_count("render_gate_walk_stream_proofs_n"),
-            route_count("render_gate_walk_stream_proven_bytes"),
+            route_count("render_gate_walk_stream_reused_n"),
+            route_count("render_gate_walk_stream_reused_bytes"),
             route_count("render_gate_walk_vertex_source_submit_n"),
             route_count("render_gate_walk_stream_tables_n"),
+            route_count("render_gate_walk_vertex_attrs_n"),
         ];
         let frame = match provider_render::submit_render(
             &inputs(&stages, RenderChainRole::SoleOrTail),
@@ -24291,13 +24290,14 @@ fn the_proved_joined_stream_lands_the_same_frame_and_reads_once_per_table() {
         let after = [
             route_count("render_provider_out_of_class_vertex_staging_staged"),
             route_count("render_provider_out_of_class_vertex_staging_bytes"),
-            route_count("render_gate_walk_stream_proofs_n"),
-            route_count("render_gate_walk_stream_proven_bytes"),
+            route_count("render_gate_walk_stream_reused_n"),
+            route_count("render_gate_walk_stream_reused_bytes"),
             route_count("render_gate_walk_vertex_source_submit_n"),
             route_count("render_gate_walk_stream_tables_n"),
+            route_count("render_gate_walk_vertex_attrs_n"),
         ];
-        let delta = std::array::from_fn::<_, 6, _>(|slot| after[slot] - before[slot]);
-        provider_render::set_gate_prove_joined_stream_arm(None);
+        let delta = std::array::from_fn::<_, 7, _>(|slot| after[slot] - before[slot]);
+        provider_render::set_one_election_per_source_arm(None);
         (frame, delta)
     };
     let (control_frame, control) = run(Some(false));
@@ -24317,37 +24317,39 @@ fn the_proved_joined_stream_lands_the_same_frame_and_reads_once_per_table() {
         );
     }
 
-    // The control arm reads one source per record: two copies for the two
-    // records that state one table.
+    // The control arm elects — and reads — one source per record: two copies for
+    // the two records that state one table.
     assert_eq!(
         (control[0], control[2]),
         (2, 0),
-        "the control arm copies once per record and proves nothing: {control:?}"
+        "the control arm elects once per record: {control:?}"
     );
     assert_eq!(
         (control[1], control[3]),
         (2 * BIND_BYTES, 0),
         "and carries the table's bytes twice: {control:?}"
     );
-    // The increment arm reads one source per *table*: the record that opens it
-    // keeps its copy, and the record that joins it proves the read it drops.
+    // The increment arm elects one source per *table*: the record that opens it
+    // keeps its copy, and the record that reads the same source is answered by
+    // the election the table's head already ran.
     assert_eq!(
         (proved[0], proved[2]),
         (1, 1),
-        "the increment arm copies once for the table and proves the record that joins it: \
-         {proved:?}"
+        "the increment arm elects once for the table and reuses it for the record that reads \
+         the same source: {proved:?}"
     );
     assert_eq!(
         (proved[1], proved[3]),
         (BIND_BYTES, BIND_BYTES),
-        "and the census reads one population: the bytes carried plus the bytes proved are the \
-         bytes the two records state: {proved:?}"
+        "and the census reads one population: the bytes carried plus the bytes the skipped \
+         election would have carried are the bytes the two records state: {proved:?}"
     );
-    // The population that does not move: the walk still elects once per record.
+    // The population that does not move: the walk still reads one record per
+    // attribute, states one table for the two, and asks once per record.
     assert_eq!(
-        (control[4], proved[4], control[5], proved[5]),
-        (2, 2, 1, 1),
-        "one ask per record and one table stated, on both arms: {control:?} {proved:?}"
+        (control[4], proved[4], control[5], proved[5], control[6], proved[6]),
+        (2, 2, 1, 1, 2, 2),
+        "two records, one table and one ask per record on both arms: {control:?} {proved:?}"
     );
 }
 

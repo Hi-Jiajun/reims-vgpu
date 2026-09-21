@@ -1622,8 +1622,8 @@ pub const GATE_MODULES_ONE_MEMO: &str = "REIMS_VGPU_GATE_MODULES_ONE_MEMO";
 /// trace makes instead.
 pub const GATE_PROVE_GATHER: &str = "REIMS_VGPU_GATE_PROVE_GATHER";
 
-/// **Whether a vertex stream whose bytes the walk *drops* is proved instead of
-/// read** (`R-WS1`, the walk's stream tables).
+/// **Whether one vertex source is elected once instead of once per record**
+/// (`R-WS1`, the walk's stream tables).
 ///
 /// # The reading it answers
 ///
@@ -1640,34 +1640,36 @@ pub const GATE_PROVE_GATHER: &str = "REIMS_VGPU_GATE_PROVE_GATHER";
 ///
 /// # What `on` does, and what it cannot change
 ///
-/// A record that joins a table already stated asks the *same* election the copy
-/// would have asked (`dropped_stream_len`) for the answer it owes — the
-/// refusals it can raise and the length the record-length rule reads — and gets
-/// the windowless gather's read **proved** rather than made: the same
-/// two-decision arithmetic and the same run walk with no sink
-/// (`stage_run_walk`), so every shape the copy refused is refused now, by the
-/// same slug and sentence, and the length the coverage rules below read is the
-/// length the copy would have carried. The record that *opens* a table keeps
-/// its read on both arms: its bytes are the ones the pass states.
+/// A record that joins a table already stated **through one source**
+/// (`one_vertex_source`: one `runs` allocation, one window inside it, one
+/// `pages` list) has no second election to run. The source its own election
+/// would mint is dropped where the record lands — the table already carries the
+/// one its head elected — and the election that answered the head answers this
+/// record too, because it reads nothing but those fields. So the walk skips it,
+/// and reads the length the record-length rule needs off the table's own source.
+///
+/// A record that joins a table through a *different* source (the one shape the
+/// predicate can refuse) and every record that **opens** a table elect and read
+/// exactly as they always did: its bytes are the ones the pass states.
 ///
 /// The census keeps reading one population across the two arms: the copies that
 /// happen are counted where they always were
 /// (`render_provider_out_of_class_vertex_staging_staged`/`_bytes`) and the
-/// reads that were proved are counted beside them
-/// (`render_gate_walk_stream_proofs_n`/`_proven_bytes`), so
-/// `copies + proofs` is the record population on both arms and
-/// `copied_bytes + proven_bytes` is the bytes those records carry. The shapes
+/// elections that were not run beside them
+/// (`render_gate_walk_stream_reused_n`/`_reused_bytes`), so
+/// `copies + reused` is the record population on both arms and
+/// `copied_bytes + reused_bytes` is the bytes those records state. The shapes
 /// the reach cut answers for (`G1-C`'s declared/copied histograms and the slack
-/// they leave) are charged on both arms, because they are facts about the bind
-/// rather than about the read.
+/// they leave) are charged on the arms that still elect, because they are facts
+/// about the bind rather than about the read.
 ///
 /// # What it costs
 ///
-/// Off is one relaxed load per record and nothing else — the copy, the walk and
-/// every counter are the ones the round before it ran. On adds one pass over
-/// the runs' coordinates per *dropped* read (no bytes, no `Vec`) and removes a
-/// `Vec::with_capacity` plus a `memcpy` from each of them.
-pub const GATE_PROVE_JOINED_STREAM: &str = "REIMS_VGPU_GATE_PROVE_JOINED_STREAM";
+/// Off is one relaxed load per record and nothing else — the election, the copy
+/// and every counter are the ones the round before it ran. On removes the whole
+/// election (its window derivation, its counters and its `Vec`) from every
+/// record that reads its table's own source.
+pub const ONE_ELECTION_PER_SOURCE: &str = "REIMS_VGPU_GATE_ONE_ELECTION_PER_SOURCE";
 }
 
 counts! {

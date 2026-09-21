@@ -1183,22 +1183,11 @@ pub(crate) enum FrameSpan {
     /// reading: a probe states no view, so every byte a probe's bind election
     /// gathered is a read no frame ever named.
     ProvGateWalkStageBuffersProbe = 92,
-    /// The *proof* that stands in one dropped vertex stream's read (`R-WS1`):
-    /// `stream_run_proved`'s `stage_run_walk` with no sink, taken by the record
-    /// that lands in a table the walk has already stated — the arm
-    /// `REIMS_VGPU_GATE_PROVE_JOINED_STREAM` selects.
-    ///
-    /// The pair to [`Self::ProvGateWalkStreamsGather`] on the same bind, and the
-    /// two are read against each other: that bar is the `Vec` and the `memcpy`,
-    /// this one is the answer about them that replaces them where the bytes are
-    /// dropped. Off, this bar is zero and the copy's own is what the round
-    /// before it read.
-    ProvGateWalkStreamsGatherProve = 93,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::ProvGateWalkStreamsGatherProve as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::ProvGateWalkStageBuffersProbe as usize + 1;
 
 /// One byte source the owner mints for the attachment's own declaration, with
 /// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
@@ -1651,7 +1640,6 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     // R-WS1's cut: the proof that replaces one dropped vertex stream's read, on
     // the arm `REIMS_VGPU_GATE_PROVE_JOINED_STREAM` selects -- read against
     // `prov_gate_walk_streams_gather_us_mean`, the copy it is the answer about.
-    "prov_gate_walk_streams_gather_prove_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.
