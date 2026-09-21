@@ -11827,9 +11827,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // class a value it structurally cannot reach, and the readback just
             // paid for is bought for a reader that cannot ask. See
             // `config::SEAM_UNREAD_FRAMES` for the round that priced it.
-            let unread_frames = crate::config::switch(crate::config::SEAM_UNREAD_FRAMES)
-                == crate::config::Switch::On
-                && (req.chain_loads_resident || attachment_window_runs.is_some());
+            // **On by default since 2026-09-21**, once the R-SR2 round had
+            // priced it: with the meter beside it, 67 661 of 67 666 chain read
+            // attempts in one 300 s production round were for a frame the class
+            // cannot read, against a bar of 18 302 µs a frame on the encode half
+            // alone, and `render_provider_resident_source_bytes` stayed zero.
+            // Only the control words turn it off; unset is the skipping arm. See
+            // `config::SEAM_UNREAD_FRAMES`.
+            let unread_frames = !matches!(
+                crate::config::switch(crate::config::SEAM_UNREAD_FRAMES),
+                crate::config::Switch::Off
+            ) && (req.chain_loads_resident || attachment_window_runs.is_some());
             if unread_frames && chain_source_is_engine_resident {
                 crate::runtime::drain::note_store_route("render_provider_unread_frame_chain");
             }

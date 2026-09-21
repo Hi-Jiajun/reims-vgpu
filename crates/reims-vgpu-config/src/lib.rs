@@ -1325,8 +1325,27 @@ pub const FRAME_PROFILE: &str = "REIMS_VGPU_FRAME_PROFILE";
 ///
 /// The arm is a read the class cannot reach, so `on` removes a copy and changes
 /// no decision: the same `RenderRailInputs` reach the same gate with the same
-/// values in every field the gate can read. Off is today's device exactly, and
-/// unset and an unrecognized value are `off`.
+/// values in every field the gate can read.
+///
+/// # What the arm is worth, and why it is now on by default
+///
+/// The R-SR2 round (300 s, production pose, `guest import off`) counted the
+/// reads this arm skips with a content version beside them
+/// ([`SEAM_READ_GENERATION`]): `seam_frame_chain_n` **67 666 attempts in 453
+/// frames — 149.4 a frame**, of which `seam_read_chain_unreachable_n` reads
+/// **67 661 (100.0 %)** — every attempt but five was for a frame the class
+/// cannot read, and its bar `seam_frame_chain_us_mean` stood at **18 302 µs a
+/// frame** on the encode half alone (the probe half is uncharged). The class's
+/// own door counter agrees from the other side:
+/// `render_provider_resident_source_bytes` was **zero for the whole round**,
+/// so not one of those frames was ever used.
+///
+/// **On by default since 2026-09-21** (`sr2b` against the two `sr2`/`sr2c`
+/// controls, one exe, 300 s each); the control words put the pre-cut read back.
+/// The memo the same round priced — serving a repeated `(identity, allocation,
+/// view, version)` — read 79.4 %/80.8 % hit rates but is worth far less, because
+/// a served read still pays its frame's copy into the caller's buffer; see the
+/// round's report.
 pub const SEAM_UNREAD_FRAMES: &str = "REIMS_VGPU_SEAM_UNREAD_FRAMES";
 
 /// **Probe, default off.** `on` counts the present capture's own steps — the
