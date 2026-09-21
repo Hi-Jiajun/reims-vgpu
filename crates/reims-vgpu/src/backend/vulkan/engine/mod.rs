@@ -3072,8 +3072,8 @@ pub fn resident_read_witness(identity: &TargetIdentity) -> Option<ResidentReadWi
     let slot = guard.pools.registry_get(identity)?;
     Some(ResidentReadWitness {
         key_generation: identity.generation(),
-        image: slot.image.as_raw() as u64,
-        view: slot.view.as_raw() as u64,
+        image: slot.image.as_raw(),
+        view: slot.view.as_raw(),
         content_serial: (slot.content_serial != 0).then_some(slot.content_serial),
         content_epoch: slot.content_epoch,
         content_ready: slot.content_ready,

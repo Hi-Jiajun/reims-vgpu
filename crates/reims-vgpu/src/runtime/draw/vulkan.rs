@@ -14648,7 +14648,7 @@ fn note_seam_read_count(seam: SeamReadSeam, count: SeamReadCount, n: u64) {
 /// on the next hit. Observed before, a published write can only make the entry
 /// *unreachable* — the serial never goes back — which costs a hit and can never
 /// cost a frame.
-pub fn note_seam_read_attempt(
+fn note_seam_read_attempt(
     seam: SeamReadSeam,
     identity: &crate::backend::vulkan::engine::TargetIdentity,
     charged: bool,
@@ -14760,7 +14760,7 @@ const SEAM_READ_MEMO_ENTRIES: usize = 8;
 
 /// Meter a read **after** it is taken: `Some(bytes)` is the frame it answered
 /// with, `None` the refusal.
-pub fn note_seam_read_answer(seam: SeamReadSeam, ticket: SeamReadTicket, bytes: Option<u64>) {
+fn note_seam_read_answer(seam: SeamReadSeam, ticket: SeamReadTicket, bytes: Option<u64>) {
     if !seam_read_meter_enabled() {
         return;
     }
@@ -14784,7 +14784,7 @@ pub fn note_seam_read_answer(seam: SeamReadSeam, ticket: SeamReadTicket, bytes: 
 /// `unreachable` is false at the sampled-target seam: a frame declared there
 /// becomes a `TextureSource::OwnedBytes` the trace consumes, so the only way
 /// that read is wasted is a refusal, which that seam cannot know before asking.
-pub fn note_seam_read_unreachable(seam: SeamReadSeam, unreachable: bool, bytes: Option<u64>) {
+fn note_seam_read_unreachable(seam: SeamReadSeam, unreachable: bool, bytes: Option<u64>) {
     if !unreachable || !seam_read_meter_enabled() {
         return;
     }
@@ -20777,7 +20777,6 @@ mod seam_read_meter_tests {
     #[test]
     fn a_frame_the_class_cannot_read_is_counted_with_the_bytes_it_moved() {
         set_seam_read_meter_arm(Some(true));
-        let identity = TargetIdentity::Anonymous { slot: 11 };
         let count = |suffix: SeamReadCount| {
             let name = SEAM_READ_COUNTERS[SeamReadSeam::Chain as usize][suffix as usize];
             crate::runtime::drain::store_route_count(name)
