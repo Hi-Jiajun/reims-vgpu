@@ -1328,6 +1328,43 @@ pub const FRAME_PROFILE: &str = "REIMS_VGPU_FRAME_PROFILE";
 /// values in every field the gate can read. Off is today's device exactly, and
 /// unset and an unrecognized value are `off`.
 pub const SEAM_UNREAD_FRAMES: &str = "REIMS_VGPU_SEAM_UNREAD_FRAMES";
+
+/// **Probe, default off.** `on` counts the present capture's own steps — the
+/// two sources it can be served from, and the first step that refused when
+/// neither has the frame — and, on a refusal, prints one line naming the
+/// registry's own answer for the identity the capture asked under.
+///
+/// # What could not be read off the capture before this
+///
+/// `present_capture FAIL` says one thing: this present found no frame, so the
+/// console keeps its prior retain. That is *a* reading, and it is the one every
+/// report about the frozen window has had to argue from — but it is one word
+/// for four different states, and they have four different repairs:
+///
+/// * the identity the capture asked under is **absent** from the registry, so
+///   nothing has rendered into this surface since it was mapped;
+/// * it is absent while the *same* surface is registered under another
+///   generation (the guest re-mapped it) — a key fault, not a missing target,
+///   and the frame may be sitting in the older image;
+/// * the image is registered and its writer has cleared `content_ready`, so the
+///   frame is late rather than missing;
+/// * the image is ready and the readback itself declined (a texel order this
+///   rail cannot hand the console).
+///
+/// Reading any of those off an aggregate is impossible: the line carries the
+/// presented mid, its geometry and a generation that is the *mapping's*
+/// content generation, none of which names the resident key.
+///
+/// # What it costs, and when it is read
+///
+/// Off is today's device exactly: the counters below are not touched at all and
+/// the detail line is not built. On, one capture attempt adds a handful of
+/// relaxed atomic additions and — only on the refusal this probe exists for —
+/// one registry walk under an engine lock the caller already holds. The detail
+/// line is bounded (`runtime::scanout::capture_probe::MAX_DETAILS`, eight
+/// signatures) and deduplicated, so a boot cannot turn a rare refusal into a
+/// per-present flood.
+pub const CAPTURE_PROBE: &str = "REIMS_VGPU_CAPTURE_PROBE";
 }
 
 counts! {

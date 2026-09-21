@@ -79,7 +79,7 @@ impl Backend for MetalBackend {
         mapping_id: u32,
         width: u32,
         height: u32,
-    ) -> bool {
+    ) -> Result<(), crate::runtime::scanout::CaptureRefusal> {
         crate::runtime::scanout::metal::try_capture_from_resident(
             state, buf, mapping_id, width, height,
         )

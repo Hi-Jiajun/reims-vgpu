@@ -502,7 +502,7 @@ impl Backend for VulkanBackend {
         mapping_id: u32,
         width: u32,
         height: u32,
-    ) -> bool {
+    ) -> Result<(), crate::runtime::scanout::CaptureRefusal> {
         scanout::vulkan::try_capture_from_resident(state, buf, mapping_id, width, height)
     }
 

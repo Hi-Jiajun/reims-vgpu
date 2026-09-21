@@ -825,6 +825,65 @@ impl ResourcePools {
             .unwrap_or((TargetKeyDivergence::Absent, None))
     }
 
+    /// Probe-only: the registry's whole answer for a key that just missed.
+    ///
+    /// The divergence above says *how* the nearest key differs; this says what
+    /// the registry holds — whether the exact key is there and, if so, whether
+    /// anyone has vouched for its pixels, at what extent and in what format —
+    /// and then the surface-keyed population behind it, so a reader can see the
+    /// state the miss happened in instead of inferring it from counters.
+    ///
+    /// Bounded on purpose: the registry's own `registry_pressure` census reads a
+    /// peak of about thirty slots, and this is called once per distinct failure
+    /// signature with the switch on.
+    pub(crate) fn capture_probe_report(&self, identity: &TargetIdentity) -> String {
+        let (how, held) = self.registry_key_divergence(identity);
+        let mut out = format!(
+            "key={how:?} held_generation={}",
+            held.map(|g| g.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        );
+        match self.registry_get(identity) {
+            Some(slot) => out.push_str(&format!(
+                " exact=present {}x{} ready={} scanout_order={} declared={:?} \
+                 allocation={:?} guest_imported={} content_epoch={:?} replaced={}",
+                slot.width,
+                slot.height,
+                slot.content_ready as u8,
+                slot.scanout_order() as u8,
+                slot.format.declared(),
+                slot.format.allocation(),
+                slot.memory.is_guest_imported() as u8,
+                slot.content_epoch,
+                slot.sampled_content_replaced as u8,
+            )),
+            None => out.push_str(" exact=absent"),
+        }
+        // The population this key could have been: surface-keyed slots only,
+        // because a miss here is always asked by a mapper-ref-texture present
+        // and a texture or GVA key cannot be the frame this capture wants.
+        let mut surfaces: Vec<_> = self
+            .registry
+            .iter()
+            .filter_map(|(held, slot)| match held {
+                TargetIdentity::Surface { id, generation, .. } => Some((*id, *generation, slot)),
+                _ => None,
+            })
+            .collect();
+        surfaces.sort_by_key(|(id, generation, _)| (*id, *generation));
+        out.push_str(&format!(" surfaces={}", surfaces.len()));
+        for (id, generation, slot) in surfaces {
+            out.push_str(&format!(
+                " [id={id} gen={generation} {}x{} ready={} fmt={:?}]",
+                slot.width,
+                slot.height,
+                slot.content_ready as u8,
+                slot.format.declared(),
+            ));
+        }
+        out
+    }
+
     /// Return the sampled view for a resident image, at the format the guest's
     /// declaration reaches rather than at the one the bind could spell.
     ///

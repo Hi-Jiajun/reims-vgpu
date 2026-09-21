@@ -25,6 +25,7 @@
 // The Vulkan rail's answers about a present's resident, named rather than
 // re-exported flat — a capture reaches them only through `Backend`, so this
 // module's own code never mentions a rail.
+pub mod capture_probe;
 #[cfg(feature = "backend-metal")]
 pub mod metal;
 #[cfg(feature = "backend-vulkan")]
@@ -59,6 +60,68 @@ pub enum ScanoutCopyResult {
     Unchanged,
     /// Hard failure (bad args).
     Failed,
+}
+
+/// Why a rail's resident-direct capture produced no frame.
+///
+/// One vocabulary for the refusal, owned here rather than by a rail, because
+/// two readers need it and neither may invent its own: the always-on
+/// `present_capture FAIL` line, and [`capture_probe`]'s step census. The
+/// distinction is not cosmetic — these are four different states with four
+/// different repairs, and the single word `no_resident_content` they used to
+/// share is what made a boot's seven refusals unreadable:
+///
+/// * [`Self::NoTarget`] — nothing in the rail's registry names this surface at
+///   any key. The guest has not rendered into it since it was mapped, or the
+///   resident was reclaimed.
+/// * [`Self::KeyGeneration`] / [`Self::KeyGeometry`] / [`Self::KeyOther`] — the
+///   surface *is* registered and the capture asked under another key. A key
+///   fault rather than a missing target: the guest re-mapped or resized it, and
+///   the frame this capture wanted may be sitting in the image under the other
+///   key.
+/// * [`Self::ContentNotReady`] — registered, and no writer has vouched for its
+///   pixels yet. The frame is late rather than missing.
+/// * [`Self::ReadbackDeclined`] — registered and ready, and the rail's own
+///   readback declined (a texel form it cannot hand the console, a device-side
+///   refusal, a short readback).
+/// * [`Self::NoRegistry`] — the rail holds no resident registry at all, so
+///   every present of a rendered surface fails. This is the arm/Metal gap
+///   [`crate::backend::Backend::try_capture_from_resident`] documents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureRefusal {
+    NoTarget,
+    KeyGeneration,
+    KeyGeometry,
+    KeyOther,
+    ContentNotReady,
+    ReadbackDeclined,
+    NoRegistry,
+}
+
+impl CaptureRefusal {
+    /// The word this refusal contributes to `reason=` on the failure channel.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NoTarget => "no_target",
+            Self::KeyGeneration => "key_generation",
+            Self::KeyGeometry => "key_geometry",
+            Self::KeyOther => "key_other",
+            Self::ContentNotReady => "content_not_ready",
+            Self::ReadbackDeclined => "readback_declined",
+            Self::NoRegistry => "no_resident_registry",
+        }
+    }
+
+    /// Every refusal, in the order the probe's summary line prints them.
+    pub const ALL: [CaptureRefusal; 7] = [
+        Self::NoTarget,
+        Self::KeyGeneration,
+        Self::KeyGeometry,
+        Self::KeyOther,
+        Self::ContentNotReady,
+        Self::ReadbackDeclined,
+        Self::NoRegistry,
+    ];
 }
 
 /// Read mapping pages into `dst` without updating present/paint generation.
@@ -255,6 +318,23 @@ pub fn capture_present_frame(
     } else {
         false
     };
+    // The probe's own reading of this step, taken before the rail is asked. A
+    // miss here is one of two states a frozen-window reader has to tell apart:
+    // nothing host-side holds the frame, or the *cession* — an entry that
+    // deliberately holds no bytes because the resident is authoritative. `get`
+    // answers both the same way, so only the cache itself can name the second.
+    // Off by default; a switch that is off touches no counter.
+    if capture_probe::enabled()
+        && !from_host_cache
+        && crate::runtime::surface_cache::surface_ceded_to_resident(
+            state, mapping_id, width, height,
+        )
+    {
+        capture_probe::note_ceded();
+    }
+    if from_host_cache {
+        capture_probe::note_source(capture_probe::Source::HostCache);
+    }
     // Resident-direct capture — the ONLY GPU-content capture source.
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
@@ -278,28 +358,65 @@ pub fn capture_present_frame(
     // Live evidence for the delete: `capture_source resident=51 guest=0` across a
     // full boot (pre-convergence included), zero `present_capture FAIL`.
     //
+    // That reading does not generalise, and the rounds since say so. Every
+    // narrow-import census boot on record refutes the second half of it — v61
+    // (7), md9 (6), sr2 (6) and pt7 (7) each print 6-7 `present_capture FAIL`
+    // lines — while the same binary in the *production* posture (`guest_import
+    // =off`, the pose the user's own VM boots) prints **none**, because the
+    // host cache serves those first presents there. So the old line was a
+    // reading of one posture, promoted to a claim about the pathway. What is
+    // true of every round is narrower and much more useful: the refusals are
+    // the **first** present of each freshly-mapped compositor surface, in one
+    // ~17 s band (t=27-44 s), with `frame_mapping=0` on the first three to four
+    // — i.e. a startup transient at the moment the guest's WindowServer starts
+    // swapping, not a per-present failure. `REIMS_VGPU_CAPTURE_PROBE=on` is what
+    // turns that reading into a census (`capture_probe … resident=N
+    // refused_*=N`) and names the state of each refusal; the comment above the
+    // call is what stops the four states from sharing one word again.
+    //
     // Consequence for a rail with no resident registry: capture fails there and
     // the console holds its prior retain. That is the known arm/Metal breakage
     // this pathway already carries, and it is spelled once as the
     // `Backend::try_capture_from_resident` default rather than as a second vein
     // here.
-    if !from_host_cache
-        && !crate::backend::selected()
+    // The refusal names the state, not the outcome: `no_resident_content` was
+    // one word for four of them, and a boot whose window is frozen reads
+    // differently depending on which one it is — nothing ever rendered here
+    // (the guest presented a surface a display is entitled to show as it
+    // cleared it), the frame is under another key because the guest re-mapped
+    // the surface, the frame is merely late, or this rail's readback cannot
+    // deliver it. See `CaptureRefusal`.
+    let resident = if from_host_cache {
+        Ok(())
+    } else {
+        crate::backend::selected()
             .try_capture_from_resident(state, &mut buf, mapping_id, width, height)
-    {
+    };
+    if let Err(refusal) = resident {
         crate::observe::off(format!(
             "present_capture FAIL mid={mapping_id} {width}x{height} gen={generation} \
-             reason=no_resident_content present_mapping={} frame_mapping={}",
-            state.present.present_mapping, state.present.frame_mapping
+             reason={} present_mapping={} frame_mapping={}",
+            refusal.slug(),
+            state.present.present_mapping,
+            state.present.frame_mapping
         ));
+        // The rail named the state it refused in, and the identity it asked
+        // under, where it refused. What is left for this caller is the source:
+        // the host cache had already missed, so this present found no frame on
+        // either vein. Counted here rather than at the rail because only this
+        // call site knows that *both* sources were asked.
+        capture_probe::note_source(capture_probe::Source::None);
         // Recycle the untouched scratch; the prior retain stays intact.
         state.present.capture_scratch = buf;
         return false;
     }
+    if !from_host_cache {
+        capture_probe::note_source(capture_probe::Source::Resident);
+    }
     // Capture provenance, and there are only two sources to name: the backing
     // surface_cache hit, or the resident. Reaching here with `!from_host_cache`
-    // means `Backend::try_capture_from_resident` returned true above, and it returns true
-    // and there is no third source. This used to read a `last_paint_src`
+    // means `Backend::try_capture_from_resident` returned `Ok` above, and there
+    // is no third source. This used to read a `last_paint_src`
     // provenance field through a five-arm match whose other four arms named
     // `paint_mapping` sub-paths — left over from when this function had a
     // guest-page capture fallback. It no longer calls `paint_mapping` at all, so

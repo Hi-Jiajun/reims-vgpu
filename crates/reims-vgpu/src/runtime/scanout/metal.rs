@@ -14,12 +14,12 @@
 //! Until the Store learned to cede
 //! ([`crate::runtime::mapping_write::FramePublication`]) the Metal rail's
 //! present capture was always served by the BGRA8 host cache, and
-//! `Backend::try_capture_from_resident`'s default `false` was reached only when
-//! that cache had no entry — which the doc on the default called "the known
-//! arm/Metal breakage this pathway already carries". A ceded frame lives in the
-//! resident and nowhere else host-side, so the default would now be reached on
-//! *every* present of a rendered surface and the console would hold its prior
-//! retain forever.
+//! `Backend::try_capture_from_resident`'s default (`NoRegistry`) was reached
+//! only when that cache had no entry — which the doc on the default called "the
+//! known arm/Metal breakage this pathway already carries". A ceded frame lives
+//! in the resident and nowhere else host-side, so the default would now be
+//! reached on *every* present of a rendered surface and the console would hold
+//! its prior retain forever.
 //!
 //! Reached only through [`crate::backend::Backend`]; the drain and the capture
 //! never name this rail.
@@ -56,26 +56,31 @@ pub fn present_resident_carries(
 /// Fill `buf` from the mapping's resident colour target, without any guest-page
 /// scatter.
 ///
-/// On `true` `buf` holds tight BGRA8; on `false` `buf` is untouched. A miss is
-/// an expected steady-state condition (a cold mapping, a target the byte budget
+/// On `Ok` `buf` holds tight BGRA8; on `Err` `buf` is untouched. A miss is an
+/// expected steady-state condition (a cold mapping, a target the byte budget
 /// evicted, a Store that published to the host cache instead), so it is the
-/// caller's `capture_source` census rather than a line per present.
+/// caller's own census rather than a line per present — which is why the
+/// refusal is a value the caller names rather than a log line here.
 pub fn try_capture_from_resident(
     state: &mut DeviceState,
     buf: &mut Vec<u8>,
     mapping_id: u32,
     width: u32,
     height: u32,
-) -> bool {
+) -> Result<(), super::CaptureRefusal> {
+    use super::CaptureRefusal as Refusal;
     let need = buf.len();
     let Some(generation) =
         crate::runtime::surface_cache::frame_generation(state, mapping_id, width, height)
     else {
-        return false;
+        // No host-side frame names this mapping at this geometry, so there is no
+        // resident key to ask with either: the surface the guest presented has
+        // no published content on this rail.
+        return Err(Refusal::NoTarget);
     };
     let key = ResidentColorKey::for_surface(mapping_id, width, height);
     let Some(mut rgba) = resident::read_published_rgba8(&key, generation) else {
-        return false;
+        return Err(Refusal::ContentNotReady);
     };
     if rgba.len() != need {
         // The caller sized `buf` from the same geometry this key carries, so a
@@ -87,7 +92,7 @@ pub fn try_capture_from_resident(
              {width}x{height} have={} need={need}",
             rgba.len()
         ));
-        return false;
+        return Err(Refusal::ReadbackDeclined);
     }
     // The resident is RGBA8 and the console is BGRA8 — see `read_published_rgba8`
     // for why the order is named rather than assumed. In place, because this
@@ -95,5 +100,5 @@ pub fn try_capture_from_resident(
     crate::runtime::draw::swap_rb_channels_in_place(&mut rgba);
     // Move (not copy) the readback in; the untouched scratch returns to the pool.
     state.present.capture_scratch = std::mem::replace(buf, rgba);
-    true
+    Ok(())
 }
