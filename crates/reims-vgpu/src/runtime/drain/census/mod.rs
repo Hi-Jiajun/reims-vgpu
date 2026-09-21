@@ -1572,20 +1572,23 @@ pub(crate) fn note_lease_vec(meter: LeaseVecMeter, n: u64, bytes: u64) {
     FRAME_PROFILE.note_lease_vec(meter, n, bytes);
 }
 
-/// Bank one [`TraceCloneMeter`]'s copy against the open frame.
+/// Bank one [`TraceCloneMeter`]'s value against the open frame: one value
+/// copied (or, on the cut's arm, moved), and the payload it carried.
 ///
-/// `n` is how many copies the call site made (1 everywhere: each site is one
-/// `clone()`), and `bytes` is the payload the copy reproduced — the same
-/// reading [`note_lease_vec`] takes, one level deeper: a cloned descriptor's
-/// weight is every list it allocates plus every byte source it owns.
+/// `bytes` is a closure rather than a number because this walk's weight is not
+/// a `len()`: it is a walk over the value's own lists and byte sources, and a
+/// round whose frame profile is off must not pay for a meter it never prints.
+/// The switch is read before the closure runs, so an off profile costs the call
+/// site one relaxed load — the same terms [`note_lease_vec`]'s cheap arguments
+/// are charged on.
 ///
-/// Charged at the copy's own site, so the count, the bytes and the
+/// Charged at the value's own site, so the count, the bytes and the
 /// [`FrameSpan`] bar beside them are all of the same events.
-pub(crate) fn note_trace_clone(meter: TraceCloneMeter, n: u64, bytes: u64) {
+pub(crate) fn note_trace_clone(meter: TraceCloneMeter, bytes: impl FnOnce() -> u64) {
     if !frame_profile_on() {
         return;
     }
-    FRAME_PROFILE.note_trace_clone(meter, n, bytes);
+    FRAME_PROFILE.note_trace_clone(meter, 1, bytes());
 }
 
 /// Bank one of [`crate::runtime::chain_phase`]'s bars, named by its ordinal.
