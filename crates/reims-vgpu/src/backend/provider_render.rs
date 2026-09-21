@@ -13270,6 +13270,54 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     submit_render_inner(inputs, req, false, None)
 }
 
+/// The cut's own arm, forced by a test (`None` gives the switch back) — the
+/// shape [`set_trace_pass_owned_arm`] and `set_seam_frame_borrow_arm` give
+/// their own cuts.
+///
+/// A switch read through a `OnceLock` cannot be put back, and the arm this
+/// selects is the one thing an equivalence case has to vary **within one
+/// process**: a test that ran one arm in one binary and the other in the next
+/// would be comparing two scenarios rather than two statements of one.
+static GATE_ONE_FRAME_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the class gate's own arm for a test (R-RG1).
+///
+/// `None` restores the switch's own reading. The values are the three states
+/// one byte can carry: unset, off, on.
+pub fn set_gate_one_frame_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    GATE_ONE_FRAME_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the class gate reads one capability frame for the whole call
+/// ([`GATE_ONE_FRAME`](crate::config::GATE_ONE_FRAME), R-RG1).
+///
+/// Read once per gate call, so the environment lookup is cached: the gate is
+/// handed every draw's class probe and every draw's submission, and
+/// `config::switch` parses the variable each time it is asked.
+fn gate_one_frame_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match GATE_ONE_FRAME_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::switch(crate::config::GATE_ONE_FRAME),
+            crate::config::Switch::On
+        )
+    })
+}
+
 fn submit_render_inner(
     inputs: &RenderRailInputs<'_>,
     req: &DrawRequest,
@@ -13299,6 +13347,24 @@ fn submit_render_inner(
     // call and every capability answer the class reads before the walk.
     let _gate_asks =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateAsks);
+    // R-RG1's own cut: every device answer below is a field of the one snapshot
+    // the provider published, so the gate decodes that snapshot **once** here
+    // and the asks that follow read it instead of encoding their own
+    // (`REIMS_VGPU_GATE_ONE_FRAME`, default off). A provider that cannot be read
+    // — or a snapshot the codec refuses — leaves the slot empty on purpose: the
+    // asks then answer exactly where, and exactly how, they did before this
+    // cut. The guard goes back to the wire when the gate ends, so nothing
+    // outside this call reads a frame it did not ask for.
+    let _gate_frame = if gate_one_frame_enabled() {
+        rail().ok().and_then(|rail| {
+            provider_wire::begin_gate_frame(
+                rail.provider.device_epoch(),
+                rail.provider.capabilities(),
+            )
+        })
+    } else {
+        None
+    };
     // The band a widening order sizes the vertex axis on, charged for every
     // request the gate is handed and before any condition answers — so a shape
     // the gate refuses is still in the denominator, and the four arms sum to the
@@ -14313,6 +14379,7 @@ fn submit_render_inner(
         texture_copies.insert(texture.index, written);
     }
     drop(_gate_make);
+    drop(_gate_frame);
     drop(_gate);
     // R42: a kept frame is a *provider* image, and the provider retires them —
     // an eviction, a teardown, a lost device. A load from one that is no longer

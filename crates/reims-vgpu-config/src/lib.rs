@@ -1473,6 +1473,48 @@ pub const SEAM_FRAME_BORROW: &str = "REIMS_VGPU_SEAM_FRAME_BORROW";
 /// each recorded write into a resident adds one relaxed add — a cost paid on
 /// the publish path, never on the encoder's.
 pub const SEAM_READ_GENERATION: &str = "REIMS_VGPU_SEAM_READ_GENERATION";
+
+/// **Default off.** `on` lets one class gate read the provider's capability
+/// frame **once** for the whole call, instead of once per answer it asks.
+///
+/// # The reading that motivated it
+///
+/// R-RG1's split of the sixth round's two unsplit bars (production pose, 300 s,
+/// provider `cb61633`: `rg0`, 414 frames) reads the class gate's own regions
+/// apart for the first time. `prov_gate_asks_us_mean` is **14 849.7 µs per
+/// present frame**, and inside it the three per-module memos are **11 916.5**;
+/// what is left — **2 933.2 µs per frame** — is the capability frames the
+/// twenty-odd device answers are read out of, and the round counts them:
+/// **780 325** encodes over 414 frames, 1 885 a frame and **6.43 per gate
+/// call** (121 280 calls), at **1.56 µs** each.
+///
+/// Each of those encodes is `provider_wire::capabilities_frame`: a deep clone
+/// of the provider's snapshot, an encode of the whole capability frame and a
+/// decode of it back. The gate is handed the same snapshot for every one of
+/// them — the provider publishes it once, at construction — so the frame is
+/// cloned, encoded and decoded six times per call where once answers every
+/// question with the same value.
+///
+/// # What `on` does, and what it cannot change
+///
+/// The gate states the frame it is reading for the call in flight
+/// (`provider_wire::begin_gate_frame`), and an ask whose snapshot compares
+/// **equal**, field for field, to the one that frame was decoded from — with
+/// the same epoch — is handed that frame rather than encoding its own. The
+/// comparison is on the snapshot's value, not on a pointer or a timestamp, and
+/// an equal value encodes to equal bytes and decodes to equal answers because
+/// the codec's encoder is a function of that value. An ask outside a gate, an
+/// ask whose snapshot differs, and an epoch that moved all take the path they
+/// took before this increment; a process that cannot state the frame at all
+/// answers every question at the same place, with the same refusal, as it did.
+///
+/// # What it costs
+///
+/// Off is one relaxed load per gate call and nothing else. On adds one encode
+/// and one decode per **call** — the frame the asks then share — and the two
+/// counters that price the wire (`wire_capability_frames`, the codec's own
+/// `capability_frames`) divide by the calls instead of by the answers.
+pub const GATE_ONE_FRAME: &str = "REIMS_VGPU_GATE_ONE_FRAME";
 }
 
 counts! {
