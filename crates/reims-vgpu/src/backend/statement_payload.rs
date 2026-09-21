@@ -46,14 +46,41 @@ use metal_api_core::statement_payload::{payload_digest, PayloadLedger, PayloadPl
 
 /// The switch a launcher writes to arm the mechanism. **Back to off by
 /// default** (2026-09-22): census v65 flipped it on and read the red line
-/// `draws_skipped_after_engine_refusal = 3 468` — every skip
-/// `refused_by=trace_admission`, with seven `statement_payload_table_full`
-/// refusals preceding them. The sender's ledger and the provider's table
-/// disagree about the table's bound somewhere, and a disagreement kills the
-/// whole statement rather than carrying that declaration's bytes. The cut is
-/// priced (616 488 → 22 285 B a statement) and stays behind this switch until
-/// the two ends are proven to plan alike; unset is off, `1/on/true/yes` arms
-/// it.
+/// `draws_skipped_after_engine_refusal = 3 468`, every skip
+/// `refused_by=trace_admission`, behind seven `statement_payload_table_full`
+/// refusals (six of them the per-pipeline refusal line, which dedupes on
+/// `(pipeline, slug)`, and one that came back through the batch path). A
+/// refusal kills the whole statement rather than carrying that one
+/// declaration's bytes, so six statements were refused once each and re-walked
+/// for the rest of the round.
+///
+/// # What the two ends disagreed about, and what the E tip did about it
+///
+/// Not *which* bound: the sender's ledger read one of its two bounds and the
+/// provider's `declare` read both. A plan's fresh-slot branch returned a slot
+/// number below `PAYLOAD_TABLE_SLOTS` without asking `payload_fits`, on the
+/// reading that a free slot number is room — and the byte bound is the one that
+/// binds first by orders of magnitude. v65's own counters say which:
+/// `stmt_payload_declared_*` reached **531 265 024 B in 100 filings** against a
+/// 512 MiB bound, `stmt_payload_carried_n` stayed **0** for the whole round (a
+/// plan that read the byte bound would have replaced an entry or carried), and
+/// the refusals start at the first payload the remaining 5.6 MB could not hold.
+///
+/// `metal_api_core::statement_payload::PayloadLedger::plan` (E
+/// `feat-payload-bound`, `5ee8ba5`) now reads `payload_fits` on **every**
+/// branch: a fresh slot is room only while the whole budget holds it, past that
+/// the plan replaces the least recently used entry into that entry's own slot,
+/// and a payload even that cannot hold is carried — the policy the module docs
+/// already claimed. The two-ends walk that fails on the old plan and passes on
+/// this one is in that module's own tests
+/// (`the_two_ends_hold_the_same_table_over_the_shape_census_v65_walked`), and
+/// the provider's own caps are a wiring guard again rather than a second policy.
+///
+/// The arm stays here until a census reads the red line at 0 on a pose that
+/// crosses the bound: E-SW3's 120 s arms saw ~500 MB of distinct payloads and
+/// never reached it, which is why the 430 s round is the one that caught it.
+/// The cut is priced (616 488 → 22 285 B a statement). unset is off,
+/// `1/on/true/yes` arms it.
 const SWITCH: &str = "REIMS_VGPU_STATEMENT_PAYLOAD_TABLE";
 
 /// Whether this process states the payload table's arms.
