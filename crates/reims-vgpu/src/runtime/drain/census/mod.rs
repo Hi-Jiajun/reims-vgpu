@@ -824,6 +824,16 @@ pub(crate) enum FrameSpan {
     /// Unlike the eleven others, it carries no counter of its own: the read
     /// count is `seam_read_sample_n`, which is charged by the meter that the
     /// same switch turns on.
+    ///
+    /// # Why it can read *larger* than the parent it was carved out of
+    ///
+    /// The seam's own bars are charged on the encode and not on the walk's
+    /// class-only probe (`seam_charges`), while the read this bar brackets is
+    /// taken on **both** — a record is looked at twice and the frame is bought
+    /// twice. That is not a defect of the bar; it is the only way the round can
+    /// see the probe's half, which no seam bar charged before it. The two
+    /// populations are counted apart as `seam_read_sample_probe_n` and
+    /// `seam_read_sample_encode_n`, and the parent is read against the second.
     SeamSampleRead = 53,
 }
 
