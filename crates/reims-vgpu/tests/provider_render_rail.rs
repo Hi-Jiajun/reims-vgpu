@@ -7880,6 +7880,7 @@ fn the_zero_fill_declaration_arm_lands_the_same_frame_as_the_payload_it_replaces
         vec![0_u8; arm.len()],
         "and the frame is the draw's own, not the zeros both arms begin from"
     );
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
     eprintln!(
         "zero-fill declarations: arm={} payload={} bytes={}",
         hex(&arm),
