@@ -33035,8 +33035,10 @@ fn one_modules_memo_lands_the_same_frame_and_translates_fewer_modules() {
         "render_register_fragment_xlate_n",
         "render_register_fragment_reuse_n",
     ];
-    let snapshot =
-        || ROUTES.map(|route| reims_vgpu::runtime::drain::store_route_count_for_test(route));
+    // The `map` takes the reader itself rather than a closure that calls it:
+    // clippy's site set is one of this cut's gates, and a `redundant closure`
+    // here would be a site the base does not have.
+    let snapshot = || ROUTES.map(reims_vgpu::runtime::drain::store_route_count_for_test);
     let run = |arm: Option<bool>| {
         provider_render::forget_module_memos_for_test();
         provider_render::set_gate_modules_one_memo_arm(arm);
