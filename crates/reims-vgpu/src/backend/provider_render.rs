@@ -18903,28 +18903,7 @@ fn assemble_narrow_record(
                     .and_then(|plan| plan.guest_runs(load_seed_owner_binding()))
                     .expect("the owner plan covers an admitted guest-runs seed"),
             )),
-            NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => {
-                if zero_fill_decl_enabled() {
-                    // The arm's whole point (statement economy W2-A): the
-                    // declaration states the zeros it stands for, so no vector
-                    // is minted here at all and the statement carries a length
-                    // instead of the extent's bytes. The bar is priced with the
-                    // same number the arm that mints them prices, so the two
-                    // arms' readings are read side by side.
-                    crate::runtime::drain::note_byte_arm(
-                        crate::runtime::drain::ByteArmMeter::ZeroMint,
-                        pass.extent,
-                    );
-                    BufferSource::zero_fill(pass.extent)
-                } else {
-                    let zeros = vec![0u8; usize::try_from(pass.extent).unwrap_or(0)];
-                    crate::runtime::drain::note_byte_arm(
-                        crate::runtime::drain::ByteArmMeter::ZeroMint,
-                        u64::try_from(zeros.len()).unwrap_or(u64::MAX),
-                    );
-                    BufferSource::OwnedBytes(zeros)
-                }
-            }
+            NarrowLoad::Clear(_) | NarrowLoad::Resident(_) => clear_attachment_source(pass.extent),
         }
     };
     let declaration = BufferView {
@@ -21437,17 +21416,35 @@ fn production_declaration(production: &ProductionInFlight) -> BufferView {
 /// The source one **in-flight production's** own declaration states.
 ///
 /// The second of the two zero-fill producers (`REIMS_VGPU_ZERO_FILL_DECL`,
-/// statement economy W2-A): a production's declaration is what tells the
-/// provider that the attachment exists for the passes that read it, and nothing
-/// in the submission reads its bytes as content. Off (the shipped default) it
-/// mints the extent's zeros and ships them exactly as before; on, it states
-/// [`BufferSource::zero_fill`] and the provider materializes the same zeros
-/// locally.
+/// statement economy W2-A): see [`clear_attachment_source`] for the first and
+/// for what the two arms read as.
 fn zero_fill_declaration_source(extent: u64) -> BufferSource {
     if zero_fill_decl_enabled() {
         BufferSource::zero_fill(extent)
     } else {
         BufferSource::OwnedBytes(vec![0u8; usize::try_from(extent).unwrap_or(usize::MAX)])
+    }
+}
+
+/// The source one attachment declaration states on its `Clear` / `Resident`
+/// arms (`REIMS_VGPU_ZERO_FILL_DECL`, statement economy W2-A).
+///
+/// The first of the two zero-fill producers. Off — the shipped default — this
+/// mints the extent's zeros and prices them with [`ByteArmMeter::ZeroMint`],
+/// exactly as every round before the cut read; on, it states the contract's
+/// zero-fill arm and prices the same number, so a round can read the two arms'
+/// byte bars side by side while the statement stops carrying the bytes.
+fn clear_attachment_source(extent: u64) -> BufferSource {
+    if zero_fill_decl_enabled() {
+        crate::runtime::drain::note_byte_arm(crate::runtime::drain::ByteArmMeter::ZeroMint, extent);
+        BufferSource::zero_fill(extent)
+    } else {
+        let zeros = vec![0u8; usize::try_from(extent).unwrap_or(0)];
+        crate::runtime::drain::note_byte_arm(
+            crate::runtime::drain::ByteArmMeter::ZeroMint,
+            u64::try_from(zeros.len()).unwrap_or(u64::MAX),
+        );
+        BufferSource::OwnedBytes(zeros)
     }
 }
 
@@ -21532,27 +21529,38 @@ mod zero_fill_decl_switch_tests {
         }
     }
 
-    /// The production declaration's own source, in both arms: the shipped arm
-    /// mints the extent's zeros, the cut's arm states them, and the two stand
-    /// for the same bytes.
+    /// **Both** producers' own source, in both arms: the shipped arm mints the
+    /// extent's zeros, the cut's arm states them, and the two stand for the same
+    /// bytes. The attachment's `Clear` / `Resident` arm and every in-flight
+    /// production's declaration are the cut's two producers, so a case that
+    /// pinned only one of them would leave the other's spelling unread.
     #[test]
     fn a_declaration_states_the_arm_or_carries_the_zeros_it_stands_for() {
         set_zero_fill_decl_arm(Some(false));
-        let payload = zero_fill_declaration_source(16);
+        let payloads = [
+            clear_attachment_source(16),
+            zero_fill_declaration_source(16),
+        ];
         set_zero_fill_decl_arm(Some(true));
-        let arm = zero_fill_declaration_source(16);
+        let arms = [
+            clear_attachment_source(16),
+            zero_fill_declaration_source(16),
+        ];
         set_zero_fill_decl_arm(None);
 
-        assert_eq!(payload, BufferSource::OwnedBytes(vec![0_u8; 16]));
-        assert_eq!(arm, BufferSource::zero_fill(16));
-        // The two sources state the same content: the arm is a checked door
-        // over exactly the payload the shipped arm ships (statement economy
-        // W2-A), and a payload that is not that zero fill is refused by name
-        // rather than declared as zeros.
-        if let BufferSource::OwnedBytes(bytes) = &payload {
+        for (payload, arm) in payloads.iter().zip(arms.iter()) {
+            assert_eq!(*payload, BufferSource::OwnedBytes(vec![0_u8; 16]));
+            assert_eq!(*arm, BufferSource::zero_fill(16));
+            // The two sources state the same content: the arm is a checked door
+            // over exactly the payload the shipped arm ships (statement economy
+            // W2-A), and a payload that is not that zero fill is refused by name
+            // rather than declared as zeros.
+            let BufferSource::OwnedBytes(bytes) = payload else {
+                panic!("the shipped arm of both producers carries the extent's zeros");
+            };
             assert_eq!(
                 BufferSource::zero_fill_of(bytes).expect("the shipped payload is the zero fill"),
-                arm
+                *arm
             );
         }
         assert_eq!(
