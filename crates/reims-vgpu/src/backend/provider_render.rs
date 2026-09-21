@@ -9389,6 +9389,86 @@ pub fn override_render_pass_entry_snapshot(declared: Option<bool>) -> PassEntryS
     }
 }
 
+/// The three facts one fragment module's walk states (R-GM1).
+///
+/// The class gate asks three questions about the draw's **own** fragment module
+/// before it can answer, and each of them was its own memo keyed by the
+/// module's own bytes:
+///
+/// * [`pixel_coordinate_sampler_module`] — whether the module has the
+///   explicit-LOD sibling the texel space executes;
+/// * [`fragment_output_superset_module`] — whether it stores more colour
+///   locations than the class's own contract attaches, which is `true` for
+///   every module but the superset one;
+/// * [`half_capability_module`] — whether it declares the 16-bit shader
+///   capability pair.
+///
+/// The three walks parse the same bytes and translate the same module (the
+/// first two under the device's own policy, the third under
+/// [`SpirvFeaturePolicy::ADMITTING`]), which is three parses and three
+/// translations for three answers about one value. This struct is what the
+/// merged walk answers with instead: one parse, one translation, three facts,
+/// each keeping the default its own memo used when the module could not be read
+/// at all — and those defaults are not one default, which is why they are
+/// spelled in [`Self::UNREADABLE`] rather than derived.
+///
+/// [`SpirvFeaturePolicy::ADMITTING`]: metal_api_vulkan::SpirvFeaturePolicy::ADMITTING
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragmentModuleFacts {
+    /// What [`pixel_coordinate_sampler_module`] answers for this module: the
+    /// translation succeeded and the module has the explicit-LOD sibling.
+    pub executes_pixel_coordinate_samplers: bool,
+    /// What [`fragment_output_superset_module`] answers for this module: the
+    /// reflection declares more than one render target.
+    pub stores_more_than_the_contract: bool,
+    /// What [`half_capability_module`] answers for this module: the module
+    /// declares `Float16` or `Int16`.
+    pub declares_the_16_bit_pair: bool,
+}
+
+impl FragmentModuleFacts {
+    /// The three answers of a module nothing could read: each memo's own
+    /// fail-closed direction, which is not the same one for all three.
+    ///
+    /// A module the translator refuses does not have the sibling the texel
+    /// space needs (`false`), and the capabilities of a module nothing can
+    /// decode are not a question the half walk answers (`false`); the superset
+    /// question is the other way round (`true`), because the class then keeps
+    /// the shape on the engine under its own name instead of handing the
+    /// registration a module it has no account of.
+    pub const UNREADABLE: Self = Self {
+        executes_pixel_coordinate_samplers: false,
+        stores_more_than_the_contract: true,
+        declares_the_16_bit_pair: false,
+    };
+}
+
+/// One fragment module's merged walk, held by the module's own bytes (R-GM1).
+///
+/// The key is the module's bytes because that is what the three memos this
+/// replaces key on: the guest builds a handful of fragment modules per boot and
+/// draws with each of them tens of thousands of times, so the walk is paid once
+/// per distinct module rather than once per draw.
+struct FragmentModuleWalk {
+    /// The AIR entry this walk translated. The key is the module, the entry is
+    /// what the translation actually read out of it — and what a registration
+    /// that wants to take [`Self::stage`] has to name.
+    entry: Option<String>,
+    /// The three answers, as the gate reads them.
+    facts: FragmentModuleFacts,
+    /// The translated stage itself, kept so the register miss path can hand the
+    /// provider a module it would otherwise translate a fourth time.
+    ///
+    /// `Option` and not a plain value because `TranslatedRenderStage` is the
+    /// translator's product: E builds it by translating and the registration
+    /// takes it **by value**, and the type is not `Clone`. The walk therefore
+    /// holds it until the first registration that names this very module and
+    /// entry, and a second pipeline over the same module pays its own
+    /// translation — counted as `render_register_fragment_xlate_n` rather than
+    /// hidden behind the reuse count.
+    stage: Option<TranslatedRenderStage>,
+}
+
 /// Whether this draw's own fragment module can be executed with a
 /// pixel-coordinate sampler (2026-09-19, census v43's `texture_state` axis).
 ///
@@ -9409,8 +9489,14 @@ pub fn override_render_pass_entry_snapshot(declared: Option<bool>) -> PassEntryS
 /// rather than a decline: this is a *candidate* question, and the same failure
 /// would be answered by the registration for a normalized draw, where it keeps
 /// its own slug and sentence.
+///
+/// R-GM1 adds the arm that answers it out of the shared walk
+/// ([`fragment_module_walk`], `REIMS_VGPU_GATE_MODULES_ONE_MEMO`): the fact is
+/// the same one either way, and the memo below stays the path a process that
+/// leaves the switch unset takes.
 fn pixel_coordinate_sampler_module(
-    inputs: &RenderRailInputs<'_>,
+    fragment_air: &[u8],
+    fragment_entry: Option<&str>,
 ) -> Result<bool, ProviderRenderDecline> {
     // R-RG1: one of the three per-module memos the ask region reads, and the
     // one whose customer is a request that states the texel space.
@@ -9420,6 +9506,11 @@ fn pixel_coordinate_sampler_module(
     // is asked on (a texel-space bind, not every request).
     let _mine =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModulePixel);
+    if modules_one_memo_enabled() {
+        return Ok(
+            fragment_module_walk(fragment_air, fragment_entry)?.executes_pixel_coordinate_samplers
+        );
+    }
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail.pixel_sampler_modules.lock().map_err(|_| {
@@ -9428,17 +9519,17 @@ fn pixel_coordinate_sampler_module(
             detail: "the fragment module cache is poisoned".to_owned(),
         }
     })?;
-    if let Some(answer) = modules.get(inputs.fragment_air) {
+    if let Some(answer) = modules.get(fragment_air) {
         return Ok(*answer);
     }
     let answer = (|| -> Option<bool> {
-        let entry = inputs.fragment_entry?;
+        let entry = fragment_entry?;
         // R-GM1's denominator: the times this memo parsed the module itself,
         // charged before the attempt so a refusal counts as one of them.
         crate::runtime::drain::note_store_route("render_gate_module_pixel_parse_n");
         let function = provider_rail
             .device
-            .new_library_with_binary_air(inputs.fragment_air.to_vec())
+            .new_library_with_binary_air(fragment_air.to_vec())
             .ok()?
             .function(entry)
             .ok()?;
@@ -9452,7 +9543,7 @@ fn pixel_coordinate_sampler_module(
         Some(stage.executes_pixel_coordinate_samplers())
     })()
     .unwrap_or(false);
-    modules.insert(inputs.fragment_air.to_vec(), answer);
+    modules.insert(fragment_air.to_vec(), answer);
     Ok(answer)
 }
 
@@ -9477,16 +9568,21 @@ fn pixel_coordinate_sampler_module(
 /// which an unreadable module does not).
 #[cfg(feature = "provider-render")]
 fn fragment_output_superset_module(
-    inputs: &RenderRailInputs<'_>,
+    fragment_air: &[u8],
+    fragment_entry: Option<&str>,
 ) -> Result<bool, ProviderRenderDecline> {
     // R-RG1: the second of the three, asked for every request the gate is
     // handed (its answer is `true` for every module but the superset one).
     let _module =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
     // R-GM1: this memo's own share of the parent above.
-    let _mine = crate::runtime::drain::frame_span(
-        crate::runtime::drain::FrameSpan::ProvGateModuleSuperset,
-    );
+    let _mine =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModuleSuperset);
+    if modules_one_memo_enabled() {
+        return Ok(
+            fragment_module_walk(fragment_air, fragment_entry)?.stores_more_than_the_contract
+        );
+    }
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail
@@ -9496,16 +9592,16 @@ fn fragment_output_superset_module(
             step: "fragment_output_superset_module",
             detail: "the fragment module cache is poisoned".to_owned(),
         })?;
-    if let Some(answer) = modules.get(inputs.fragment_air) {
+    if let Some(answer) = modules.get(fragment_air) {
         return Ok(*answer);
     }
     let answer = (|| -> Option<bool> {
-        let entry = inputs.fragment_entry?;
+        let entry = fragment_entry?;
         // R-GM1's denominator, charged the way the memo above charges its own.
         crate::runtime::drain::note_store_route("render_gate_module_superset_parse_n");
         let function = provider_rail
             .device
-            .new_library_with_binary_air(inputs.fragment_air.to_vec())
+            .new_library_with_binary_air(fragment_air.to_vec())
             .ok()?
             .function(entry)
             .ok()?;
@@ -9519,7 +9615,7 @@ fn fragment_output_superset_module(
         Some(stage.reflection().render_targets.len() > 1)
     })()
     .unwrap_or(true);
-    modules.insert(inputs.fragment_air.to_vec(), answer);
+    modules.insert(fragment_air.to_vec(), answer);
     Ok(answer)
 }
 
@@ -9546,7 +9642,10 @@ fn fragment_output_superset_module(
 /// fragment modules per boot and draws with each of them tens of thousands of
 /// times, so the translation is paid once per module rather than once per draw.
 #[cfg(feature = "provider-render")]
-fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, ProviderRenderDecline> {
+fn half_capability_module(
+    fragment_air: &[u8],
+    fragment_entry: Option<&str>,
+) -> Result<bool, ProviderRenderDecline> {
     // R-RG1: the third, asked for the same population as the memo above it.
     let _module =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
@@ -9554,6 +9653,9 @@ fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, Provide
     // whose translation is E's own capability walk under `ADMITTING`.
     let _mine =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModuleHalf);
+    if modules_one_memo_enabled() {
+        return Ok(fragment_module_walk(fragment_air, fragment_entry)?.declares_the_16_bit_pair);
+    }
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail.half_capability_modules.lock().map_err(|_| {
@@ -9562,17 +9664,17 @@ fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, Provide
             detail: "the fragment module cache is poisoned".to_owned(),
         }
     })?;
-    if let Some(answer) = modules.get(inputs.fragment_air) {
+    if let Some(answer) = modules.get(fragment_air) {
         return Ok(*answer);
     }
     let answer = (|| -> Option<bool> {
-        let entry = inputs.fragment_entry?;
+        let entry = fragment_entry?;
         // R-GM1's denominator, charged the way the two memos above charge
         // theirs, so the three counts are read against each other.
         crate::runtime::drain::note_store_route("render_gate_module_half_parse_n");
         let function = provider_rail
             .device
-            .new_library_with_binary_air(inputs.fragment_air.to_vec())
+            .new_library_with_binary_air(fragment_air.to_vec())
             .ok()?
             .function(entry)
             .ok()?;
@@ -9584,8 +9686,300 @@ fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, Provide
         )
     })()
     .unwrap_or(false);
-    modules.insert(inputs.fragment_air.to_vec(), answer);
+    modules.insert(fragment_air.to_vec(), answer);
     Ok(answer)
+}
+
+/// One fragment module's three facts from **one** parse and **one**
+/// translation (R-GM1, `REIMS_VGPU_GATE_MODULES_ONE_MEMO`).
+///
+/// # Why one walk
+///
+/// The three memos above are three questions about one value: the draw's own
+/// fragment module, keyed by its own bytes, each paying
+/// `Device::new_library_with_binary_air` and a translation before it reads one
+/// field of the result. R-RG1 priced the three together at **11 916.5 µs per
+/// present frame** (peak **1 633 972 µs/window** in the boot's first windows,
+/// steady **543 µs/window**), the largest region inside the class gate, and the
+/// register miss path translates the same module a fourth time. This walk is
+/// that one parse and one translation, with the three facts read out of it.
+///
+/// # What it cannot change
+///
+/// The two request-independent facts are read from the same call the memos made
+/// — `TranslatedRenderStage::translate_with_policy` under
+/// `provider.spirv_feature_policy()` — so they are the same values by
+/// construction. The half-capability fact is E's own walk under
+/// [`SpirvFeaturePolicy::ADMITTING`]: this walk reads the pair out of its own
+/// words when the device's policy **is** that policy (one translation, the
+/// point of the cut), and otherwise calls E's walk and counts it
+/// (`render_gate_module_half_walk_n`) rather than assuming two policies that
+/// differ state the same declarations. A module no translation can read answers
+/// [`FragmentModuleFacts::UNREADABLE`], which is each memo's own default.
+///
+/// [`SpirvFeaturePolicy::ADMITTING`]: metal_api_vulkan::SpirvFeaturePolicy::ADMITTING
+fn fragment_module_walk(
+    fragment_air: &[u8],
+    fragment_entry: Option<&str>,
+) -> Result<FragmentModuleFacts, ProviderRenderDecline> {
+    let provider_rail = rail().map_err(IntoRender::into_render)?;
+    let render_rail = render_rail();
+    // The walk holds the map's guard across the translation, exactly as the
+    // three memos this replaces hold their own: two vCPUs drawing with the same
+    // module wait for one translation instead of paying two, and the
+    // registration below takes the stage out of the same map right after. The
+    // gate never asks for the registration's own lock while this one is held,
+    // so the two orders cannot meet.
+    let mut walks = render_rail.fragment_module_walks.lock().map_err(|_| {
+        ProviderRenderDecline::PipelineCompile {
+            step: "fragment_module_walk",
+            detail: "the fragment module walk cache is poisoned".to_owned(),
+        }
+    })?;
+    if let Some(walk) = walks.get(fragment_air) {
+        return Ok(walk.facts);
+    }
+    let policy = provider_rail.provider.spirv_feature_policy();
+    let mut facts = FragmentModuleFacts::UNREADABLE;
+    let mut stage = None;
+    if let Some(entry) = fragment_entry {
+        // R-GM1's denominator: one parse per module where the three memos
+        // charge one each (`render_gate_module_*_parse_n`), charged before the
+        // attempt so a module that refuses counts as one.
+        crate::runtime::drain::note_store_route("render_gate_module_memo_parse_n");
+        let function = provider_rail
+            .device
+            .new_library_with_binary_air(fragment_air.to_vec())
+            .ok()
+            .and_then(|library| library.function(entry).ok());
+        if let Some(function) = function {
+            crate::runtime::drain::note_store_route("render_gate_module_memo_xlate_n");
+            let translated = TranslatedRenderStage::translate_with_policy_and_layout(
+                RenderStage::Fragment,
+                &function,
+                policy,
+                metal2vulkan::reflect::DescriptorLayout::default(),
+            )
+            .ok();
+            if let Some(translated) = translated.as_ref() {
+                facts.executes_pixel_coordinate_samplers =
+                    translated.executes_pixel_coordinate_samplers();
+                facts.stores_more_than_the_contract =
+                    translated.reflection().render_targets.len() > 1;
+            }
+            facts.declares_the_16_bit_pair = match translated.as_ref() {
+                Some(translated) if policy == metal_api_vulkan::SpirvFeaturePolicy::ADMITTING => {
+                    module_spirv_declares_the_16_bit_pair(translated.spirv())
+                }
+                // A policy that is not the admitting one: the half fact keeps
+                // E's own walk, which translates the module a second time under
+                // `ADMITTING`. Counted, not assumed away — a device whose policy
+                // differs from `ADMITTING` pays two translations per module in
+                // this arm and one in the arm a satisfying device takes.
+                _ => {
+                    crate::runtime::drain::note_store_route("render_gate_module_half_walk_n");
+                    TranslatedRenderStage::declared_shader_capabilities(
+                        RenderStage::Fragment,
+                        &function,
+                    )
+                    .map(|declared| declared.declares_half())
+                    .unwrap_or(false)
+                }
+            };
+            stage = translated;
+        }
+    }
+    walks.insert(
+        fragment_air.to_vec(),
+        FragmentModuleWalk {
+            entry: fragment_entry.map(str::to_owned),
+            facts,
+            stage,
+        },
+    );
+    Ok(facts)
+}
+
+/// Whether one module's translated words declare the 16-bit shader capability
+/// pair (R-GM1).
+///
+/// E's walk ([`TranslatedRenderStage::declared_shader_capabilities`]) takes the
+/// module's `Function`, translates it under `SpirvFeaturePolicy::ADMITTING` and
+/// scans the words it produced; the scan itself is private to E. The merged walk
+/// has already translated the module under that same policy when the device's
+/// policy is the admitting one, so all it needs from the pair is the scan — and
+/// the scan is a pure function of the words: `OpCapability` is a two-word
+/// instruction whose only operand is the capability number, legal only in the
+/// module's declaration section.
+///
+/// This reader is that walk reduced to the pair the gate asks about, with E's
+/// structural rules kept whole — word aligned, a valid header, a two-word
+/// `OpCapability`, a walk that stops at the first `OpFunction`, and a `false`
+/// for a malformed instruction rather than "the walk found nothing" — because a
+/// caller must not read a refusal as a declaration. The two are pinned to each
+/// other on the fixture corpus by
+/// `the_merged_walk_states_the_same_three_facts_as_the_three_memos`
+/// (`crates/reims-vgpu/tests/provider_render_rail.rs`), which translates under
+/// `ADMITTING` itself and compares this reader with E's walk.
+fn module_spirv_declares_the_16_bit_pair(spirv: &[u8]) -> bool {
+    /// `OpCapability`, which carries one capability operand.
+    const OP_CAPABILITY: u32 = 17;
+    /// `OpFunction`, where the module's declaration section ends.
+    const OP_FUNCTION: u32 = 54;
+    /// `OpCapability Float16`.
+    const CAPABILITY_FLOAT16: u32 = 9;
+    /// `OpCapability Int16`.
+    const CAPABILITY_INT16: u32 = 10;
+    /// The SPIR-V magic word, in the first word of every module.
+    const MAGIC: u32 = 0x0723_0203;
+
+    if !spirv.len().is_multiple_of(4) {
+        return false;
+    }
+    let words = spirv.len() / 4;
+    let word = |index: usize| -> u32 {
+        u32::from_le_bytes(
+            spirv[index * 4..index * 4 + 4]
+                .try_into()
+                .expect("four-byte chunk"),
+        )
+    };
+    if words < 5 || word(0) != MAGIC {
+        return false;
+    }
+    let mut declares = false;
+    let mut cursor = 5;
+    while cursor < words {
+        let header = word(cursor);
+        let count = (header >> 16) as usize;
+        let opcode = header & 0xffff;
+        let Some(end) = cursor
+            .checked_add(count)
+            .filter(|end| count != 0 && *end <= words)
+        else {
+            return false;
+        };
+        if opcode == OP_FUNCTION {
+            break;
+        }
+        if opcode == OP_CAPABILITY {
+            if count != 2 {
+                return false;
+            }
+            let capability = word(cursor + 1);
+            if capability == CAPABILITY_FLOAT16 || capability == CAPABILITY_INT16 {
+                declares = true;
+            }
+        }
+        cursor = end;
+    }
+    declares
+}
+
+/// The two arms of R-GM1's walk, and the two capability readers, for one
+/// module. Tests only.
+#[doc(hidden)]
+pub struct FragmentModuleArms {
+    /// What the three separate memos answer — the path a process that leaves
+    /// the switch unset takes.
+    pub separate: FragmentModuleFacts,
+    /// What the merged walk answers.
+    pub merged: FragmentModuleFacts,
+    /// The merged walk's own capability reader over a translation under
+    /// `SpirvFeaturePolicy::ADMITTING`, and E's own capability walk for the same
+    /// module. Both are `None` when the module does not translate even there.
+    pub reader_under_admitting: Option<bool>,
+    pub e_walk: Option<bool>,
+}
+
+/// Both arms' answers about one fragment module, for the equivalence cases
+/// (R-GM1). Tests only.
+///
+/// The rail's own arm switch changes which walk the *gate* takes, but the two
+/// answers are about one module and one device, so they can be read side by side
+/// in one process — which is what
+/// `the_merged_walk_states_the_same_three_facts_as_the_three_memos` does for
+/// every fixture whose module exercises one of the three facts.
+#[doc(hidden)]
+pub fn fragment_module_arms_for_test(
+    fragment_air: &[u8],
+    fragment_entry: &str,
+) -> Result<FragmentModuleArms, ProviderRenderDecline> {
+    let separate = FragmentModuleFacts {
+        executes_pixel_coordinate_samplers: pixel_coordinate_sampler_module(
+            fragment_air,
+            Some(fragment_entry),
+        )?,
+        stores_more_than_the_contract: fragment_output_superset_module(
+            fragment_air,
+            Some(fragment_entry),
+        )?,
+        declares_the_16_bit_pair: half_capability_module(fragment_air, Some(fragment_entry))?,
+    };
+    let merged = fragment_module_walk(fragment_air, Some(fragment_entry))?;
+    let provider_rail = rail().map_err(IntoRender::into_render)?;
+    let function = provider_rail
+        .device
+        .new_library_with_binary_air(fragment_air.to_vec())
+        .map_err(|error| ProviderRenderDecline::PipelineCompile {
+            step: "fragment_module_probe",
+            detail: error.to_string(),
+        })?
+        .function(fragment_entry)
+        .map_err(|error| ProviderRenderDecline::PipelineCompile {
+            step: "fragment_module_probe",
+            detail: error.to_string(),
+        })?;
+    let translated = TranslatedRenderStage::translate_with_policy(
+        RenderStage::Fragment,
+        &function,
+        metal_api_vulkan::SpirvFeaturePolicy::ADMITTING,
+    )
+    .ok();
+    let reader_under_admitting = translated
+        .as_ref()
+        .map(|translated| module_spirv_declares_the_16_bit_pair(translated.spirv()));
+    let e_walk =
+        TranslatedRenderStage::declared_shader_capabilities(RenderStage::Fragment, &function)
+            .ok()
+            .map(|declared| declared.declares_half());
+    Ok(FragmentModuleArms {
+        separate,
+        merged,
+        reader_under_admitting,
+        e_walk,
+    })
+}
+
+/// Forget the memos and the registration cache this cut is about, for the two
+/// equivalence cases (R-GM1). Tests only.
+///
+/// Every one of them is a pure memo: the three module maps and the merged walk
+/// are keyed by the fragment module's own bytes, the registration cache by the
+/// request's contract, and dropping one only re-pays the work it memoized — no
+/// answer can change, because each answer is a function of the same inputs the
+/// memo was filled from. The case that needs this is the register arm of the
+/// cut: a reuse is paid only on a pipeline **miss**, so a scenario whose
+/// pipeline an earlier test in the same process already registered would read
+/// nothing there, and the two arms would not be measured on the same work.
+#[doc(hidden)]
+pub fn forget_module_memos_for_test() {
+    let rail = render_rail();
+    if let Ok(mut modules) = rail.pixel_sampler_modules.lock() {
+        modules.clear();
+    }
+    if let Ok(mut modules) = rail.fragment_output_superset_modules.lock() {
+        modules.clear();
+    }
+    if let Ok(mut modules) = rail.half_capability_modules.lock() {
+        modules.clear();
+    }
+    if let Ok(mut walks) = rail.fragment_module_walks.lock() {
+        walks.clear();
+    }
+    if let Ok(mut pipelines) = rail.pipelines.lock() {
+        pipelines.clear();
+    }
 }
 
 /// The highest vertex one indexed draw's own index bytes name, over the first
@@ -13077,6 +13471,15 @@ struct RenderRail {
     /// fragment module because the guest builds few and draws with each of them
     /// many times.
     half_capability_modules: Mutex<HashMap<Vec<u8>, bool>>,
+    /// One merged walk per distinct fragment module: the three facts the class
+    /// gate reads about it, and the translation they were read from (R-GM1).
+    ///
+    /// The map the three memos above are the switch-off path of. It is keyed
+    /// the way they are — by the module's own bytes — and holds the translated
+    /// stage beside the facts so the register miss path can hand the provider
+    /// the very module the gate just read instead of translating it a fourth
+    /// time (`REIMS_VGPU_GATE_MODULES_ONE_MEMO`).
+    fragment_module_walks: Mutex<HashMap<Vec<u8>, FragmentModuleWalk>>,
 }
 
 /// Cache key of one registered render pipeline: everything the registration
@@ -13349,6 +13752,56 @@ fn gate_one_frame_enabled() -> bool {
         !matches!(
             crate::config::switch(crate::config::GATE_ONE_FRAME),
             crate::config::Switch::Off
+        )
+    })
+}
+
+/// The cut's own arm, forced by a test (`None` gives the switch back) — the
+/// shape [`set_gate_one_frame_arm`] gives its own cut.
+static GATE_MODULES_ONE_MEMO_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the merged fragment-module walk for a test (R-GM1).
+///
+/// `None` restores the switch's own reading. The values are the three states
+/// one byte can carry: unset, off, on.
+pub fn set_gate_modules_one_memo_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    GATE_MODULES_ONE_MEMO_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the class gate reads one fragment module's three facts out of one
+/// parse and one translation
+/// ([`GATE_MODULES_ONE_MEMO`](crate::config::GATE_MODULES_ONE_MEMO), R-GM1).
+///
+/// **Off unless a control word turns it on**: the round's control arm is the
+/// two-paths-per-module pose every round before this increment ran, and the
+/// three memos' own bars and counts
+/// (`prov_gate_module_*_us_mean`, `render_gate_module_*_parse_n` /
+/// `_xlate_n`) are what the increment arm is read against. Only
+/// `1/on/true/yes` turn it on.
+///
+/// Read once per module question, so the environment lookup is cached: the gate
+/// is handed every draw's class probe and every draw's submission, and
+/// `config::switch` parses the variable each time it is asked.
+fn modules_one_memo_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match GATE_MODULES_ONE_MEMO_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::switch(crate::config::GATE_MODULES_ONE_MEMO),
+            crate::config::Switch::On
         )
     })
 }
@@ -13686,10 +14139,12 @@ fn submit_render_inner(
         false => false,
         true => match declared_render_pixel_coordinate_sampler() {
             Ok(false) => false,
-            Ok(true) => match pixel_coordinate_sampler_module(inputs) {
-                Ok(answer) => answer,
-                Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
-            },
+            Ok(true) => {
+                match pixel_coordinate_sampler_module(inputs.fragment_air, inputs.fragment_entry) {
+                    Ok(answer) => answer,
+                    Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+                }
+            }
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
         },
     };
@@ -13792,14 +14247,15 @@ fn submit_render_inner(
     // `draws_skipped_after_engine_refusal`. Everything else answers `true`
     // without asking the frame at all, so no record reaches the provider any
     // earlier than it did.
-    let render_fragment_output_superset = match fragment_output_superset_module(inputs) {
-        Ok(false) => true,
-        Ok(true) => match declared_render_fragment_output_superset() {
-            Ok(declared) => declared,
+    let render_fragment_output_superset =
+        match fragment_output_superset_module(inputs.fragment_air, inputs.fragment_entry) {
+            Ok(false) => true,
+            Ok(true) => match declared_render_fragment_output_superset() {
+                Ok(declared) => declared,
+                Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+            },
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
-        },
-        Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
-    };
+        };
     // The 16-bit shader capability pair (2026-09-20, census v48's LPF
     // pipeline): the sixteenth device answer this rail asks *before* the gate,
     // and the second whose candidate is a fact about the *module* rather than
@@ -13815,14 +14271,15 @@ fn submit_render_inner(
     // the superset fragment interface's answer is used, because a module the
     // provider cannot translate at all is one no attachment list has an
     // opinion about.
-    let render_half_capabilities = match half_capability_module(inputs) {
-        Ok(false) => true,
-        Ok(true) => match declared_render_half_capabilities() {
-            Ok(declared) => declared,
+    let render_half_capabilities =
+        match half_capability_module(inputs.fragment_air, inputs.fragment_entry) {
+            Ok(false) => true,
+            Ok(true) => match declared_render_half_capabilities() {
+                Ok(declared) => declared,
+                Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
+            },
             Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
-        },
-        Err(decline) => return RenderRailOutcome::ProviderDeclined(decline),
-    };
+        };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
     // R-RG1 closes the ask region here and opens the walk's own bar, so the two
@@ -22346,6 +22803,34 @@ const FRAGMENT_STAGE_COUNTERS: StageRouteCounters = StageRouteCounters {
     xlate: "render_register_fragment_xlate_n",
 };
 
+/// The fragment stage a registration may hand the provider instead of
+/// translating it again (R-GM1, `REIMS_VGPU_GATE_MODULES_ONE_MEMO`).
+///
+/// The class gate has already translated this module — it read the three facts
+/// out of that very translation a few calls earlier — and the fragment stage of
+/// a registration is translated against the same descriptor layout
+/// (`DescriptorLayout::default`: the namespace split is the *vertex* stage's
+/// layout) under the same device policy. The one thing that has to match is
+/// what the translation actually read: the AIR **entry**, because the map is
+/// keyed by the module's bytes and one library can carry more than one entry.
+///
+/// `None` is every other case, and each of them keeps the path it had: a
+/// registration outside the cut, a module the gate never walked, an entry the
+/// walk did not read, a walk whose translation refused, and a second pipeline
+/// over a module whose stage the first registration already took — that one
+/// pays its own translation, charged as `render_register_fragment_xlate_n`.
+fn take_fragment_module_stage(
+    fragment_air: &[u8],
+    fragment_entry: &str,
+) -> Option<TranslatedRenderStage> {
+    let mut walks = render_rail().fragment_module_walks.lock().ok()?;
+    let walk = walks.get_mut(fragment_air)?;
+    if walk.entry.as_deref() != Some(fragment_entry) {
+        return None;
+    }
+    walk.stage.take()
+}
+
 /// Register (or look up) the request's own translated pipeline pair.
 ///
 /// The contract is built from the *request*, not from the AIR: the attachment
@@ -22501,14 +22986,28 @@ fn register_render_pipeline(
         vertex_layout,
         None,
     )?;
-    let fragment = stage(
-        inputs.fragment_air,
-        &pass.fragment_entry,
-        "fragment_stage",
-        RenderStage::Fragment,
-        metal2vulkan::reflect::DescriptorLayout::default(),
-        Some(FRAGMENT_STAGE_COUNTERS),
-    )?;
+    // R-GM1: the module the class gate's walk already translated, when it is
+    // this one and this entry — the fourth read of it inside this admission,
+    // and the one the merge removes. Every other case translates here, exactly
+    // as it did before.
+    let fragment = match if modules_one_memo_enabled() {
+        take_fragment_module_stage(inputs.fragment_air, &pass.fragment_entry)
+    } else {
+        None
+    } {
+        Some(stage) => {
+            crate::runtime::drain::note_store_route("render_register_fragment_reuse_n");
+            stage
+        }
+        None => stage(
+            inputs.fragment_air,
+            &pass.fragment_entry,
+            "fragment_stage",
+            RenderStage::Fragment,
+            metal2vulkan::reflect::DescriptorLayout::default(),
+            Some(FRAGMENT_STAGE_COUNTERS),
+        )?,
+    };
     let digest = SemanticDigest::new(
         "reims-provider-render-v1",
         format!(
