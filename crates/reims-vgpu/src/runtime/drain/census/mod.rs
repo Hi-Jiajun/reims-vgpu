@@ -1030,11 +1030,22 @@ pub(crate) enum FrameSpan {
     /// this point having answered every question, and the pass it builds is
     /// dropped by its caller (`render_gate_walk_probe_n` is that population).
     ProvGateWalkTail = 78,
+    /// The walk one gathered read is *proved* by inside [`Self::ProvGateWalk`]:
+    /// `stage_run_len`, the same run walk [`Self::LeaseGatherBytes`] makes with
+    /// no bytes read, on the arm `REIMS_VGPU_GATE_PROVE_GATHER` selects
+    /// (`R-GW1`).
+    ///
+    /// The pair to [`Self::LeaseGatherBytes`], and the two are read against each
+    /// other: that bar is the copy, this one is the answer about the copy that
+    /// replaces it on the increment arm — and the bytes it proves are the bytes
+    /// the copy would have carried, so a round can say what a read cost from
+    /// what it costs to decide whether to make it.
+    GateGatherProof = 79,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::ProvGateWalkTail as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::GateGatherProof as usize + 1;
 
 /// One byte source the owner mints for the attachment's own declaration, with
 /// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
@@ -1460,6 +1471,10 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     "prov_gate_walk_streams_us_mean",
     "prov_gate_walk_copies_us_mean",
     "prov_gate_walk_tail_us_mean",
+    // R-GW1's cut: the proof that replaces one gathered read on the arm
+    // `REIMS_VGPU_GATE_PROVE_GATHER` selects, read against `lease_gather_bytes`
+    // -- the copy it is the answer about.
+    "gate_gather_proof_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.
