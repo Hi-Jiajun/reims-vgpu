@@ -1041,11 +1041,153 @@ pub(crate) enum FrameSpan {
     /// the copy would have carried, so a round can say what a read cost from
     /// what it costs to decide whether to make it.
     GateGatherProof = 79,
+    /// `narrow_class`'s index arm inside [`Self::ProvGateWalkStreams`]
+    /// (`R-WS1`): the two doors on `req.indexed` (a zero count, a `baseVertex`),
+    /// the index format, the stream's own source election and the `G1-B`
+    /// coverage rule that weighs the bytes this rail read against the indices
+    /// the draw names.
+    ///
+    /// # Why the parent was not enough
+    ///
+    /// R-GW1 split the walk into nine regions and left `walk_streams` as one
+    /// number — **916 µs/frame** at the steady p50 on the arm that had stopped
+    /// reading sampled textures (48 % of that arm's whole walk), against
+    /// **4.87 stream gathers per walk**. The region holds three mechanisms that
+    /// a cut is chosen between and that the one number cannot tell apart: this
+    /// arm (one per indexed draw), the attribute loop (3.94 records per walk)
+    /// and the two proofs that close the tables. This bar and the two beside it
+    /// ([`Self::ProvGateWalkStreamsAttrs`], [`Self::ProvGateWalkStreamsProofs`])
+    /// are disjoint, so their sum against the parent is an identity a reader can
+    /// check before believing any one of them.
+    ProvGateWalkStreamsIndex = 80,
+    /// `highest_index` inside [`Self::ProvGateWalkStreamsIndex`] (`R-WS1`): the
+    /// decode of the index stream's own values, read once per indexed walk
+    /// because the draw's reach and the two coverage proofs below need the
+    /// highest vertex the bytes name.
+    ///
+    /// Nested deliberately: the decode belongs to the arm that elected the
+    /// bytes, and the region above it is what the arm is worth against the walk.
+    /// It is a bar of its own because it is the one part of the index arm a cut
+    /// can *not* move to a proof: the reach it feeds is arithmetic over values
+    /// somebody has to read.
+    ProvGateWalkStreamsIndexDecode = 81,
+    /// The per-attribute loop inside [`Self::ProvGateWalkStreams`] (`R-WS1`):
+    /// one record per attribute the request's layout declares, holding the step
+    /// function, the format, the stride rule, the draw's own reach, the stream's
+    /// source election and the table the record lands in.
+    ///
+    /// The population is the walk's own denominator
+    /// (`render_gate_walk_vertex_attrs_n`, 391 948 records over 99 597 walks in
+    /// the round that priced this split), so the parent's µs/frame divide into
+    /// a per-record reading here rather than into a per-walk one.
+    ProvGateWalkStreamsAttrs = 82,
+    /// One record's own source election inside [`Self::ProvGateWalkStreamsAttrs`]
+    /// (`R-WS1`): the reach cut and `vertex_stream_source` — the staged arm, the
+    /// registered window, or the windowless gather this rail reads out of the
+    /// runs.
+    ///
+    /// Nested, and priced apart from the record's own rules and table, because
+    /// this is where the allocation and the bytes are: a record whose stream is
+    /// the request's own staged copy pays none of this, and one whose stream is
+    /// a gather pays all of it ([`Self::ProvGateWalkStreamsGather`] below holds
+    /// the copy itself).
+    ProvGateWalkStreamsAttrSource = 83,
+    /// The table a record lands in inside [`Self::ProvGateWalkStreamsAttrs`]
+    /// (`R-WS1`): the `one_vertex_stream` walk over the tables already built,
+    /// and the `Vec` the record's own attributes are pushed into.
+    ///
+    /// The walk is quadratic in the request's attribute count (each record is
+    /// compared against every table before it), which is why it is priced
+    /// separately from the record's rules: an attribute list is one entry per
+    /// location and a table list is one per stream, so the two numbers are not
+    /// the same population.
+    ProvGateWalkStreamsAttrTable = 84,
+    /// The copy a stream's own gather makes inside
+    /// [`Self::ProvGateWalkStreamsAttrSource`] and
+    /// [`Self::ProvGateWalkStreamsIndex`] (`R-WS1`): `stage_run_bytes` — the
+    /// `Vec` and the `memcpy` the `StreamSource::Copied` arm carries, charged
+    /// once per stream this rail reads itself (the index stream included, whose
+    /// copy the decode above is made from).
+    ///
+    /// Nested inside whichever arm made it, the way
+    /// [`Self::ProvGateWalkCopies`] is nested inside the load arm that copies a
+    /// run list: the question it answers is "how much of a record's source
+    /// election is the copy" rather than "how big is the region".
+    ProvGateWalkStreamsGather = 85,
+    /// The two proofs that close the stream tables inside
+    /// [`Self::ProvGateWalkStreams`] (`R-WS1`): the `G1-B` coverage rule over
+    /// the streams this rail read itself, and `R-VI1`'s surplus-stream rule
+    /// beside the non-indexed span.
+    ///
+    /// Disjoint from the two arms above, and cheap per stream by construction —
+    /// both are arithmetic over the lengths the tables already hold — so this
+    /// bar is what tells a round that the region's money is in the reads and not
+    /// in the rules that weigh them.
+    ProvGateWalkStreamsProofs = 86,
+    /// The whole of [`Self::ProvGateWalkStreams`] again, charged **only** for the
+    /// walks whose pass is dropped (`R-WS1`).
+    ///
+    /// A class probe walks the shape to answer the class and its caller keeps
+    /// only In/OutOfClass (R42): the pass the walk built — every stream, every
+    /// stage buffer, every sampled texture — is dropped where it is returned.
+    /// That makes the probe's share of the region the *cut* candidate this split
+    /// is for, and a nested arm bar is the only way to price it without moving
+    /// the parent's own number (which the previous round's readings are compared
+    /// against). The population is `render_gate_walk_probe_n`.
+    ProvGateWalkStreamsProbe = 87,
+    /// `stage_buffer_gate`'s opening inside
+    /// [`Self::ProvGateWalkStageBuffers`] (`R-WS1`): the statement the request's
+    /// two stages make, the slot no stage reads, the empty answer, the canonical
+    /// ordering and the per-stage ceiling.
+    ///
+    /// The stage-buffer region was priced as one number by R-GW1 (**441 µs/frame**
+    /// against **2.55 gathers per walk**) and holds two mechanisms a cut has to
+    /// choose between: this one, which is paid once per walk whatever the bind
+    /// count, and the per-declaration loop below, which is paid once per
+    /// `[[buffer(N)]]` the two stages declare.
+    ProvGateWalkStageBuffersStatement = 88,
+    /// The per-declaration loop inside [`Self::ProvGateWalkStageBuffers`]
+    /// (`R-WS1`): the duplicate, folded-set-0 and vertex-layout rules, the
+    /// declaration's own footprint proof, the bytes-or-windows election and the
+    /// push.
+    ///
+    /// One record per declared stage buffer
+    /// (`render_gate_walk_stage_buffer_decls_n`), so the region's µs divide into
+    /// a per-declaration reading rather than the per-walk one the parent gives.
+    ProvGateWalkStageBuffersBinds = 89,
+    /// The footprint proof inside [`Self::ProvGateWalkStageBuffersBinds`]
+    /// (`R-WS1`): the static ceiling or the affine access set evaluated over the
+    /// draw's own invocation counts, and the required-bytes rule beside it.
+    ///
+    /// Nested inside the record, because the proof belongs to the declaration
+    /// rather than to the walk, and it is the one part of the record that is
+    /// arithmetic over the *index bytes* — the reads an affine declaration makes
+    /// are the index stream's own ([`Self::ProvGateWalkStreamsIndex`]), and this
+    /// bar is what says whether the declaration paid for them again.
+    ProvGateWalkStageBuffersProof = 90,
+    /// The bytes a stage buffer's own gather carries inside
+    /// [`Self::ProvGateWalkStageBuffersBinds`] (`R-WS1`): the windows the ledger
+    /// derives for the bind's runs, the copy `stage_run_bytes` makes when it
+    /// derives none, and the refusal the two of them fall through to.
+    ///
+    /// The sibling of [`Self::ProvGateWalkStreamsGather`] on the same mechanism
+    /// (a windowless gather read out of the bind's own runs) and the same
+    /// question: this region's 2.55 gathers per walk carry 98 bytes each in the
+    /// round that priced them, so what the bar reads is the call, the `Vec` and
+    /// the counters — not the memcpy.
+    ProvGateWalkStageBuffersGather = 91,
+    /// The whole of [`Self::ProvGateWalkStageBuffers`] again, charged **only**
+    /// for the walks whose pass is dropped (`R-WS1`).
+    ///
+    /// The stage-buffer half of [`Self::ProvGateWalkStreamsProbe`], and the same
+    /// reading: a probe states no view, so every byte a probe's bind election
+    /// gathered is a read no frame ever named.
+    ProvGateWalkStageBuffersProbe = 92,
 }
 
 /// Number of [`FrameSpan`] slots, derived from the enum so a variant added
 /// without a name below cannot silently drop out of the line.
-const FRAME_SPANS: usize = FrameSpan::GateGatherProof as usize + 1;
+const FRAME_SPANS: usize = FrameSpan::ProvGateWalkStageBuffersProbe as usize + 1;
 
 /// One byte source the owner mints for the attachment's own declaration, with
 /// its own slot in the count/byte tables beside [`FrameSpan::AttachDeclare`].
@@ -1475,6 +1617,26 @@ const SPAN_NAMES: [&str; FRAME_SPANS] = [
     // `REIMS_VGPU_GATE_PROVE_GATHER` selects, read against `lease_gather_bytes`
     // -- the copy it is the answer about.
     "gate_gather_proof_us_mean",
+    // R-WS1: the two regions R-GW1 left as single numbers -- the stream tables
+    // and the stage buffers -- split into the mechanisms their own code already
+    // has. The three stream arms are disjoint (their sum against
+    // `prov_gate_walk_streams_us_mean` is an identity), the two nested slots
+    // inside them (the index decode, a record's source election, the gather's
+    // own copy) name the reads a cut can move, and the two `*_probe` bars price
+    // the half of each region whose pass is dropped.
+    "prov_gate_walk_streams_index_us_mean",
+    "prov_gate_walk_streams_index_decode_us_mean",
+    "prov_gate_walk_streams_attrs_us_mean",
+    "prov_gate_walk_streams_attr_source_us_mean",
+    "prov_gate_walk_streams_attr_table_us_mean",
+    "prov_gate_walk_streams_gather_us_mean",
+    "prov_gate_walk_streams_proofs_us_mean",
+    "prov_gate_walk_streams_probe_us_mean",
+    "prov_gate_walk_stage_buffers_statement_us_mean",
+    "prov_gate_walk_stage_buffers_binds_us_mean",
+    "prov_gate_walk_stage_buffers_proof_us_mean",
+    "prov_gate_walk_stage_buffers_gather_us_mean",
+    "prov_gate_walk_stage_buffers_probe_us_mean",
 ];
 
 /// One `frame_profile` line per this many milliseconds of presents.

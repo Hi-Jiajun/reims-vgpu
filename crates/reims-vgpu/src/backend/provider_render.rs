@@ -7255,7 +7255,16 @@ fn stream_run_bytes(
     }
     let declared = source.total_len;
     let len = reach.map_or(declared, |reach| reach.min(declared));
-    let copy = stage_run_bytes(source, len, GatherSite::Stream)?;
+    // R-WS1: the copy itself, as its own arm of the walk's stream region — the
+    // `Vec`, the run walk and the `memcpy`, once per stream this rail reads
+    // itself (a vertex fetch table or the index array). Priced inside
+    // `stage_run_bytes`' two site counters, which are on the same call.
+    let copy = {
+        let _walk_streams_gather = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvGateWalkStreamsGather,
+        );
+        stage_run_bytes(source, len, GatherSite::Stream)?
+    };
     // The census' own reading of this arm: one route per bind that took it and
     // one byte total beside it, so a boot can say how much of the streams' own
     // traffic the CPU gather carries and what it costs per bind — beside the
@@ -10994,6 +11003,14 @@ fn stage_buffer_gate<'a>(
     stage_buffer_per_stage_ceiling: Option<usize>,
     stage_buffer_binding_range: bool,
 ) -> Result<NarrowStageBuffers<'a>, OutOfClass> {
+    // R-WS1: the region's opening, paid once per walk whatever the bind count —
+    // the statement the two stages make, the slot no stage reads, the empty
+    // answer, the canonical ordering and the per-stage ceiling. Priced apart
+    // from the per-declaration loop below because the two scale with different
+    // populations (one walk, one `[[buffer(N)]]`).
+    let _walk_stage_buffers_statement = crate::runtime::drain::frame_span(
+        crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffersStatement,
+    );
     // The one statement this request's two stages make (R9m): `declared` is
     // what the contract, the pass's own views and the wire frame are built
     // from, and `unstated` is the class's own account of what the statement
@@ -11054,6 +11071,21 @@ fn stage_buffer_gate<'a>(
             counted.sentence(),
         ));
     }
+    drop(_walk_stage_buffers_statement);
+    // R-WS1: the per-declaration loop's arm of the region — one record per
+    // `[[buffer(N)]]` the two stages declare, so the region's µs divide by the
+    // declarations rather than by the walks.
+    let _walk_stage_buffers_binds = crate::runtime::drain::frame_span(
+        crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffersBinds,
+    );
+    // The loop's own denominator, read off the ordered statement rather than
+    // counted inside the loop (R-WS1): a shape refused by one of the rules below
+    // still declared the declarations the statement carries, and the two counts
+    // have to be one population.
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_stage_buffer_decls_n",
+        u64::try_from(ordered.len()).unwrap_or(u64::MAX),
+    );
     let mut out: Vec<NarrowStageBuffer<'a>> = Vec::with_capacity(ordered.len());
     // The index bytes an affine proof reads, at most once per gate evaluation
     // (R47): the arm is a property of the draw's index view, so a second affine
@@ -11177,25 +11209,35 @@ fn stage_buffer_gate<'a>(
         // trace's own index bytes, the non-indexed one out of the request's own
         // `vertex_count`, which is the count the contract reads for a draw that
         // names its vertices `0..vertices`.
-        let (proof, max_bytes) = match &declaration.footprint {
-            StageBufferFootprint::Static { max_bytes } => (
-                FootprintProof::Static {
-                    max_bytes: *max_bytes,
-                },
-                Some(*max_bytes),
-            ),
-            StageBufferFootprint::Affine { accesses } => {
-                // A refusal of the index *view* itself (a gather no one
-                // registered window covers, a window whose bytes the owner rail
-                // will not hand back) is the index stream's own answer and
-                // travels under its own name: `?` and not a footprint sentence,
-                // because the fact that stopped this draw is not the proof's
-                // arithmetic.
-                let Some(counts) = stage_buffer_affine_counts(req, &mut index_bytes)? else {
-                    return Err(OutOfClass::owned(
-                        "render_provider_out_of_class_stage_buffer_footprint",
-                        format!(
-                            "a draw whose {} stage declares a [[buffer({})]] argument with an \
+        //
+        // R-WS1: the proof's own arm of the record, because it is the one part
+        // of it that is arithmetic over the *index bytes* — an affine
+        // declaration reads the index stream's own copy (cached in
+        // `index_bytes`), and this bar says what that proof cost beside the
+        // bytes it weighed.
+        let (proof, max_bytes) = {
+            let _walk_stage_buffers_proof = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffersProof,
+            );
+            match &declaration.footprint {
+                StageBufferFootprint::Static { max_bytes } => (
+                    FootprintProof::Static {
+                        max_bytes: *max_bytes,
+                    },
+                    Some(*max_bytes),
+                ),
+                StageBufferFootprint::Affine { accesses } => {
+                    // A refusal of the index *view* itself (a gather no one
+                    // registered window covers, a window whose bytes the owner rail
+                    // will not hand back) is the index stream's own answer and
+                    // travels under its own name: `?` and not a footprint sentence,
+                    // because the fact that stopped this draw is not the proof's
+                    // arithmetic.
+                    let Some(counts) = stage_buffer_affine_counts(req, &mut index_bytes)? else {
+                        return Err(OutOfClass::owned(
+                            "render_provider_out_of_class_stage_buffer_footprint",
+                            format!(
+                                "a draw whose {} stage declares a [[buffer({})]] argument with an \
                              affine footprint stays on the engine when the draw's own invocation \
                              counts cannot be stated over the index bytes the trace carries — \
                              bytes that stop short of the indices this draw fetches, or a \
@@ -11203,50 +11245,51 @@ fn stage_buffer_gate<'a>(
                              canonical contract bounds the proof over the trace's own index bytes \
                              and refuses a count nothing states (`buffer_footprint_axis_invalid` \
                              / `StageBufferFootprintProofUnsupported`)",
-                            stage.name(),
-                            declaration.index,
-                        ),
-                    ));
-                };
-                let Some(required) = stage_buffer_affine_required_bytes(accesses, counts) else {
-                    return Err(OutOfClass::owned(
-                        "render_provider_out_of_class_stage_buffer_footprint",
-                        format!(
-                            "a draw whose {} stage declares a [[buffer({})]] argument with an \
+                                stage.name(),
+                                declaration.index,
+                            ),
+                        ));
+                    };
+                    let Some(required) = stage_buffer_affine_required_bytes(accesses, counts)
+                    else {
+                        return Err(OutOfClass::owned(
+                            "render_provider_out_of_class_stage_buffer_footprint",
+                            format!(
+                                "a draw whose {} stage declares a [[buffer({})]] argument with an \
                              affine footprint stays on the engine when the proof's bound cannot be \
                              evaluated over this draw: {} access(es) over the draw's own \
                              invocation counts either overflow the byte extent or name an axis a \
                              draw does not have, and the contract refuses such a proof by name",
-                            stage.name(),
-                            declaration.index,
-                            accesses.len(),
-                        ),
-                    ));
-                };
-                (
-                    FootprintProof::Affine {
-                        accesses: accesses.clone(),
-                    },
-                    Some(required),
-                )
-            }
-            // The whole-binding arm (R48, E-SB3): the translation stated no
-            // reach, and the device declared that it executes such a
-            // declaration by binding the request's own window whole. The
-            // contract says `FootprintProof::BindingRange`, which publishes no
-            // byte ceiling — so the pair below hands the bind's bytes over
-            // without a proof comparison, and the walk's `bind`/window/run-list
-            // rules beside it are what still hold the pairing to the request's
-            // own bytes. The arm is asked of the *device* and never assumed:
-            // the fall-through arm below is the census's own refusal, sentence
-            // and proof arithmetic included, byte for byte.
-            StageBufferFootprint::Unstated if stage_buffer_binding_range => {
-                (FootprintProof::BindingRange, None)
-            }
-            StageBufferFootprint::Unstated => {
-                return Err(OutOfClass::owned(
-                    "render_provider_out_of_class_stage_buffer_footprint",
-                    format!(
+                                stage.name(),
+                                declaration.index,
+                                accesses.len(),
+                            ),
+                        ));
+                    };
+                    (
+                        FootprintProof::Affine {
+                            accesses: accesses.clone(),
+                        },
+                        Some(required),
+                    )
+                }
+                // The whole-binding arm (R48, E-SB3): the translation stated no
+                // reach, and the device declared that it executes such a
+                // declaration by binding the request's own window whole. The
+                // contract says `FootprintProof::BindingRange`, which publishes no
+                // byte ceiling — so the pair below hands the bind's bytes over
+                // without a proof comparison, and the walk's `bind`/window/run-list
+                // rules beside it are what still hold the pairing to the request's
+                // own bytes. The arm is asked of the *device* and never assumed:
+                // the fall-through arm below is the census's own refusal, sentence
+                // and proof arithmetic included, byte for byte.
+                StageBufferFootprint::Unstated if stage_buffer_binding_range => {
+                    (FootprintProof::BindingRange, None)
+                }
+                StageBufferFootprint::Unstated => {
+                    return Err(OutOfClass::owned(
+                        "render_provider_out_of_class_stage_buffer_footprint",
+                        format!(
                         "a draw whose {} stage declares a [[buffer({})]] argument stays on the \
                          engine when the translation's reach is unbounded or states no byte range \
                          at all: the canonical contract states stage buffer footprints as a \
@@ -11256,7 +11299,8 @@ fn stage_buffer_gate<'a>(
                         stage.name(),
                         declaration.index,
                     ),
-                ))
+                    ))
+                }
             }
         };
         let Some(bind) = inputs
@@ -11340,6 +11384,14 @@ fn stage_buffer_gate<'a>(
                 ),
             ));
         }
+        // R-WS1: the record's own byte election — the staged copy in hand, the
+        // windows the ledger derives for the bind's runs, or the gather this
+        // rail reads itself when it derives none — priced apart from the rules
+        // above and the proof beside them, because this is the arm that
+        // allocates and reads.
+        let _walk_stage_buffers_gather = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffersGather,
+        );
         let mut bytes = match bind.content {
             BufferContent::Bytes(bytes) => Some(Cow::Borrowed(bytes.as_slice())),
             // A gather the GPU would perform from guest RAM is not staged
@@ -11457,7 +11509,11 @@ fn stage_buffer_gate<'a>(
             bytes,
             windows,
         });
+        // R-WS1: the record's election and its push are one arm, so the timer
+        // closes here rather than at the end of the loop body.
+        drop(_walk_stage_buffers_gather);
     }
+    drop(_walk_stage_buffers_binds);
     Ok(NarrowStageBuffers {
         buffers: out,
         index_bytes,
@@ -18280,6 +18336,19 @@ fn narrow_class<'a>(
     let _walk_stage_buffers = crate::runtime::drain::frame_span(
         crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffers,
     );
+    // R-WS1: the same region again, charged only for the calls whose pass is
+    // dropped (`render_gate_walk_probe_n` is the population). A probe's stage
+    // buffer election gathers its binds' bytes into a pass nobody states, so
+    // this nested bar and the one on the stream region are the two halves of
+    // the same question: how much of each region is read for a class answer
+    // that carries no view.
+    let _walk_stage_buffers_probe = if class_only {
+        crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvGateWalkStageBuffersProbe,
+        )
+    } else {
+        None
+    };
     let NarrowStageBuffers {
         buffers: stage_buffers,
         index_bytes: index_window_bytes,
@@ -18307,6 +18376,7 @@ fn narrow_class<'a>(
     // module refuses keeps the engine under its own name ([`sampled_textures`]).
     // R-GW1: the stage-buffer section closes; the sampled declarations are the
     // next region.
+    drop(_walk_stage_buffers_probe);
     drop(_walk_stage_buffers);
     let _walk_sampling =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkSampling);
@@ -18450,8 +18520,29 @@ fn narrow_class<'a>(
     drop(_walk_rules_raster);
     let _walk_streams =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkStreams);
+    // R-WS1: the same region, charged a second time for the calls whose pass is
+    // dropped. A class probe (R42) walks the shape for its class and nothing
+    // else — its caller keeps In/OutOfClass — so the streams it gathers and the
+    // stage buffers it copies are bytes no frame will ever name. Nested rather
+    // than a second region, because the parent's own number has to stay
+    // comparable with the round that priced the region (916 µs/frame at the
+    // steady p50); the population is `render_gate_walk_probe_n`.
+    let _walk_streams_probe = if class_only {
+        crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvGateWalkStreamsProbe,
+        )
+    } else {
+        None
+    };
     let (draw_count, index_stream, index_highest) = match req.indexed.as_ref() {
         Some(index) => {
+            // R-WS1: the index half of the region, and its own denominator —
+            // one per walk that states an index stream, so the arm's µs divide
+            // by the draws that have it rather than by every walk.
+            let _walk_streams_index = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvGateWalkStreamsIndex,
+            );
+            crate::runtime::drain::note_store_route("render_gate_walk_index_arm_n");
             if index.index_count == 0 {
                 return Err(OutOfClass::new(
                     "render_provider_out_of_class_index_count_zero",
@@ -18486,6 +18577,16 @@ fn narrow_class<'a>(
             // affine proof already weighed) or the one this gate finds by
             // itself — the fact the `G1-B` coverage rule further down reads.
             let affine_index_read = index_window_bytes.is_some();
+            // R-WS1: this arm's own asks, told apart by the caller that made
+            // them. The pass a probe builds is dropped, so a source election a
+            // probe makes is a read (or a window derivation) no frame names —
+            // and the two populations are what a cut that answers a probe's
+            // shape without materializing bytes has to move.
+            crate::runtime::drain::note_store_route(if class_only {
+                "render_gate_walk_index_source_probe_n"
+            } else {
+                "render_gate_walk_index_source_submit_n"
+            });
             let index_source = match index_window_bytes {
                 Some(bytes) => StreamSource::Copied(bytes),
                 None => index_stream_source(&index.content)?,
@@ -18544,9 +18645,17 @@ fn narrow_class<'a>(
             // A window that still travels as a lease (`R11`) is guest RAM this
             // arm has not read (`None`), which is the pre-R47 boundary the
             // surplus-stream proof keeps.
-            let index_highest = index_source
-                .trace_owned()
-                .and_then(|bytes| highest_index(bytes, index.index_type, index.index_count));
+            // R-WS1: the decode is the one part of this arm no proof replaces —
+            // the reach below is arithmetic over the values themselves — so it
+            // is priced apart from the election that handed the bytes over.
+            let index_highest = {
+                let _walk_streams_index_decode = crate::runtime::drain::frame_span(
+                    crate::runtime::drain::FrameSpan::ProvGateWalkStreamsIndexDecode,
+                );
+                index_source
+                    .trace_owned()
+                    .and_then(|bytes| highest_index(bytes, index.index_type, index.index_count))
+            };
             (
                 index.index_count,
                 Some(NarrowIndexStream {
@@ -18623,6 +18732,12 @@ fn narrow_class<'a>(
     }
     let mut vertex_streams: Vec<NarrowVertexStream<'_>> =
         Vec::with_capacity(req.vertex_attributes.len());
+    // R-WS1: the per-attribute loop's own arm of the region. The per-walk `Vec`
+    // above is deliberately outside it: what this bar prices is the records, and
+    // the table they land in is priced apart below.
+    let _walk_streams_attrs = crate::runtime::drain::frame_span(
+        crate::runtime::drain::FrameSpan::ProvGateWalkStreamsAttrs,
+    );
     for (head, attribute) in req.vertex_attributes.iter().enumerate() {
         // R-GW1: the record loop's own denominator — one per attribute the
         // request's layout declares, charged where the loop body starts so a
@@ -18666,8 +18781,27 @@ fn narrow_class<'a>(
         // as the owner's lease: those records are stated by bytes nobody has
         // read, so the copy stays the declared one and the coverage rule below
         // keeps the draw on the engine.
-        let reach = vertex_reach_bytes(req.indexed.is_some(), draw_count, index_highest, stride);
-        let source = vertex_stream_source(&attribute.content, reach)?;
+        //
+        // R-WS1: the record's own source election, priced apart from its rules
+        // and its table. This is the arm a probe pays for nothing: the bytes
+        // [`vertex_stream_source`] mints (a `Vec` out of the runs, or the
+        // request's own staged copy) travel into a pass the probe drops.
+        let source = {
+            let _walk_streams_attr_source = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvGateWalkStreamsAttrSource,
+            );
+            // The arm's own asks, told apart by the caller (R-WS1): one per
+            // attribute of a probe, one per attribute of a submission, so a
+            // round can read how much of the region's gather is a probe's.
+            crate::runtime::drain::note_store_route(if class_only {
+                "render_gate_walk_vertex_source_probe_n"
+            } else {
+                "render_gate_walk_vertex_source_submit_n"
+            });
+            let reach =
+                vertex_reach_bytes(req.indexed.is_some(), draw_count, index_highest, stride);
+            vertex_stream_source(&attribute.content, reach)?
+        };
         if source.len() < stride {
             return Err(OutOfClass::new(
                 "render_provider_out_of_class_vertex_short",
@@ -18683,19 +18817,43 @@ fn narrow_class<'a>(
             offset: u64::from(attribute.offset),
             format,
         };
-        match vertex_streams
-            .iter_mut()
-            .find(|stream| one_vertex_stream(&req.vertex_attributes[stream.head], attribute))
+        // R-WS1: the table the record lands in, priced apart from its rules.
+        // The walk is one comparison per table already built (quadratic in the
+        // attribute count), and the arm that starts a table mints the `Vec` its
+        // attributes are pushed into — the region's own per-record allocation.
         {
-            Some(stream) => stream.attributes.push(stated),
-            None => vertex_streams.push(NarrowVertexStream {
-                stride,
-                head,
-                source,
-                attributes: vec![stated],
-            }),
+            let _walk_streams_attr_table = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvGateWalkStreamsAttrTable,
+            );
+            match vertex_streams
+                .iter_mut()
+                .find(|stream| one_vertex_stream(&req.vertex_attributes[stream.head], attribute))
+            {
+                Some(stream) => stream.attributes.push(stated),
+                None => vertex_streams.push(NarrowVertexStream {
+                    stride,
+                    head,
+                    source,
+                    attributes: vec![stated],
+                }),
+            }
         }
     }
+    drop(_walk_streams_attrs);
+    // The loop's own product, read off the table it built rather than counted
+    // inside it (R-WS1): one per fetch table the walk stated, which is the
+    // denominator the two proofs below are read against.
+    crate::runtime::drain::note_store_route_n(
+        "render_gate_walk_stream_tables_n",
+        u64::try_from(vertex_streams.len()).unwrap_or(u64::MAX),
+    );
+    // R-WS1: the two proofs that close the tables are their own arm of the
+    // region — both are arithmetic over the lengths the tables already hold, so
+    // this bar is what tells a round the region's money is in the reads and not
+    // in the rules that weigh them.
+    let _walk_streams_proofs = crate::runtime::drain::frame_span(
+        crate::runtime::drain::FrameSpan::ProvGateWalkStreamsProofs,
+    );
 
     // G1-B: the streams this increment *reads* owe the provider's own coverage
     // proof, and this is the one place both of its numbers are in hand.
@@ -18870,6 +19028,11 @@ fn narrow_class<'a>(
     // [`NarrowPass::views`] is the same sum read back at completion time.
     // R-GW1: the stream region closes; the tail (the pool budget and the pass
     // the walk hands back) is the last region.
+    drop(_walk_streams_proofs);
+    // R-WS1: the probe's own reading of the same region closes with it. Both
+    // timers are closed before the parent's, so the nested bars are inside the
+    // number they are read against.
+    drop(_walk_streams_probe);
     drop(_walk_streams);
     let _walk_tail =
         crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalkTail);

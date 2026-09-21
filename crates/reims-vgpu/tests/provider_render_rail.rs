@@ -24003,6 +24003,165 @@ fn a_vertex_stream_the_ledger_leaves_windowless_is_gathered_from_its_runs() {
     );
 }
 
+/// R-WS1: the walk's stream region, split into the populations a cut is chosen
+/// from — and the one reading the split was built to expose.
+///
+/// `walk_streams` was a single number until this round: R-GW1 priced it at
+/// **916 µs/frame** on the arm that had stopped reading sampled textures
+/// (48 % of that arm's whole walk) against **4.87 stream gathers per walk**,
+/// and the only thing that number could name was the region. Four facts the
+/// walk already had, and one bar each, is what turns it into a cut:
+///
+/// - the **records**: one per attribute the request's layout declares
+///   (`render_gate_walk_vertex_attrs_n`), which is the population the attribute
+///   loop's bar is read against;
+/// - the **tables** those records land in
+///   (`render_gate_walk_stream_tables_n`), which is a *different* population —
+///   `one_vertex_stream` groups the attributes of one interleaved guest stream
+///   into one canonical stream, so a request may declare more records than the
+///   layout it states;
+/// - the **asks**, told apart by the caller a walk serves
+///   (`render_gate_walk_vertex_source_{probe,submit}_n`): a probe's pass is
+///   dropped by its caller (R42), so the bytes its election gathers are bytes
+///   no frame names — the same reading the rounded `*_probe` bars carry in a
+///   census, pinned here where it can be counted;
+/// - the **index arm**, one per walk that states an index stream
+///   (`render_gate_walk_index_arm_n`).
+///
+/// The shape is the two-stream fixture's, with the two attributes rewired to
+/// **one** bind: `one_vertex_stream` compares the `Arc` the two share rather
+/// than the bytes, so this is one table read at two locations — and today's
+/// walk makes **two** copies for it, because the record that joins an existing
+/// table elects its own source before it asks whether it needs one
+/// (`render_provider_out_of_class_vertex_staging_staged` and `…_bytes` move by
+/// two binds and two streams' bytes per walk). That unequal pair of numbers is
+/// the reading this split exists for: a copy whose bytes the walk drops is a
+/// read the guest never sees.
+#[test]
+fn the_walks_stream_split_counts_its_records_tables_and_asks() {
+    use reims_vgpu::backend::provider_compute::host_import_alignment;
+
+    /// Three `float2` records, the reviewed triangle's own stream bytes.
+    const STREAM_BYTES: u64 = 24;
+
+    let _guard = engine_test_session();
+    let stages = two_stream_stages();
+    let alignment = host_import_alignment().expect("the owner rail's provider answers");
+    let page = usize::try_from(alignment).expect("the alignment fits usize");
+    let mut owner = AlignedHost::new(2 * page, page);
+    owner.as_mut_slice()[..STREAM_BYTES as usize].copy_from_slice(&position_records());
+    let mapping = owner.pointer as usize;
+    let mapping_len = 2 * page as u64;
+    // The production pose's own source: one live host run over the stream's own
+    // bytes and no `pages`, which is the arm this rail reads itself.
+    let content = BufferContent::GuestRuns(engine::GuestRunSource {
+        runs: std::sync::Arc::new(vec![engine::GuestRun::in_mapping(
+            mapping,
+            mapping_len,
+            0,
+            STREAM_BYTES,
+        )
+        .expect("the stream's own bytes are inside the mapping")]),
+        source_offset: 0,
+        total_len: STREAM_BYTES,
+        row_length_texels: 0,
+        pages: None,
+        direct_image: None,
+    });
+    // Two locations, one table: the same content `Arc` at the same stride and
+    // step is one canonical stream (`one_vertex_stream`), which is the grouping
+    // the guest's own interleaved descriptor states.
+    let attribute = |location: u32| VertexAttributeResource {
+        location,
+        binding: location,
+        format: VertexAttributeFormat::parse(MTL_FORMAT_VERTEX_FLOAT2)
+            .expect("Float2 is a vertex format"),
+        offset: 0,
+        stride: 8,
+        step_function: VertexStepFunction::PerVertex,
+        step_rate: 1,
+        content: content.clone(),
+    };
+    let request = || {
+        let mut req = narrow_request(MTL_FORMAT_RGBA8_UNORM);
+        req.vertex_attributes = vec![attribute(0), attribute(1)];
+        req
+    };
+    const ROUTES: [&str; 9] = [
+        "render_gate_walk_vertex_attrs_n",
+        "render_gate_walk_stream_tables_n",
+        "render_gate_walk_index_arm_n",
+        "render_gate_walk_vertex_source_probe_n",
+        "render_gate_walk_vertex_source_submit_n",
+        "render_gate_walk_index_source_probe_n",
+        "render_gate_walk_index_source_submit_n",
+        "render_provider_out_of_class_vertex_staging_staged",
+        "render_provider_out_of_class_vertex_staging_bytes",
+    ];
+    // The `map` takes the reader itself rather than a closure: clippy's site set
+    // is one of this round's gates, and a redundant closure would be a site the
+    // base does not have.
+    let snapshot = || ROUTES.map(route_count);
+    let delta = |before: [u64; ROUTES.len()], after: [u64; ROUTES.len()]| {
+        std::array::from_fn::<_, { ROUTES.len() }, _>(|slot| after[slot] - before[slot])
+    };
+
+    // 1. The probe: the walk answers the class, and its own asks are named.
+    let before = snapshot();
+    assert_eq!(
+        provider_render::render_class_probe(
+            &inputs(&stages, RenderChainRole::SoleOrTail),
+            &request()
+        ),
+        provider_render::RenderClassProbe::InClass,
+        "the two-location, one-table shape is in class"
+    );
+    let probe = delta(before, snapshot());
+    // 2. The same request submitted: the same walk, whose pass is stated.
+    let before = snapshot();
+    let _ =
+        provider_render::submit_render(&inputs(&stages, RenderChainRole::SoleOrTail), &request());
+    let submit = delta(before, snapshot());
+
+    eprintln!("R-WS1 stream split: probe={probe:?} submit={submit:?}");
+    for (label, read) in [("probe", probe), ("submission", submit)] {
+        assert_eq!(
+            read[0], 2,
+            "the {label} reads one record per declared attribute: {read:?}"
+        );
+        assert_eq!(
+            read[1], 1,
+            "and states one table for the two records that share the bind: {read:?}"
+        );
+        assert_eq!(
+            read[2], 1,
+            "the indexed fixture's walk states one index stream: {read:?}"
+        );
+    }
+    assert_eq!(
+        (probe[3], probe[4], probe[5], probe[6]),
+        (2, 0, 1, 0),
+        "a probe's asks are the probe's own — two vertex elections and the index \
+         election, none of them a submission's: {probe:?}"
+    );
+    assert_eq!(
+        (submit[3], submit[4], submit[5], submit[6]),
+        (0, 2, 0, 1),
+        "and a submission's are its own: {submit:?}"
+    );
+    assert_eq!(
+        (probe[7], probe[8]),
+        (2, 2 * STREAM_BYTES),
+        "the probe makes one copy per *record* though it states one table — the \
+         reading this split is for: {probe:?}"
+    );
+    assert_eq!(
+        (submit[7], submit[8]),
+        (2, 2 * STREAM_BYTES),
+        "and the submission pays the same two copies for the same one table: {submit:?}"
+    );
+}
+
 /// A host allocation whose first byte is aligned to `alignment`, so the owner
 /// rail's registration can name it (`research/docs/20` §3.2).
 struct AlignedHost {
