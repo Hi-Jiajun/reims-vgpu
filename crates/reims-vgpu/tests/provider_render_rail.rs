@@ -7902,7 +7902,7 @@ fn the_zero_fill_declaration_arm_ships_the_same_frame_without_the_bytes() {
             .serial_resources()
             .expect("the trace's own serial pool")
             .into_iter()
-            .map(|resource| (resource.view().view_id, resource.view().source.clone()))
+            .map(|view| (view.view_id, view.source))
             .collect::<Vec<_>>()
     };
     let (arm_trace, _) = provider_wire::carried_submission(&arm_frames[0])
@@ -7930,10 +7930,10 @@ fn the_zero_fill_declaration_arm_ships_the_same_frame_without_the_bytes() {
                 );
                 assert_eq!(
                     u64::try_from(bytes.len()).expect("payload length"),
-                    *length,
+                    length,
                     "the arm's length is the payload's own"
                 );
-                declared += *length;
+                declared += length;
                 arms += 1;
             }
             (left, right) => assert_eq!(
