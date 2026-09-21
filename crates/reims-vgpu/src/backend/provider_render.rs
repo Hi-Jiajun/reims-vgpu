@@ -14062,11 +14062,13 @@ pub fn set_gate_prove_gather_arm(arm: Option<bool>) {
 /// Whether the class gate *proves* a tight sampled gather's read instead of
 /// making it ([`GATE_PROVE_GATHER`](crate::config::GATE_PROVE_GATHER), R-GW1).
 ///
-/// **Off unless a control word turns it on**: this is the arm the round that
-/// chose it fires, and the one that has to stay inert until that round has
-/// read it. Off, `gathered_texture_source` makes the copy it always made and
-/// every count, bar and landed byte is the path every round before this
-/// increment ran.
+/// **On unless a control word turns it off**: the round priced it at
+/// 1.003 → 0.504 copies per tight gather (the trace's own reads beside them)
+/// and `walk_sampling` 3 545 → 183 µs a frame — 6.1× the two identical control
+/// arms' 15.6 % band — with `walk_streams`/`walk_stage_buffers` unmoved and the
+/// control plane identical. Off (`0/off/false/no`), `gathered_texture_source`
+/// makes the copy it always made and every count, bar and landed byte is the
+/// path every round before this increment ran.
 ///
 /// On, the *tight* shape — a bind whose gather carries no registered window,
 /// whose rows are the guest's own tight rows, and whose lane needs no channel
@@ -14087,9 +14089,9 @@ fn gate_prove_gather() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             crate::config::switch(crate::config::GATE_PROVE_GATHER),
-            crate::config::Switch::On
+            crate::config::Switch::Off
         )
     })
 }
