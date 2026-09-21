@@ -7880,11 +7880,25 @@ fn the_zero_fill_declaration_arm_lands_the_same_frame_as_the_payload_it_replaces
         vec![0_u8; arm.len()],
         "and the frame is the draw's own, not the zeros both arms begin from"
     );
-    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    // The first texel, not the whole frame: this shape's attachment is
+    // 2048x2048, and a frame-wide hex line would put sixteen megabytes into the
+    // log for a reading the assertion above already made.
+    let first_texel = |bytes: &[u8]| -> String {
+        bytes
+            .chunks_exact(4)
+            .next()
+            .map(|texel| {
+                texel
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    };
     eprintln!(
-        "zero-fill declarations: arm={} payload={} bytes={}",
-        hex(&arm),
-        hex(&payload),
+        "zero-fill declarations: arm texel0={} payload texel0={} bytes={}",
+        first_texel(&arm),
+        first_texel(&payload),
         arm.len()
     );
 }
