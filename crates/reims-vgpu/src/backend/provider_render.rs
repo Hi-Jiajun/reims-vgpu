@@ -19588,13 +19588,14 @@ pub fn set_trace_pass_owned_arm(arm: Option<bool>) {
 /// Whether the trace walk takes the record's own render pass by value instead of
 /// copying it (TR1, `REIMS_VGPU_TRACE_PASS_OWNED`).
 ///
-/// **Off by default**, like every other cut in this rail: unset is the arm every
-/// round before this increment ran — the records stay with the caller, the walk
-/// copies the pass it states, and the completion reads the records where they
-/// lie. `REIMS_VGPU_TRACE_PASS_OWNED` spelled `1/on/true/yes` is the increment
-/// arm, where the records are split and the walk takes its half by value. The
-/// switch is read once, at the first trace, and a test may override it through
-/// [`set_trace_pass_owned_arm`].
+/// **On by default since 2026-09-21**, once its A/B had priced it: the walk's
+/// copy of a record's own render pass read 7 423.0 → 0.0 → 6 694.7 µs per frame
+/// with the split arm moving 118–120 values and 63–66 MB per frame instead, all
+/// three arms at 100.000% coverage. `REIMS_VGPU_TRACE_PASS_OWNED` spelled
+/// `0/off/false/no` is the pre-cut arm, where the records stay with the caller
+/// and the walk copies the pass it states — the control a round compares
+/// against. The switch is read once, at the first trace, and a test may override
+/// it through [`set_trace_pass_owned_arm`].
 fn trace_pass_owned_enabled() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     match TRACE_PASS_OWNED_ARM.load(Relaxed) {
@@ -19611,9 +19612,9 @@ fn trace_pass_owned_enabled() -> bool {
 /// The switch's own parser, apart from the process-global it caches into so a
 /// unit test can read every spelling without a switch it cannot put back.
 fn parse_trace_pass_owned(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "on" | "true" | "yes")
+        Some("0" | "off" | "false" | "no")
     )
 }
 
@@ -19621,24 +19622,25 @@ fn parse_trace_pass_owned(value: Option<&str>) -> bool {
 mod trace_pass_owned_switch_tests {
     use super::*;
 
-    /// The spellings the cut's switch answers to, and — the reading that matters
-    /// for a control arm — that everything else, an unset variable included, is
-    /// the path every round before this increment ran.
+    /// The spellings the cut's switch answers to — and, since it is flipped on,
+    /// that an unset variable is the increment arm while the control words put
+    /// the pre-cut path back.
     #[test]
     fn the_trace_pass_owned_switch_reads_the_rail_s_own_spellings() {
         for on in [
+            None,
+            Some(""),
             Some("1"),
             Some("on"),
             Some("ON"),
             Some("true"),
             Some("yes"),
             Some(" on "),
+            Some("trace-pass-owned"),
         ] {
             assert!(parse_trace_pass_owned(on), "{on:?} is an ask");
         }
         for off in [
-            None,
-            Some(""),
             Some("0"),
             Some("off"),
             Some("OFF"),
