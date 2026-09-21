@@ -1621,6 +1621,55 @@ pub const GATE_MODULES_ONE_MEMO: &str = "REIMS_VGPU_GATE_MODULES_ONE_MEMO";
 /// over the runs' coordinates per proved bind — no bytes — and the read the
 /// trace makes instead.
 pub const GATE_PROVE_GATHER: &str = "REIMS_VGPU_GATE_PROVE_GATHER";
+
+/// **Whether one vertex source is elected once instead of once per record**
+/// (`R-WS1`, the walk's stream tables).
+///
+/// # The reading it answers
+///
+/// The walk states one canonical vertex stream per *fetch table* the request's
+/// layout reads (`one_vertex_stream` groups the attributes of one interleaved
+/// bind), and it elects — and copies — one source per *record*: the record that
+/// opens a table keeps its source, and every record that joins one drops the
+/// source it just elected, because the table it lands in already carries the
+/// one its own head elected. The split round priced that: on the production
+/// pose's own workload (single-interleaved-stream draws), **4.00 stream copies
+/// per stated table against 1.00 kept** — 331 264 copies for 82 822 tables over
+/// 84 611 walks, at 0.195 µs a copy, with the election around each copy worth
+/// another 0.343 µs.
+///
+/// # What `on` does, and what it cannot change
+///
+/// A record that joins a table already stated **through one source**
+/// (`one_vertex_source`: one `runs` allocation, one window inside it, one
+/// `pages` list) has no second election to run. The source its own election
+/// would mint is dropped where the record lands — the table already carries the
+/// one its head elected — and the election that answered the head answers this
+/// record too, because it reads nothing but those fields. So the walk skips it,
+/// and reads the length the record-length rule needs off the table's own source.
+///
+/// A record that joins a table through a *different* source (the one shape the
+/// predicate can refuse) and every record that **opens** a table elect and read
+/// exactly as they always did: its bytes are the ones the pass states.
+///
+/// The census keeps reading one population across the two arms: the copies that
+/// happen are counted where they always were
+/// (`render_provider_out_of_class_vertex_staging_staged`/`_bytes`) and the
+/// elections that were not run beside them
+/// (`render_gate_walk_stream_reused_n`/`_reused_bytes`), so
+/// `copies + reused` is the record population on both arms and
+/// `copied_bytes + reused_bytes` is the bytes those records state. The shapes
+/// the reach cut answers for (`G1-C`'s declared/copied histograms and the slack
+/// they leave) are charged on the arms that still elect, because they are facts
+/// about the bind rather than about the read.
+///
+/// # What it costs
+///
+/// Off is one relaxed load per record and nothing else — the election, the copy
+/// and every counter are the ones the round before it ran. On removes the whole
+/// election (its window derivation, its counters and its `Vec`) from every
+/// record that reads its table's own source.
+pub const ONE_ELECTION_PER_SOURCE: &str = "REIMS_VGPU_GATE_ONE_ELECTION_PER_SOURCE";
 }
 
 counts! {
