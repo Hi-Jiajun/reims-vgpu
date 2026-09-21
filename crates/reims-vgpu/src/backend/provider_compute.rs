@@ -1487,6 +1487,14 @@ fn submit_narrow(
             access: TextureAccess::Sampled,
             source: TextureSource::OwnedBytes(staged.bytes.to_vec()),
         });
+        // E-SW3: the compute rail's own arm of the statement payload census —
+        // this view declares the staged bytes as the trace's own copy, and the
+        // census reads it under its own arm rather than folding it into the
+        // render walk's `trace` counter.
+        crate::backend::texture_payload_census::note_declared(
+            crate::backend::texture_payload_census::PayloadArm::Compute,
+            Some(u64::try_from(staged.bytes.len()).unwrap_or(u64::MAX)),
+        );
     }
     // The sampler descriptor the request carried is consumed here: the
     // canonical contract states its state on the texture binding instead, so
@@ -1583,6 +1591,10 @@ fn submit_narrow(
         heap: None,
         indirect: None,
     };
+    // E-SW3: one reading per statement, on the trace this rail is about to
+    // state — the compute rail's half of the texture payload census. Off, one
+    // relaxed load; on, a count of the payload and of what it repeats.
+    crate::backend::texture_payload_census::note_statement(&trace);
     // C1c: a pass whose table carries compute texture declarations crosses the
     // owner→provider wire before anything is admitted. The frame is the payload
     // — the declaration the provider compiled beside the view this rail staged,
