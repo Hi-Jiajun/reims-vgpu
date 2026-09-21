@@ -14286,7 +14286,7 @@ impl ResidentSourceDoors {
 #[cfg(feature = "provider-render")]
 fn chain_middle_source_frame(
     resources: &crate::backend::vulkan::engine::DrawRequest,
-) -> Option<Vec<u8>> {
+) -> Option<std::borrow::Cow<'_, [u8]>> {
     let attachment = resources.color_attachment?;
     let layout = translate::pixel::texel_layout_of(attachment.format())?;
     if !layout.is_four_byte_color() {
@@ -14299,18 +14299,72 @@ fn chain_middle_source_frame(
     if seed.len() != pixels.checked_mul(4)? {
         return None;
     }
-    let mut bytes = seed.to_vec();
-    if matches!(
+    // The exchange is the only reason this function ever needs its own buffer:
+    // it is asked for when the seed states the other order, and skipped — by
+    // this same condition — when the seed already states the view's. On the
+    // borrow arm the second case hands the caller its own frame back instead of
+    // reproducing it, and the bytes are the same bytes either way.
+    let exchange = matches!(
         resources.target_seed_order,
         crate::backend::vulkan::engine::SeedOrder::Bgra8
-    ) != translate::pixel::has_bgra_order(attachment.format())
-    {
+    ) != translate::pixel::has_bgra_order(attachment.format());
+    if !exchange && seam_frame_borrow_enabled() {
+        crate::runtime::drain::note_byte_arm(
+            crate::runtime::drain::ByteArmMeter::SeamFrameBorrowed,
+            u64::try_from(seed.len()).unwrap_or(u64::MAX),
+        );
+        return Some(std::borrow::Cow::Borrowed(seed));
+    }
+    let mut bytes = seed.to_vec();
+    if exchange {
         for texel in bytes.chunks_exact_mut(4) {
             texel.swap(0, 2);
         }
     }
-    Some(bytes)
+    // The seam's own copy of this frame, priced beside the declaration that
+    // reproduces it a second time on the way to the wire
+    // (`ByteArmMeter::BytesCopy`). Default off behind the frame profile, so a
+    // profile that is off costs this call site one relaxed load.
+    crate::runtime::drain::note_byte_arm(
+        crate::runtime::drain::ByteArmMeter::SeamFrame,
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    );
+    Some(std::borrow::Cow::Owned(bytes))
 }
+
+/// The arm `REIMS_VGPU_SEAM_FRAME_BORROW` selects, forced by a test (`None`
+/// gives the env back) — the shape `provider_render::set_trace_pass_owned_arm`
+/// gives the ninth cut, and for the same reason: the two arms have to be two
+/// statements of **one** scenario inside one process.
+pub fn set_seam_frame_borrow_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    SEAM_FRAME_BORROW_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the seam hands the caller its own frame when the fold is the
+/// identity ([`SEAM_FRAME_BORROW`](crate::config::SEAM_FRAME_BORROW)).
+fn seam_frame_borrow_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match SEAM_FRAME_BORROW_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    matches!(
+        crate::config::switch(crate::config::SEAM_FRAME_BORROW),
+        crate::config::Switch::On
+    )
+}
+
+/// The test's own arm, beside the function it selects.
+static SEAM_FRAME_BORROW_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// The frames this caller can hand the canonical rail for sampled GPU targets
 /// it has no production to restate (R24).
@@ -19626,34 +19680,78 @@ mod chain_middle_source_tests {
     #[test]
     fn the_walks_frame_reaches_the_view_in_the_views_own_order() {
         let seed = texels([32, 64, 128, 255], 6);
-        let frame = chain_middle_source_frame(&request(
-            MTL_FORMAT_BGRA8_UNORM,
-            3,
-            2,
-            SeedOrder::Rgba8,
-            seed.clone(),
-        ))
-        .expect("the walk's whole frame crosses into a scanout-order view");
+        // The frame is borrowed from the request on the cut's arm, so the
+        // request is a statement of its own rather than a temporary.
+        let exchange_request =
+            request(MTL_FORMAT_BGRA8_UNORM, 3, 2, SeedOrder::Rgba8, seed.clone());
+        let frame = chain_middle_source_frame(&exchange_request)
+            .expect("the walk's whole frame crosses into a scanout-order view");
         assert_eq!(
-            frame,
-            texels([128, 64, 32, 255], 6),
+            frame.as_ref(),
+            texels([128, 64, 32, 255], 6).as_slice(),
             "the bytes cross into the order the pass declares its view with"
         );
         assert_ne!(
-            frame, seed,
+            frame.as_ref(),
+            seed.as_slice(),
             "the walk's order is not the view's order, so an arm that uploaded verbatim would \
              hand the pass red and blue exchanged"
         );
 
-        let already_view_order = chain_middle_source_frame(&request(
-            MTL_FORMAT_BGRA8_UNORM,
-            3,
-            2,
-            SeedOrder::Bgra8,
-            seed.clone(),
-        ))
-        .expect("a seed that states the view's own order crosses unchanged");
-        assert_eq!(already_view_order, seed);
+        let view_order_request =
+            request(MTL_FORMAT_BGRA8_UNORM, 3, 2, SeedOrder::Bgra8, seed.clone());
+        let already_view_order = chain_middle_source_frame(&view_order_request)
+            .expect("a seed that states the view's own order crosses unchanged");
+        assert_eq!(already_view_order.as_ref(), seed.as_slice());
+    }
+
+    /// The borrow arm states the same frame: one scenario, run twice in this
+    /// process — the pre-cut statement (a `to_vec` of the caller's frame) and
+    /// `REIMS_VGPU_SEAM_FRAME_BORROW`'s (the caller's own frame handed back) —
+    /// and the bytes the rail is handed are compared as values.
+    ///
+    /// The two are one scenario rather than two because the fixture is the same
+    /// request; only the arm differs, and it is forced through
+    /// [`super::set_seam_frame_borrow_arm`] so a switch read from the
+    /// environment cannot make one run's arm a property of the process.
+    #[test]
+    fn the_fold_hands_over_the_same_bytes_whether_it_copies_or_borrows() {
+        for (mtl, order, exchange) in [
+            // The borrow's own case: the seed already states the view's order,
+            // so the fold is the identity and the copy is pure.
+            (MTL_FORMAT_BGRA8_UNORM, SeedOrder::Bgra8, false),
+            (MTL_FORMAT_RGBA8_UNORM, SeedOrder::Rgba8, false),
+            // And the case the switch must NOT touch: the exchange is real, so
+            // the buffer is the answer on both arms.
+            (MTL_FORMAT_BGRA8_UNORM, SeedOrder::Rgba8, true),
+        ] {
+            let seed = texels([7, 91, 203, 255], 4);
+            let request = request(mtl, 2, 2, order, seed.clone());
+            super::set_seam_frame_borrow_arm(Some(false));
+            let copied = chain_middle_source_frame(&request).expect("the pre-cut arm answers");
+            super::set_seam_frame_borrow_arm(Some(true));
+            let borrowed = chain_middle_source_frame(&request).expect("the borrow arm answers");
+            super::set_seam_frame_borrow_arm(None);
+            assert_eq!(
+                copied.as_ref(),
+                borrowed.as_ref(),
+                "REIMS_VGPU_SEAM_FRAME_BORROW cannot change the bytes the rail is handed \
+                 (mtl {mtl:#x}, seed order {order:?})"
+            );
+            if !exchange {
+                assert_eq!(
+                    borrowed.as_ref(),
+                    seed.as_slice(),
+                    "and the borrow arm's bytes are the caller's own frame, unchanged"
+                );
+            } else {
+                assert_ne!(
+                    borrowed.as_ref(),
+                    seed.as_slice(),
+                    "the exchange is what the switch must not fold away"
+                );
+            }
+        }
     }
 
     /// The frames this arm cannot state keep the record on the engine by name:
