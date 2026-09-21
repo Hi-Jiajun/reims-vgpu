@@ -44,15 +44,14 @@ use std::sync::{Mutex, OnceLock};
 use metal_api_core::provider::{ComputeTrace, TextureSource};
 use metal_api_core::statement_payload::{payload_digest, PayloadLedger, PayloadPlan};
 
-/// The switch a launcher writes to arm the mechanism. **Back to off by
-/// default** (2026-09-22): census v65 flipped it on and read the red line
-/// `draws_skipped_after_engine_refusal = 3 468`, every skip
-/// `refused_by=trace_admission`, behind seven `statement_payload_table_full`
-/// refusals (six of them the per-pipeline refusal line, which dedupes on
-/// `(pipeline, slug)`, and one that came back through the batch path). A
-/// refusal kills the whole statement rather than carrying that one
-/// declaration's bytes, so six statements were refused once each and re-walked
-/// for the rest of the round.
+/// The switch a launcher writes to **disarm** the mechanism. **Unset is on**
+/// (2026-09-22): census v65 caught the plan reading one bound and not the other
+/// and read the red line `draws_skipped_after_engine_refusal = 3 468` (every
+/// skip `refused_by=trace_admission`, behind seven
+/// `statement_payload_table_full` refusals). The E tip's fix landed first and
+/// the round's own two arms then crossed the same bound with **zero refusals,
+/// zero skips and 100.0000 % coverage on both arms**; only `0/off/false/no`
+/// restore the exact pre-cut bytes.
 ///
 /// # What the two ends disagreed about, and what the E tip did about it
 ///
@@ -76,20 +75,25 @@ use metal_api_core::statement_payload::{payload_digest, PayloadLedger, PayloadPl
 /// (`the_two_ends_hold_the_same_table_over_the_shape_census_v65_walked`), and
 /// the provider's own caps are a wiring guard again rather than a second policy.
 ///
-/// The arm stays here until a census reads the red line at 0 on a pose that
-/// crosses the bound: E-SW3's 120 s arms saw ~500 MB of distinct payloads and
-/// never reached it, which is why the 430 s round is the one that caught it.
-/// The cut is priced (616 488 → 22 285 B a statement). unset is off,
-/// `1/on/true/yes` arms it.
+/// E-SW3's own 120 s arms saw ~500 MB of distinct payloads and never reached the
+/// bound, which is why the 430 s round is the one that caught the old plan — and
+/// why the fix's own round crosses it on purpose (539 563 600 B filed, past the
+/// 512 MiB bound, absorbed by LRU replacement with `stmt_payload_carried_n = 0`).
+/// The cut is priced at 616 488 → 22 285 B a statement.
 const SWITCH: &str = "REIMS_VGPU_STATEMENT_PAYLOAD_TABLE";
 
 /// Whether this process states the payload table's arms.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
-            std::env::var(SWITCH).ok().as_deref().map(str::trim),
-            Some("1") | Some("on") | Some("true") | Some("yes")
+        !matches!(
+            std::env::var(SWITCH)
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("0") | Some("off") | Some("false") | Some("no")
         )
     })
 }
