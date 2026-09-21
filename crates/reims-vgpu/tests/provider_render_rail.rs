@@ -1732,6 +1732,21 @@ fn semantic_rgba(mut pixels: Vec<u8>, bgra: bool) -> Vec<u8> {
     pixels
 }
 
+/// The length a zero-fill declaration states, when the source is that arm.
+///
+/// A free function taking `&BufferSource` rather than a pattern in the case
+/// below, so the binding mode is stated once instead of inferred: the case
+/// matches a pair of references, and the arm's own field is a `u64`.
+fn zero_fill_declaration_length(source: &BufferSource) -> Option<u64> {
+    match source {
+        BufferSource::ZeroFill { length } => Some(*length),
+        BufferSource::OwnedBytes(_)
+        | BufferSource::StagedLease(_)
+        | BufferSource::BorrowedNoCopy(_)
+        | BufferSource::GuestRuns(_) => None,
+    }
+}
+
 fn assert_solid(label: &str, pixels: &[u8]) {
     assert_texel_count(label, pixels);
     for (index, texel) in pixels.chunks_exact(4).enumerate() {
@@ -7922,8 +7937,17 @@ fn the_zero_fill_declaration_arm_ships_the_same_frame_without_the_bytes() {
         arm_declarations.iter().zip(payload_declarations.iter())
     {
         assert_eq!(arm_view, payload_view, "the same view in both arms");
-        match (arm_source, payload_source) {
-            (BufferSource::ZeroFill { length }, BufferSource::OwnedBytes(bytes)) => {
+        match (
+            zero_fill_declaration_length(arm_source),
+            zero_fill_declaration_length(payload_source),
+        ) {
+            (Some(length), None) => {
+                let BufferSource::OwnedBytes(bytes) = payload_source else {
+                    panic!(
+                        "the zero-fill arm's counterpart has to be the all-zero payload it \
+                         stands for, not {payload_source:?}"
+                    );
+                };
                 assert!(
                     bytes.iter().all(|byte| *byte == 0),
                     "the arm stands for a zero fill and nothing else"
@@ -7936,9 +7960,13 @@ fn the_zero_fill_declaration_arm_ships_the_same_frame_without_the_bytes() {
                 declared += length;
                 arms += 1;
             }
-            (left, right) => assert_eq!(
-                left, right,
+            (None, None) => assert_eq!(
+                arm_source, payload_source,
                 "every declaration the cut does not re-encode is the same value in both arms"
+            ),
+            (left, right) => panic!(
+                "the two arms disagree about the zero-fill declaration: arm={left:?} \
+                 payload={right:?}"
             ),
         }
     }
