@@ -44,25 +44,25 @@ use std::sync::{Mutex, OnceLock};
 use metal_api_core::provider::{ComputeTrace, TextureSource};
 use metal_api_core::statement_payload::{payload_digest, PayloadLedger, PayloadPlan};
 
-/// The switch a launcher writes to disarm the mechanism. **Unset is on**,
-/// flipped 2026-09-21 once its round had priced it: the two arms read the wire
-/// texture payload at 616 488 → 22 285 B a statement (−96.4 %, the whole
-/// statement −36.7 %) against a control plane that stayed identical. Only
-/// `0/off/false/no` restore the exact pre-cut bytes.
+/// The switch a launcher writes to arm the mechanism. **Back to off by
+/// default** (2026-09-22): census v65 flipped it on and read the red line
+/// `draws_skipped_after_engine_refusal = 3 468` — every skip
+/// `refused_by=trace_admission`, with seven `statement_payload_table_full`
+/// refusals preceding them. The sender's ledger and the provider's table
+/// disagree about the table's bound somewhere, and a disagreement kills the
+/// whole statement rather than carrying that declaration's bytes. The cut is
+/// priced (616 488 → 22 285 B a statement) and stays behind this switch until
+/// the two ends are proven to plan alike; unset is off, `1/on/true/yes` arms
+/// it.
 const SWITCH: &str = "REIMS_VGPU_STATEMENT_PAYLOAD_TABLE";
 
 /// Whether this process states the payload table's arms.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(
-            std::env::var(SWITCH)
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("0") | Some("off") | Some("false") | Some("no")
+        matches!(
+            std::env::var(SWITCH).ok().as_deref().map(str::trim),
+            Some("1") | Some("on") | Some("true") | Some("yes")
         )
     })
 }
