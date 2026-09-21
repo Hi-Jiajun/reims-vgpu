@@ -9412,6 +9412,10 @@ pub fn override_render_pass_entry_snapshot(declared: Option<bool>) -> PassEntryS
 fn pixel_coordinate_sampler_module(
     inputs: &RenderRailInputs<'_>,
 ) -> Result<bool, ProviderRenderDecline> {
+    // R-RG1: one of the three per-module memos the ask region reads, and the
+    // one whose customer is a request that states the texel space.
+    let _module =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail.pixel_sampler_modules.lock().map_err(|_| {
@@ -9467,6 +9471,10 @@ fn pixel_coordinate_sampler_module(
 fn fragment_output_superset_module(
     inputs: &RenderRailInputs<'_>,
 ) -> Result<bool, ProviderRenderDecline> {
+    // R-RG1: the second of the three, asked for every request the gate is
+    // handed (its answer is `true` for every module but the superset one).
+    let _module =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail
@@ -9524,6 +9532,9 @@ fn fragment_output_superset_module(
 /// times, so the translation is paid once per module rather than once per draw.
 #[cfg(feature = "provider-render")]
 fn half_capability_module(inputs: &RenderRailInputs<'_>) -> Result<bool, ProviderRenderDecline> {
+    // R-RG1: the third, asked for the same population as the memo above it.
+    let _module =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateModules);
     let provider_rail = rail().map_err(IntoRender::into_render)?;
     let render_rail = render_rail();
     let mut modules = render_rail.half_capability_modules.lock().map_err(|_| {
@@ -13259,6 +13270,54 @@ pub fn submit_render(inputs: &RenderRailInputs<'_>, req: &DrawRequest) -> Render
     submit_render_inner(inputs, req, false, None)
 }
 
+/// The cut's own arm, forced by a test (`None` gives the switch back) — the
+/// shape [`set_trace_pass_owned_arm`] and `set_seam_frame_borrow_arm` give
+/// their own cuts.
+///
+/// A switch read through a `OnceLock` cannot be put back, and the arm this
+/// selects is the one thing an equivalence case has to vary **within one
+/// process**: a test that ran one arm in one binary and the other in the next
+/// would be comparing two scenarios rather than two statements of one.
+static GATE_ONE_FRAME_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force the class gate's own arm for a test (R-RG1).
+///
+/// `None` restores the switch's own reading. The values are the three states
+/// one byte can carry: unset, off, on.
+pub fn set_gate_one_frame_arm(arm: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    GATE_ONE_FRAME_ARM.store(
+        match arm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the class gate reads one capability frame for the whole call
+/// ([`GATE_ONE_FRAME`](crate::config::GATE_ONE_FRAME), R-RG1).
+///
+/// Read once per gate call, so the environment lookup is cached: the gate is
+/// handed every draw's class probe and every draw's submission, and
+/// `config::switch` parses the variable each time it is asked.
+fn gate_one_frame_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match GATE_ONE_FRAME_ARM.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::switch(crate::config::GATE_ONE_FRAME),
+            crate::config::Switch::On
+        )
+    })
+}
+
 fn submit_render_inner(
     inputs: &RenderRailInputs<'_>,
     req: &DrawRequest,
@@ -13280,6 +13339,32 @@ fn submit_render_inner(
     // route count. `None`, and therefore no clock read, when
     // `REIMS_VGPU_FRAME_PROFILE` is off.
     let _gate = crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGate);
+    // R-RG1's own denominator for the split below: one charge per call the gate
+    // is handed, the walk's class probes included, so the eleven bars can be
+    // read per call rather than only per present frame.
+    crate::runtime::drain::note_store_route("render_gate_calls");
+    // R-RG1: the gate's first region — the four route charges that open this
+    // call and every capability answer the class reads before the walk.
+    let _gate_asks =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateAsks);
+    // R-RG1's own cut: every device answer below is a field of the one snapshot
+    // the provider published, so the gate decodes that snapshot **once** here
+    // and the asks that follow read it instead of encoding their own
+    // (`REIMS_VGPU_GATE_ONE_FRAME`, default off). A provider that cannot be read
+    // — or a snapshot the codec refuses — leaves the slot empty on purpose: the
+    // asks then answer exactly where, and exactly how, they did before this
+    // cut. The guard goes back to the wire when the gate ends, so nothing
+    // outside this call reads a frame it did not ask for.
+    let _gate_frame = if gate_one_frame_enabled() {
+        rail().ok().and_then(|rail| {
+            provider_wire::begin_gate_frame(
+                rail.provider.device_epoch(),
+                rail.provider.capabilities(),
+            )
+        })
+    } else {
+        None
+    };
     // The band a widening order sizes the vertex axis on, charged for every
     // request the gate is handed and before any condition answers — so a shape
     // the gate refuses is still in the denominator, and the four arms sum to the
@@ -13705,34 +13790,46 @@ fn submit_render_inner(
     };
     // The class gate is pure and runs first: an out-of-class shape never
     // touches the rail (no provider, no compile, no registration).
-    let pass = match narrow_class(
-        inputs,
-        req,
-        class_only,
-        stage_buffer_namespace_split,
-        stage_buffer_per_stage_ceiling,
-        stage_buffer_binding_range,
-        render_texture_gathered_extent,
-        render_texture_gathered_extent_no_copy,
-        render_vertex_interface_superset,
-        render_texture_sampled_lanes,
-        render_texture_one_dimension_window,
-        render_texture_volume_window,
-        render_texture_count_ceiling,
-        attachment_landing_view,
-        kept_frame_landing,
-        render_pixel_coordinate_sampler,
-        render_pass_entry_snapshot,
-        render_vertex_count_above_triangle,
-        render_fragment_output_superset,
-        render_half_capabilities,
-    ) {
-        Err(reason) => {
-            reason.note();
-            return RenderRailOutcome::NotInNarrowClass(reason);
+    // R-RG1 closes the ask region here and opens the walk's own bar, so the two
+    // readings are the two regions a different statement would move.
+    drop(_gate_asks);
+    let pass = {
+        let _walk =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWalk);
+        match narrow_class(
+            inputs,
+            req,
+            class_only,
+            stage_buffer_namespace_split,
+            stage_buffer_per_stage_ceiling,
+            stage_buffer_binding_range,
+            render_texture_gathered_extent,
+            render_texture_gathered_extent_no_copy,
+            render_vertex_interface_superset,
+            render_texture_sampled_lanes,
+            render_texture_one_dimension_window,
+            render_texture_volume_window,
+            render_texture_count_ceiling,
+            attachment_landing_view,
+            kept_frame_landing,
+            render_pixel_coordinate_sampler,
+            render_pass_entry_snapshot,
+            render_vertex_count_above_triangle,
+            render_fragment_output_superset,
+            render_half_capabilities,
+        ) {
+            Err(reason) => {
+                reason.note();
+                return RenderRailOutcome::NotInNarrowClass(reason);
+            }
+            Ok(pass) => pass,
         }
-        Ok(pass) => pass,
     };
+    // R-RG1: the device answers the walk did not make — the attachment window,
+    // the host-import alignment, the stage-buffer, sampler-carriage and
+    // texture-support sections — read apart from the copies they gate.
+    let _gate_device =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateDevice);
     // The window is the one class condition a request cannot answer by itself:
     // it is the canonical rail's declaration on this device (R1b), read from
     // the provider's capability snapshot — before this submission is
@@ -13977,6 +14074,14 @@ fn submit_render_inner(
     // device answer lives, and because a window this rail cannot read has to
     // keep the draw on the engine *by name* — an answer only the class gate can
     // give (`plan`'s refusals are declines, and a decline is not a fallback).
+    // R-RG1: the copy-forced arms get their own bar. On the sixth round's
+    // production pose every route beside them read zero — no window was staged
+    // and no row was depadded — so this bar is expected to be the pass-over
+    // and not the copies, and the reading that says which of the two it was is
+    // the route table beside it.
+    drop(_gate_device);
+    let _gate_window =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateWindow);
     let mut copies = WindowCopies::default();
     if window_backed().next().is_some() || stage_run_lists().next().is_some() {
         let alignment = match declared_host_import() {
@@ -14098,6 +14203,12 @@ fn submit_render_inner(
     // under the current epoch). No device *capability* is asked, because no
     // lease is minted for either arm: a device that cannot import host pointers
     // executes them exactly as this one does.
+    // R-RG1: the make region is its own bar for the same reason as the window
+    // one above — one copy per sampled texture that needs either arm, and the
+    // route table beside it says whether any texture needed one.
+    drop(_gate_window);
+    let _gate_make =
+        crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvGateMake);
     let mut texture_copies = TextureCopies::default();
     for texture in &pass.textures {
         let written = match &texture.source {
@@ -14267,6 +14378,8 @@ fn submit_render_inner(
         };
         texture_copies.insert(texture.index, written);
     }
+    drop(_gate_make);
+    drop(_gate_frame);
     drop(_gate);
     // R42: a kept frame is a *provider* image, and the provider retires them —
     // an eviction, a teardown, a lost device. A load from one that is no longer
@@ -18824,10 +18937,18 @@ fn assemble_narrow_record(
     let (declaring, render_pipeline) = {
         let _register =
             crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvRegister);
-        (
-            declaring_pipeline(&rail.provider, &rail.device)?,
-            register_render_pipeline(&rail.provider, &rail.device, inputs, pass)?,
-        )
+        // R-RG1: the declaring kernel's own lookup, read apart from the
+        // request's pair below it. The two are different statements — one
+        // cached compile of a fixed module against one cache of the guest's
+        // own modules — so a round cannot choose between them on their sum.
+        let declaring = {
+            let _declare = crate::runtime::drain::frame_span(
+                crate::runtime::drain::FrameSpan::ProvRegisterDeclare,
+            );
+            declaring_pipeline(&rail.provider, &rail.device)?
+        };
+        let render_pipeline = register_render_pipeline(&rail.provider, &rail.device, inputs, pass)?;
+        (declaring, render_pipeline)
     };
     // This record's own block of the trace's view namespace. The staged views'
     // allocations are derived from the same view numbers this assembly mints
@@ -22029,56 +22150,86 @@ fn register_render_pipeline(
     inputs: &RenderRailInputs<'_>,
     pass: &NarrowPass<'_>,
 ) -> Result<CompiledComputePipeline, ProviderRenderDecline> {
-    let contract = RenderPipelineContract {
-        vertex_entry: pass.vertex_entry.clone(),
-        fragment_entry: pass.fragment_entry.clone(),
-        color_formats: vec![pass.format],
-        vertex_layout: pass.vertex_layout(),
-        // The v83 half, stated (R9d/R9j): one declaration per `[[buffer(N)]]`
-        // argument the two stages' own translations reported, in the
-        // contract's canonical order, with the access the reflection reported
-        // and the footprint it reaches (a static ceiling, or the affine access
-        // set R9f landed). The gate admitted this request by pairing each of
-        // these declarations with a bind, so the pass below states exactly one
-        // view per entry — carrying the same access — and core holds the two
-        // lists to each other (`validate_against`). An empty list is the
-        // pre-R9d shape where neither stage declares a buffer at all.
-        stage_buffers: pass
-            .stage_buffers
-            .iter()
-            .map(|buffer| StageBufferBinding {
-                stage: buffer.stage,
-                index: buffer.index,
-                access: buffer.access,
-                footprint: buffer.proof.clone(),
-            })
-            .collect(),
-        // The render texture declarations (E-RS1, `research/docs/23` §101): one
-        // entry per admitted sampled texture, each restating the module's own
-        // AIR sampler state at the Metal index the pass's own view states
-        // (E-RS3, §104), in the same canonical order those views are stated in.
-        textures: pass.texture_declarations(),
+    // R-RG1: one charge per registration, so the six bars below can be read per
+    // call and not only per present frame. The two cache counters beside it say
+    // which of the two paths the µs were spent on — a hit is a lookup, a miss
+    // is a compile the bar would otherwise price as one.
+    crate::runtime::drain::note_store_route("render_register_calls");
+    let contract = {
+        let _contract = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvRegisterContract,
+        );
+        RenderPipelineContract {
+            vertex_entry: pass.vertex_entry.clone(),
+            fragment_entry: pass.fragment_entry.clone(),
+            color_formats: vec![pass.format],
+            vertex_layout: pass.vertex_layout(),
+            // The v83 half, stated (R9d/R9j): one declaration per `[[buffer(N)]]`
+            // argument the two stages' own translations reported, in the
+            // contract's canonical order, with the access the reflection reported
+            // and the footprint it reaches (a static ceiling, or the affine access
+            // set R9f landed). The gate admitted this request by pairing each of
+            // these declarations with a bind, so the pass below states exactly one
+            // view per entry — carrying the same access — and core holds the two
+            // lists to each other (`validate_against`). An empty list is the
+            // pre-R9d shape where neither stage declares a buffer at all.
+            stage_buffers: pass
+                .stage_buffers
+                .iter()
+                .map(|buffer| StageBufferBinding {
+                    stage: buffer.stage,
+                    index: buffer.index,
+                    access: buffer.access,
+                    footprint: buffer.proof.clone(),
+                })
+                .collect(),
+            // The render texture declarations (E-RS1, `research/docs/23` §101): one
+            // entry per admitted sampled texture, each restating the module's own
+            // AIR sampler state at the Metal index the pass's own view states
+            // (E-RS3, §104), in the same canonical order those views are stated in.
+            textures: pass.texture_declarations(),
+        }
     };
-    let fingerprint = contract_fingerprint(&contract);
-    let key = RenderPipelineKey {
-        vertex_air: inputs.vertex_air.to_vec(),
-        fragment_air: inputs.fragment_air.to_vec(),
-        vertex_entry: pass.vertex_entry.clone(),
-        fragment_entry: pass.fragment_entry.clone(),
-        contract: fingerprint.clone(),
-        vertex_stage_buffer_namespace_split: pass.vertex_stage_buffer_namespace_split,
+    let fingerprint = {
+        let _fingerprint = crate::runtime::drain::frame_span(
+            crate::runtime::drain::FrameSpan::ProvRegisterFingerprint,
+        );
+        contract_fingerprint(&contract)
+    };
+    let key = {
+        let _key =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvRegisterKey);
+        RenderPipelineKey {
+            vertex_air: inputs.vertex_air.to_vec(),
+            fragment_air: inputs.fragment_air.to_vec(),
+            vertex_entry: pass.vertex_entry.clone(),
+            fragment_entry: pass.fragment_entry.clone(),
+            contract: fingerprint.clone(),
+            vertex_stage_buffer_namespace_split: pass.vertex_stage_buffer_namespace_split,
+        }
     };
     let rail = render_rail();
-    let mut pipelines =
+    // R-RG1: the acquisition is its own bar — a large one is contention and not
+    // work — and the lookup below it is the map probe and the hit's clone.
+    let mut pipelines = {
+        let _lock =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvRegisterLock);
         rail.pipelines
             .lock()
             .map_err(|_| ProviderRenderDecline::PipelineCompile {
                 step: "render_pipeline",
                 detail: "the render pipeline cache is poisoned".to_owned(),
-            })?;
-    if let Some(pipeline) = pipelines.get(&key) {
-        return Ok(pipeline.clone());
+            })?
+    };
+    {
+        let _lookup =
+            crate::runtime::drain::frame_span(crate::runtime::drain::FrameSpan::ProvRegisterLookup);
+        if let Some(pipeline) = pipelines.get(&key) {
+            crate::runtime::drain::note_store_route("render_register_hits");
+            return Ok(pipeline.clone());
+        }
     }
+    crate::runtime::drain::note_store_route("render_register_misses");
     // The device's own capability answer, not the translation entry point's
     // Phase-1 default: both stages are registered against the very device this
     // provider answers for, so a module the device stated it can execute has to

@@ -32740,3 +32740,109 @@ fn a_park_refusal_is_counted_under_its_cause_at_the_rail() {
         "and not under the owner rail's arm"
     );
 }
+
+/// R-RG1: **one** scenario, two arms of the class gate's own switch.
+///
+/// The class gate asks the device's capability frame about the declared window,
+/// the host-import alignment, the folded stage-buffer pair, the sampled lanes
+/// and texture shapes and the render half's capability pair, and every one of
+/// those answers is a field of the one snapshot the provider published.
+/// `REIMS_VGPU_GATE_ONE_FRAME` states that frame once for the whole gate call
+/// and hands it to the asks that follow, instead of letting each of them encode
+/// and decode the whole frame again. The two arms are forced inside this one
+/// process — [`provider_render::set_gate_one_frame_arm`] — so the fixture, and
+/// not the environment, decides which arm a run takes.
+///
+/// Two properties, and the second is what the cut is *for*: the same shape
+/// lands the same frame on both arms, and the arm that states the frame encodes
+/// strictly fewer of them. The shape is the one fixture whose fragment stage
+/// declares a sampled texture, a runtime sampler **and** a `[[buffer(0)]]`
+/// (`render_frag_runtime_sampler_buffer.air`), so its pass crosses the frame and
+/// its gate asks three of the wire's questions — the render texture section, the
+/// stage-buffer section and the sampler carriage — rather than one. (A shape
+/// whose asks are a single question cannot show a saving; the production round's
+/// `wire_capability_frames` is what prices the average, 6.43 encodes per call.)
+#[test]
+fn one_gate_frame_lands_the_same_frame_and_encodes_fewer_of_them() {
+    let _guard = engine_test_session();
+    use reims_vgpu::protocol::sampler as mtl;
+
+    let stages = sampled_fragment_stages(
+        "render_frag_runtime_sampler_buffer.air",
+        "reims_runtime_sampled_buffer_frag",
+    );
+    assert_eq!(
+        stages.fragment_stage_buffer_declarations.len(),
+        1,
+        "the fixture declares one fragment stage buffer, which is what makes the pass cross the \
+         frame"
+    );
+    let (width, height) = (8u32, 4u32);
+    let bytes: Vec<u8> = (0..width * height).map(|index| (index as u8) | 1).collect();
+    let tint = BufferContent::Bytes(std::sync::Arc::new({
+        let mut bytes = 1.0f32.to_ne_bytes().to_vec();
+        bytes.resize(16, 0);
+        bytes
+    }));
+    let declaration = stages.fragment_texture_declarations[0];
+    let runtime = stages.sampler_family.runtime[0];
+    let mut req = request_with_streams(MTL_FORMAT_RGBA8_UNORM, &position_streams());
+    req.width = width;
+    req.height = height;
+    req.sampled_images.push(image_resource_narrow(
+        declaration.binding,
+        bytes,
+        (width, height),
+        ash::vk::Format::R8_UNORM,
+    ));
+    req.samplers.push(widened_sampler_resource(
+        runtime.binding,
+        mtl::MTL_SAMPLER_MIN_MAG_FILTER_NEAREST,
+        mtl::MTL_SAMPLER_MIP_FILTER_NOT_MIPMAPPED,
+        mtl::MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    ));
+    req.storage_buffers.push(engine::StorageBufferResource {
+        binding: 0,
+        content: tint.clone(),
+    });
+    let binds = [staged_bind(RenderPipelineStage::Fragment, 0, &tint)];
+    let inputs = inputs_with_binds(&stages, RenderChainRole::SoleOrTail, &binds);
+
+    let run = |arm: Option<bool>| {
+        provider_render::set_gate_one_frame_arm(arm);
+        let delivered = provider_render::provider_submissions();
+        let before = provider_wire::wire_counts().capability_frames;
+        let frame = match provider_render::submit_render(&inputs, &req) {
+            RenderRailOutcome::ProviderCompleted(out) => out,
+            other => panic!("one gate frame: this shape is in class: {other:?}"),
+        };
+        let frames = provider_wire::wire_counts().capability_frames - before;
+        assert!(
+            provider_render::provider_submissions() > delivered,
+            "the shape reached the canonical provider rather than the engine"
+        );
+        (frame, frames)
+    };
+    let (per_answer, per_answer_frames) = run(Some(false));
+    let (one_frame, one_frame_frames) = run(Some(true));
+    provider_render::set_gate_one_frame_arm(None);
+
+    assert_eq!(
+        per_answer.bgra, one_frame.bgra,
+        "REIMS_VGPU_GATE_ONE_FRAME cannot change the byte order the frame is stated in"
+    );
+    assert_eq!(
+        per_answer.bytes, one_frame.bytes,
+        "the two arms are one scenario: the gate answers with the same class, the same \
+         registration and the same frame, so the bytes it lands are the same bytes"
+    );
+    assert!(
+        one_frame_frames < per_answer_frames,
+        "the arm that states the frame encodes strictly fewer of them \
+         (one per call, not one per answer): {one_frame_frames} against {per_answer_frames}"
+    );
+    eprintln!(
+        "R-RG1: this shape's gate encoded {per_answer_frames} capability frames per call with \
+         the frame read per answer and {one_frame_frames} with one frame per call"
+    );
+}

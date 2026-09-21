@@ -163,7 +163,11 @@ pub fn compute_texture_support(
     Ok(ComputeTextureSupport {
         supported: decoded.supports_compute_texture_sampling,
         maximum: decoded.max_compute_textures,
-        formats: decoded.supported_compute_texture_formats,
+        // R-RG1: the frame this field is read out of is lent to every ask the
+        // class gate makes, so the one reader that *moves* a field copies it
+        // instead — a list of format codes, not the frame's bytes. The arm
+        // that encodes its own frame pays the same copy it always did.
+        formats: decoded.supported_compute_texture_formats.clone(),
     })
 }
 
@@ -235,7 +239,8 @@ pub fn render_texture_support(
         supported: decoded.supports_render_texture_sampling,
         maximum: decoded.max_render_textures,
         per_stage: decoded.max_render_textures_per_stage,
-        formats: decoded.supported_render_texture_formats,
+        // R-RG1: copied for the same reason as the compute half above.
+        formats: decoded.supported_render_texture_formats.clone(),
     })
 }
 
@@ -264,7 +269,8 @@ pub fn render_texture_narrow_lanes(
     capabilities: &ProviderCapabilities,
 ) -> Result<NarrowLaneSupport, WireDecline> {
     let decoded = capabilities_frame(epoch, capabilities)?;
-    let formats = decoded.supported_render_texture_formats;
+    // R-RG1: copied for the same reason as the two halves above.
+    let formats = decoded.supported_render_texture_formats.clone();
     Ok(NarrowLaneSupport {
         r8: formats.contains(&TextureFormat::R8Unorm),
         rg8: formats.contains(&TextureFormat::R8G8Unorm),
@@ -1026,25 +1032,121 @@ pub fn render_multi_draw(
 /// One encoder and one decoder for every capability question this rail asks,
 /// so the readings beside each other really are one frame's bytes rather than
 /// two spellings of them.
+///
+/// # One frame per class gate (R-RG1)
+///
+/// The single reader is also why the class gate can be charged for reading it
+/// once per *answer*: the gate asks the declared window, the host-import
+/// alignment, the stage-buffer, sampler and texture sections and the render
+/// half's capability pair as separate questions, and each of them is a deep
+/// clone of the snapshot, an encode of the whole frame and a decode of it back.
+/// The sixth round's production profile left the sum of those calls as one bar
+/// (`prov_gate_us_mean` **20 987.7 µs per present frame**); R-RG1's split reads
+/// the region they are in, and [`begin_gate_frame`] is the cut that followed.
+///
+/// When a gate has stated the frame it is reading for the call in flight, an
+/// ask whose snapshot compares **equal** to the one that frame was decoded from
+/// — and whose epoch is the same — is handed the frame the gate already
+/// decoded instead of encoding its own. The comparison is on the snapshot's
+/// *value* (the derive), not on a pointer or a timestamp, and an equal value
+/// encodes to equal bytes and decodes to equal answers because
+/// [`CommandCodec::encode_response`] is a function of that value (one arm
+/// selection and one field order). Every other ask — outside a gate, with a
+/// different snapshot, or with an epoch that moved — encodes and decodes
+/// exactly as it did before this increment.
 fn capabilities_frame(
     epoch: DeviceEpoch,
     capabilities: &ProviderCapabilities,
-) -> Result<ProviderCapabilities, WireDecline> {
+) -> Result<std::sync::Arc<ProviderCapabilities>, WireDecline> {
+    if let Some(frame) = gate_frame_in_flight(epoch, capabilities) {
+        return Ok(frame);
+    }
     let frame = CommandCodec::encode_response(&CommandResponse::Capabilities {
         epoch,
         capabilities: capabilities.clone(),
     })
     .map_err(|error| WireDecline::new("capabilities_frame", error))?;
     note_capability_frame();
+    // R-RG1: the same event in the per-second window the census reads, so a
+    // round can divide a class gate's capability µs by the frames it encoded
+    // rather than by the calls it made. One charge per encode.
+    crate::runtime::drain::note_store_route("wire_capability_frames");
     match CommandCodec::decode_response(&frame)
         .map_err(|error| WireDecline::new("capabilities_decode", error))?
     {
-        CommandResponse::Capabilities { capabilities, .. } => Ok(capabilities),
+        CommandResponse::Capabilities { capabilities, .. } => Ok(std::sync::Arc::new(capabilities)),
         other => Err(WireDecline {
             step: "capabilities_decode",
             detail: format!("the frame decoded as a {} response", other.kind()),
         }),
     }
+}
+
+/// The frame one class gate reads for every answer it asks (`R-RG1`).
+///
+/// The snapshot the frame was decoded from travels beside it, because that is
+/// what the asks are compared against: a frame is lent only to a caller whose
+/// snapshot is the same value, so the answers cannot be read out of another
+/// device state than the one the caller stated.
+struct GateFrame {
+    epoch: DeviceEpoch,
+    source: ProviderCapabilities,
+    decoded: std::sync::Arc<ProviderCapabilities>,
+}
+
+thread_local! {
+    /// The gate in flight's own frame, if it stated one. Thread-local rather
+    /// than global because the gate runs on the vCPU thread that drew, and a
+    /// second thread's gate must not read the first one's frame.
+    static GATE_FRAME: std::cell::RefCell<Option<GateFrame>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The guard a class gate holds while its own frame is stated, so the slot goes
+/// back to empty at every return — including the refusals and the declines that
+/// leave the gate early.
+pub(crate) struct GateFrameGuard(());
+
+impl Drop for GateFrameGuard {
+    fn drop(&mut self) {
+        GATE_FRAME.with(|frame| *frame.borrow_mut() = None);
+    }
+}
+
+/// Decode the frame this class gate's answers will be read out of, once.
+///
+/// `None` when the snapshot cannot be read into a frame now — no provider, or a
+/// codec that refuses it — and that is deliberately a *value* rather than an
+/// error: the asks that follow read the frame themselves, exactly as they did
+/// before this increment, so a process that cannot state the frame here answers
+/// every question at the same place, with the same refusal, as the round before
+/// it did.
+pub(crate) fn begin_gate_frame(
+    epoch: DeviceEpoch,
+    capabilities: ProviderCapabilities,
+) -> Option<GateFrameGuard> {
+    let decoded = capabilities_frame(epoch, &capabilities).ok()?;
+    GATE_FRAME.with(|frame| {
+        *frame.borrow_mut() = Some(GateFrame {
+            epoch,
+            source: capabilities,
+            decoded,
+        });
+    });
+    Some(GateFrameGuard(()))
+}
+
+/// The frame stated for this thread's gate, when this ask is asking about the
+/// very snapshot that frame was decoded from.
+fn gate_frame_in_flight(
+    epoch: DeviceEpoch,
+    capabilities: &ProviderCapabilities,
+) -> Option<std::sync::Arc<ProviderCapabilities>> {
+    GATE_FRAME.with(|frame| {
+        let frame = frame.borrow();
+        let frame = frame.as_ref()?;
+        (frame.epoch == epoch && frame.source == *capabilities).then(|| frame.decoded.clone())
+    })
 }
 
 /// Encode one submission's trace and resource snapshot as the frame an owner
