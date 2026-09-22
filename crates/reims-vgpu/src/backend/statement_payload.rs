@@ -30,6 +30,28 @@
 //! reference arm's digest is what turns a desync into a named refusal instead
 //! of another payload's bytes.
 //!
+//! # One statement, one plan
+//!
+//! The declaration arms of a statement are planned **together**
+//! ([`PayloadLedger::plan_statement`]), because a statement is the unit both
+//! ends file: the provider applies a statement's declarations as one batch, over
+//! a walk of its table the statement's own earlier declarations move as it goes
+//! (`PayloadTable::declare_all`). Planning them one at a time against the ledger
+//! *as the statement found it* — its own earlier declarations are not filed
+//! until the statement crossed — states declarations that each fit the bound and
+//! do not fit it together: a small one into a fresh slot and a larger one into
+//! the entry it replaces, one payload past the byte bound between them. The
+//! provider's walk refuses a statement it cannot file whole (that reading stays,
+//! as the second line), so a plan that read the room that way would buy a
+//! refused statement — and the draw behind it — with an accounting mistake.
+//!
+//! A statement the table cannot hold whole is absorbed instead: its plan
+//! replaces the entry it names, or carries the payload on the ordinary arm
+//! exactly as every round before this arm did. Nothing about the arms changes
+//! for a statement whose declarations were already planned inside the bound
+//! (each declaration of a batch reads the same readings the ledger would have
+//! given it on its own, plus the room this statement's own earlier plans took).
+//!
 //! # What is owed, and when
 //!
 //! A plan is not a filing: [`PlannedStatement`] carries the declarations the
@@ -38,6 +60,9 @@
 //! A statement that never got that far — a frame the encoder refused, a wire
 //! hop that never happened — drops its plan, so neither end holds an entry the
 //! other does not.
+//! The batch is committed in one call ([`PayloadLedger::commit_statement`]),
+//! which is the same filing, entry by entry in the statement's own order, that
+//! committing each declaration alone would have made.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -168,9 +193,9 @@ impl PlannedStatement {
         let Ok(mut ledger) = ledger().lock() else {
             return;
         };
-        for (slot, digest, length) in declarations {
-            ledger.commit(slot, digest, length);
-        }
+        // One statement, one batch: the filings take effect together, in the
+        // order the statement stated them.
+        ledger.commit_statement(&declarations);
         // The mechanism's own reading, in the census's own window: what the
         // statement filed, what it named instead of carrying, and what the
         // table's bounds left on the ordinary arm.
@@ -193,6 +218,13 @@ impl PlannedStatement {
 /// ledger can name becomes the reference arm, every one it can file becomes a
 /// declaration arm, and the rest keep the ordinary arm exactly as they were.
 ///
+/// The statement's declarations go to the ledger **as one batch**
+/// ([`PayloadLedger::plan_statement`]), so the whole statement is planned
+/// against the room its own earlier declarations leave: a statement whose
+/// declarations cannot all be filed together — the shape the census read as one
+/// `statement_payload_table_full` refusal, with the draw behind it — is absorbed
+/// by the replacement policy or by carrying those bytes, never refused.
+///
 /// Off, nothing is walked and nothing on the trace changes.
 pub(crate) fn plan(trace: &mut ComputeTrace) -> PlannedStatement {
     let mut planned = PlannedStatement::default();
@@ -203,37 +235,58 @@ pub(crate) fn plan(trace: &mut ComputeTrace) -> PlannedStatement {
         return planned;
     };
     ledger.scope(trace.device_epoch);
-    for texture in trace.texture_declarations_mut() {
+    // First, take every byte-carrying declaration off the trace, in the wire's
+    // own order, leaving the placeholder the second walk overwrites with the arm
+    // the plan names.
+    let mut carried: Vec<(usize, u128, u64, Vec<u8>)> = Vec::new();
+    for (index, texture) in trace.texture_declarations_mut().into_iter().enumerate() {
         let taken = std::mem::replace(&mut texture.source, TextureSource::PassEntrySnapshot);
         match taken {
             TextureSource::OwnedBytes(bytes) => {
                 let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 let digest = payload_digest(&bytes);
-                match ledger.plan(digest, length) {
-                    PayloadPlan::Reuse(slot) => {
-                        planned.referenced_n += 1;
-                        planned.referenced_bytes = planned.referenced_bytes.saturating_add(length);
-                        texture.source = TextureSource::SlottedBytes {
-                            slot,
-                            length,
-                            digest,
-                        };
-                    }
-                    PayloadPlan::Declare(slot) => {
-                        planned.declared_n += 1;
-                        planned.declared_bytes = planned.declared_bytes.saturating_add(length);
-                        planned.declarations.push((slot, digest, length));
-                        texture.source = TextureSource::OwnedInSlot { slot, bytes };
-                    }
-                    PayloadPlan::Carry => {
-                        planned.carried_n += 1;
-                        planned.carried_bytes = planned.carried_bytes.saturating_add(length);
-                        texture.source = TextureSource::OwnedBytes(bytes);
-                    }
-                }
+                carried.push((index, digest, length, bytes));
             }
             other => texture.source = other,
         }
+    }
+    let payloads: Vec<(u128, u64)> = carried
+        .iter()
+        .map(|(_, digest, length, _)| (*digest, *length))
+        .collect();
+    let plans = ledger.plan_statement(&payloads);
+    // Then state what the plan named, in the same order.
+    let mut carried = carried.into_iter().peekable();
+    let mut plans = plans.into_iter();
+    for (index, texture) in trace.texture_declarations_mut().into_iter().enumerate() {
+        match carried.peek() {
+            Some((carried_index, _, _, _)) if *carried_index == index => {}
+            _ => continue,
+        }
+        let (_, digest, length, bytes) = carried.next().expect("the declaration peeked above");
+        let plan = plans.next().expect("one plan per carried declaration");
+        texture.source = match plan {
+            PayloadPlan::Reuse(slot) => {
+                planned.referenced_n += 1;
+                planned.referenced_bytes = planned.referenced_bytes.saturating_add(length);
+                TextureSource::SlottedBytes {
+                    slot,
+                    length,
+                    digest,
+                }
+            }
+            PayloadPlan::Declare(slot) => {
+                planned.declared_n += 1;
+                planned.declared_bytes = planned.declared_bytes.saturating_add(length);
+                planned.declarations.push((slot, digest, length));
+                TextureSource::OwnedInSlot { slot, bytes }
+            }
+            PayloadPlan::Carry => {
+                planned.carried_n += 1;
+                planned.carried_bytes = planned.carried_bytes.saturating_add(length);
+                TextureSource::OwnedBytes(bytes)
+            }
+        };
     }
     planned
 }
@@ -299,6 +352,25 @@ mod tests {
         }
     }
 
+    /// What every declaration of the statement's one pass came to, in the
+    /// wire's own order.
+    fn arms(trace: &ComputeTrace) -> Vec<String> {
+        trace.passes[0]
+            .as_compute()
+            .expect("compute pass")
+            .textures
+            .iter()
+            .map(|texture| match &texture.source {
+                TextureSource::OwnedBytes(bytes) => format!("owned:{}", bytes.len()),
+                TextureSource::OwnedInSlot { slot, bytes } => {
+                    format!("declared:{}:{}", slot, bytes.len())
+                }
+                TextureSource::SlottedBytes { slot, .. } => format!("referenced:{slot}"),
+                other => format!("other:{other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn off_changes_nothing_and_plans_nothing() {
         set_statement_payload_table_for_test(Some(false));
@@ -350,6 +422,54 @@ mod tests {
             plan(&mut fifth).declared_n,
             1,
             "a plan that never crossed is declared again rather than named"
+        );
+        set_statement_payload_table_for_test(None);
+    }
+
+    /// One statement, one batch: a statement whose **own** two declarations
+    /// together cross the byte bound is planned against the room its own first
+    /// declaration leaves, so the second one replaces the entry the first one
+    /// filled instead of planning a fresh slot the provider's own bound would
+    /// have to refuse the whole statement for.
+    ///
+    /// The statement's first payload is exactly the table's byte budget, so a
+    /// fresh slot for the second one is one byte past it — the shape census it6
+    /// read as `statement_payload_table_full` at t≈209.5 s, with the draw behind
+    /// it.
+    #[test]
+    fn a_statements_own_declarations_are_planned_as_one_batch() {
+        use metal_api_core::statement_payload::PAYLOAD_TABLE_BYTES;
+
+        set_statement_payload_table_for_test(Some(true));
+        let bulk = vec![0x7c; usize::try_from(PAYLOAD_TABLE_BYTES).unwrap_or(usize::MAX)];
+        // The payload is moved into the arm rather than copied into it: the
+        // statement's first declaration is the whole byte budget on its own.
+        let mut bulk_view = texture(1, &[]);
+        bulk_view.source = TextureSource::OwnedBytes(bulk);
+        let mut statement = trace(vec![bulk_view, texture(2, &[0x7d])]);
+        // This statement plans against a table of its own: the ledger is one per
+        // process, so a device epoch of its own is what keeps the walk from
+        // reading whatever another test's statements filed.
+        statement.device_epoch = DeviceEpoch::new(9);
+        let planned = plan(&mut statement);
+        assert_eq!(
+            planned.declared_n, 2,
+            "both declarations state the table's arm"
+        );
+        assert_eq!(
+            planned.declared_bytes,
+            PAYLOAD_TABLE_BYTES + 1,
+            "two declarations, one byte past the byte bound between them"
+        );
+        assert_eq!(planned.carried_n, 0, "nothing here is carried");
+        assert_eq!(planned.referenced_n, 0, "nothing here is named");
+        assert_eq!(
+            arms(&statement),
+            vec![
+                format!("declared:0:{}", PAYLOAD_TABLE_BYTES),
+                "declared:0:1".to_owned(),
+            ],
+            "the second declaration replaces the entry the first one filled"
         );
         set_statement_payload_table_for_test(None);
     }
